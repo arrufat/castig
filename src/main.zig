@@ -12,9 +12,12 @@ const usage =
     \\  ls [--timeout <ms>]   discover cast devices on the local network (default 2000 ms)
     \\  probe <file>          print the streams of a media file and whether it can be cast directly
     \\  status <device>       show what the receiver is doing
-    \\  cast <device> <file|url> [--title <t>] [--type <mime>] [--subs <file|url>]
+    \\  cast <device> <file|url> [--title <t>] [--type <mime>] [--subs <file|url>] [--remux <mode>]
     \\                        play a local file or a URL and follow playback;
-    \\                        subtitles may be .srt or .vtt
+    \\                        subtitles may be .srt or .vtt. When audio must be
+    \\                        remuxed, --remux picks how: hls (default, seekable,
+    \\                        up to ~720p), mp4 (seekable, transcodes first), or
+    \\                        stream (instant, no seek)
     \\  pause <device>        pause the current item
     \\  play <device>         resume the current item
     \\  seek <device> <pos>   jump to <pos>: seconds, m:ss, h:mm:ss, or +N / -N relative
@@ -30,6 +33,10 @@ pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
         // Already explained on stderr by the command.
         error.InvalidRate, error.InvalidSeek, error.NoMedia, error.RequestFailed, error.DeviceNotFound => return 1,
+        error.ConnectionClosed => {
+            std.debug.print("the receiver closed the connection\n", .{});
+            return 1;
+        },
         else => {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             return 1;
@@ -98,6 +105,15 @@ fn run(init: std.process.Init) !void {
                 opts.content_type = args[i];
             } else if (std.mem.eql(u8, flag, "--subs")) {
                 opts.subtitles = args[i];
+            } else if (std.mem.eql(u8, flag, "--remux")) {
+                opts.remux = if (std.mem.eql(u8, args[i], "hls"))
+                    .hls
+                else if (std.mem.eql(u8, args[i], "mp4"))
+                    .mp4
+                else if (std.mem.eql(u8, args[i], "stream"))
+                    .stream
+                else
+                    fail("--remux expects hls, mp4, or stream\n");
             } else fail(usage);
         }
         try commands.cast(io, arena, out, args[2], opts, options);
@@ -127,4 +143,5 @@ test {
     _ = @import("http/server.zig");
     _ = @import("media/pipeline.zig");
     _ = @import("media/hls.zig");
+    _ = @import("cleanup.zig");
 }

@@ -142,14 +142,23 @@ pub const Channel = struct {
     }
 
     /// Blocks for the next message, answering heartbeat PINGs itself.
+    /// A closed connection (the receiver hanging up, or a TCP FIN) surfaces as
+    /// `error.EndOfStream` from the reader; it is the normal end of a session,
+    /// so it is mapped to `error.ConnectionClosed` for callers to handle.
     pub fn receive(ch: *Channel) !proto.Message {
         while (true) {
             const r = &ch.client.reader;
-            const prefix = try r.takeArray(4);
+            const prefix = r.takeArray(4) catch |err| switch (err) {
+                error.EndOfStream => return error.ConnectionClosed,
+                else => return err,
+            };
             const len = std.mem.readInt(u32, prefix, .big);
             if (len > max_frame) return error.FrameTooLarge;
             try ch.frame.resize(ch.gpa, len);
-            try r.readSliceAll(ch.frame.items);
+            r.readSliceAll(ch.frame.items) catch |err| switch (err) {
+                error.EndOfStream => return error.ConnectionClosed,
+                else => return err,
+            };
 
             const msg = try proto.decode(ch.frame.items);
             if (ch.debug and !std.mem.eql(u8, msg.namespace, ns_heartbeat)) {

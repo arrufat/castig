@@ -199,3 +199,16 @@ pub fn bsfReceive(ctx: *BSFContext, pkt: *av.Packet) av.Error!void {
 
 // --- channel layout default (libavutil) ------------------------------------
 pub extern fn av_channel_layout_default(ch_layout: *av.ChannelLayout, nb_channels: c_int) void;
+
+// --- file output (libavformat) ---------------------------------------------
+// For `--remux mp4`: transcode to a real, seekable MP4 on disk, which the
+// receiver plays with native seek (via HTTP Range requests).
+pub const AVIO_FLAG_WRITE: c_int = 2;
+pub extern fn avio_open(pb: *?*av.IOContext, url: [*:0]const u8, flags: c_int) c_int;
+pub extern fn avio_closep(pb: *?*av.IOContext) c_int;
+
+pub fn avioOpen(url: [*:0]const u8) av.Error!*av.IOContext {
+    var pb: ?*av.IOContext = null;
+    _ = try av.wrap(avio_open(&pb, url, AVIO_FLAG_WRITE));
+    return pb.?;
+}

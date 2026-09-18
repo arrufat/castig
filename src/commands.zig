@@ -9,6 +9,7 @@ const http = @import("http/server.zig");
 const subtitles = @import("media/subtitles.zig");
 const pipeline = @import("media/pipeline.zig");
 const hls = @import("media/hls.zig");
+const cleanup = @import("cleanup.zig");
 
 /// Shared by every command that opens a channel.
 pub const Options = struct {
@@ -48,6 +49,18 @@ pub fn stop(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     if (stopped == 0) try out.writeAll("nothing to stop\n");
 }
 
+/// How to deliver a file whose audio must be remuxed.
+pub const Remux = enum {
+    /// On-demand HLS (MPEG-TS), instant + native seek. Best for video up to
+    /// ~720p; some receivers refuse higher-resolution HLS-TS.
+    hls,
+    /// Pre-transcode to a seekable MP4 on disk, then serve with Range. Plays
+    /// where HLS is refused and seeks natively, but starts after a delay.
+    mp4,
+    /// Fragmented-MP4 live stream. Instant start, no seek.
+    stream,
+};
+
 pub const CastOptions = struct {
     /// http(s) URL the receiver fetches itself, or a local path castig serves.
     source: []const u8,
@@ -55,10 +68,29 @@ pub const CastOptions = struct {
     content_type: ?[]const u8 = null,
     /// WebVTT URL, or a local .srt/.vtt file castig converts and serves.
     subtitles: ?[]const u8 = null,
+    remux: Remux = .hls,
 };
 
 fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://");
+}
+
+/// The tested Chromecast refuses HLS-TS above this height.
+const hls_height_limit: c_int = 720;
+
+/// Streams a fragmented-MP4 (`--remux stream`) as it is muxed.
+const StreamCtx = struct { gpa: std.mem.Allocator, path: []const u8 };
+
+fn streamHandle(context: *const anyopaque, s: *http.Server, request: *http.Request) anyerror!void {
+    const c: *const StreamCtx = @ptrCast(@alignCast(context));
+    if (request.head.method == .HEAD) return http.respondHead(request, "video/mp4");
+    var buf: [64 * 1024]u8 = undefined;
+    var body = try http.beginStream(request, &buf, "video/mp4");
+    pipeline.remuxWindow(c.gpa, c.path, 0, null, "mp4", &body.writer) catch |err| {
+        if (s.debug) std.debug.print("stream aborted: {s}\n", .{@errorName(err)});
+        return;
+    };
+    try body.end();
 }
 
 /// Launches the default media receiver, loads the source and follows
@@ -66,8 +98,6 @@ fn isUrl(s: []const u8) bool {
 /// server for as long as the session lasts.
 pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, opts: CastOptions, options: Options) !void {
     const address = try discovery.resolve(io, arena, device);
-    const ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
-    defer ch.deinit();
 
     // Routes for whatever must be served locally.
     var routes: std.ArrayList(http.Route) = .empty;
@@ -78,6 +108,9 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     // Also true for an HLS URL the receiver fetches directly, so it gets the
     // MPEG-TS segment hint too.
     var is_hls = std.ascii.findIgnoreCase(media_content_type, "mpegurl") != null;
+    // A `--remux mp4` temp file to delete when done.
+    var temp_file: ?[]const u8 = null;
+    defer if (temp_file) |f| Io.Dir.cwd().deleteFile(io, f) catch {};
 
     if (!isUrl(opts.source)) {
         Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
@@ -97,21 +130,68 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
                 .content_type = media_content_type,
                 .body = .{ .file = opts.source },
             });
-        } else {
-            // Remux: copy video, transcode audio to AAC, serve on-demand HLS
-            // with fragmented-MP4 (CMAF) segments. Instant start and exact
-            // native seeking via the VOD playlist.
-            std.debug.print("remuxing {s} audio to aac (hls)\n", .{p.audio_codec});
-            const seg = try arena.create(hls.Segmenter);
-            seg.* = try hls.Segmenter.init(arena, opts.source);
-            media_path = hls.url_prefix ++ hls.master_name;
-            media_content_type = hls.cast_content_type;
-            is_hls = true;
-            try routes.append(arena, .{
-                .path = hls.url_prefix,
-                .content_type = hls.cast_content_type,
-                .body = .{ .dynamic = .{ .context = seg, .handle = hls.handleRoute } },
-            });
+        } else switch (opts.remux) {
+            .hls => {
+                // On-demand HLS (MPEG-TS): copy video, audio to AAC, instant
+                // start and native seek via the VOD playlist.
+                std.debug.print("remuxing {s} audio to aac (hls)\n", .{p.audio_codec});
+                if (p.video_height > hls_height_limit) {
+                    std.debug.print("note: video is {d}p; some receivers refuse HLS above {d}p. If it fails, retry with --remux mp4 (seekable, slower start) or --remux stream (instant, no seek).\n", .{ p.video_height, hls_height_limit });
+                }
+                const seg = try arena.create(hls.Segmenter);
+                seg.* = try hls.Segmenter.init(arena, opts.source);
+                media_path = hls.url_prefix ++ hls.master_name;
+                media_content_type = hls.cast_content_type;
+                is_hls = true;
+                try routes.append(arena, .{
+                    .path = hls.url_prefix,
+                    .content_type = hls.cast_content_type,
+                    .body = .{ .dynamic = .{ .context = seg, .handle = hls.handleRoute } },
+                });
+            },
+            .stream => {
+                // Fragmented-MP4 live stream: instant, no seek.
+                std.debug.print("remuxing {s} audio to aac (fragmented mp4, no seek)\n", .{p.audio_codec});
+                const c = try arena.create(StreamCtx);
+                c.* = .{ .gpa = arena, .path = opts.source };
+                media_path = "/media.mp4";
+                media_content_type = "video/mp4";
+                try routes.append(arena, .{
+                    .path = "/media.mp4",
+                    .content_type = "video/mp4",
+                    .body = .{ .dynamic = .{ .context = c, .handle = streamHandle } },
+                });
+            },
+            .mp4 => {
+                // Pre-transcode to a seekable MP4, then serve with Range. Write
+                // it next to the source (that filesystem has room for a movie);
+                // /tmp is often a small tmpfs and overflows on a 4K remux.
+                const src_dir = std.fs.path.dirname(opts.source) orelse ".";
+                const tmp = try std.fmt.allocPrint(arena, "{s}/.castig-{d}.mp4", .{ src_dir, std.os.linux.getpid() });
+                const tmp_z = try arena.dupeSentinel(u8, tmp, 0);
+                // Record it now so the top-level defer deletes it even if the
+                // remux fails partway and leaves an incomplete file. `defer`
+                // does not run on Ctrl-C, so also unlink it on SIGINT/SIGTERM.
+                temp_file = tmp;
+                cleanup.deleteOnSignal(tmp_z);
+                std.debug.print("remuxing {s} audio to aac (mp4); preparing {s} ...\n", .{ p.audio_codec, tmp });
+                try out.flush();
+                const root = std.Progress.start(io, .{});
+                defer root.end();
+                const node = root.start("remux to mp4 (seconds)", if (p.duration) |d| @intFromFloat(d) else 0);
+                defer node.end();
+                pipeline.remuxToFile(arena, opts.source, tmp_z, node) catch |err| {
+                    std.debug.print("mp4 remux failed: {s}\n", .{@errorName(err)});
+                    return err;
+                };
+                media_path = "/media.mp4";
+                media_content_type = "video/mp4";
+                try routes.append(arena, .{
+                    .path = "/media.mp4",
+                    .content_type = "video/mp4",
+                    .body = .{ .file = tmp },
+                });
+            },
         }
     }
     if (opts.subtitles) |sub| if (!isUrl(sub)) {
@@ -126,6 +206,13 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             .body = .{ .bytes = try subtitles.srtToVtt(arena, srt) },
         });
     };
+
+    // Connect only now: a `--remux mp4` transcode above can take minutes, and
+    // an idle control channel gets dropped by the receiver (unanswered
+    // heartbeat PINGs), which then surfaces as ConnectionClosed on the first
+    // request. Opening it after the heavy work keeps it live through LOAD.
+    const ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
+    defer ch.deinit();
 
     var server: ?*http.Server = null;
     defer if (server) |s| s.stop();
@@ -160,7 +247,15 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
 
     // Follow unsolicited MEDIA_STATUS updates until the item finishes.
     while (!media.isFinished()) {
-        const msg = try ch.receive();
+        const msg = ch.receive() catch |err| switch (err) {
+            // The receiver hanging up (a TCP FIN rather than a CLOSE message)
+            // is the normal end of a session, not a failure.
+            error.ConnectionClosed => {
+                try out.writeAll("receiver closed the session\n");
+                return;
+            },
+            else => return err,
+        };
         if (std.mem.eql(u8, msg.namespace, channel.ns_connection)) {
             if (std.mem.indexOf(u8, msg.payload.utf8, "\"CLOSE\"") != null) {
                 try out.writeAll("receiver closed the session\n");
