@@ -299,9 +299,20 @@ pub const Channel = struct {
         duration: ?f64,
         idle_reason: ?[]const u8,
         playback_rate: f64,
+        /// The media URL the receiver is playing, when reported.
+        content_id: ?[]const u8 = null,
+        title: ?[]const u8 = null,
+        /// Content id of the first text track, when reported.
+        subtitle_url: ?[]const u8 = null,
 
+        /// True only for terminal states; INTERRUPTED (which a seek-reload
+        /// produces) is not terminal.
         pub fn isFinished(m: MediaStatus) bool {
-            return std.mem.eql(u8, m.player_state, "IDLE") and m.idle_reason != null;
+            if (!std.mem.eql(u8, m.player_state, "IDLE")) return false;
+            const reason = m.idle_reason orelse return false;
+            return std.mem.eql(u8, reason, "FINISHED") or
+                std.mem.eql(u8, reason, "CANCELLED") or
+                std.mem.eql(u8, reason, "ERROR");
         }
     };
 
@@ -349,6 +360,19 @@ pub const Channel = struct {
         if (list.len == 0) return null;
         const s = list[0];
         const media = getObj(s, "media");
+        var content_id: ?[]const u8 = null;
+        var title: ?[]const u8 = null;
+        var subtitle_url: ?[]const u8 = null;
+        if (media) |m| {
+            content_id = getStr(m, "contentId");
+            if (getObj(m, "metadata")) |meta| title = getStr(meta, "title");
+            if (getArr(m, "tracks")) |tracks| for (tracks) |t| {
+                if (getStr(t, "type")) |ty| if (std.mem.eql(u8, ty, "TEXT")) {
+                    subtitle_url = getStr(t, "trackContentId");
+                    break;
+                };
+            };
+        }
         return .{
             .media_session_id = getInt(s, "mediaSessionId") orelse 0,
             .player_state = getStr(s, "playerState") orelse "UNKNOWN",
@@ -356,6 +380,9 @@ pub const Channel = struct {
             .duration = if (media) |m| getNum(m, "duration") else null,
             .idle_reason = getStr(s, "idleReason"),
             .playback_rate = getNum(s, "playbackRate") orelse 1,
+            .content_id = content_id,
+            .title = title,
+            .subtitle_url = subtitle_url,
         };
     }
 

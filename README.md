@@ -23,6 +23,9 @@ Early. What works today:
   receiver cannot decode (AC3, DTS, TrueHD, ...), castig remuxes on the fly:
   the video is copied and the audio is transcoded to AAC in a fragmented MP4,
   with ffmpeg compiled in, no external process.
+- `castig seek` on a remuxed stream reloads it at the new position, so seeking
+  works there too. The receiver's progress bar restarts at zero after such a
+  seek, because a live stream cannot report an absolute position.
 - `castig pause`, `play`, `seek <pos>` and `rate <x>` control whatever is
   playing, whoever started it. Positions are seconds, `m:ss`, `h:mm:ss`, or
   `+N` / `-N` relative to the current time. Rates go from 0.5 to 2.0.
@@ -32,10 +35,10 @@ Early. What works today:
 Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
 
 Video must already be in a codec the receiver decodes (H.264, VP8, VP9 or
-AV1); unplayable audio is remuxed. A remuxed stream is not seekable yet, and
-software video transcoding (for HEVC or other video) is not implemented.
-Roadmap: seek during remux (restart the pipeline at the new position) →
-embedded subtitle tracks → software video transcode.
+AV1); unplayable audio is remuxed. Software video transcoding (for HEVC or
+other video) is not implemented. Roadmap: HLS/DASH output so a remuxed
+stream seeks with a correct progress bar → embedded subtitle tracks →
+software video transcode.
 
 Some receivers, the Pixel Tablet among them, may show an "allow this cast?"
 prompt on screen. castig waits for it and says so.

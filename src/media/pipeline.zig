@@ -90,8 +90,8 @@ pub const Remux = struct {
     gpa: std.mem.Allocator,
     path: []const u8,
 
-    pub fn generate(ctx: *const Remux, w: *Io.Writer) anyerror!void {
-        try transcode(ctx.gpa, ctx.path, w);
+    pub fn generate(ctx: *const Remux, start_time: f64, w: *Io.Writer) anyerror!void {
+        try transcode(ctx.gpa, ctx.path, start_time, w);
     }
 };
 
@@ -115,7 +115,7 @@ fn writeCallback(userdata: ?*anyopaque, buf: [*:0]u8, size: c_int) callconv(.c) 
 const io_buffer_len = 64 * 1024;
 const aac_bitrate = 192_000;
 
-fn transcode(gpa: std.mem.Allocator, path: []const u8, w: *Io.Writer) !void {
+fn transcode(gpa: std.mem.Allocator, path: []const u8, start_time: f64, w: *Io.Writer) !void {
     const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
 
@@ -127,6 +127,12 @@ fn transcode(gpa: std.mem.Allocator, path: []const u8, w: *Io.Writer) !void {
     const video_index: ?usize = if (ic.find_best_stream(.VIDEO, -1, -1)) |v| @intCast(v[0]) else |_| null;
     const audio_index: usize = if (ic.find_best_stream(.AUDIO, -1, -1)) |a| @intCast(a[0]) else |_| return error.NoAudioStream;
     const in_audio = ic.streams[audio_index];
+
+    // Seek the input to the requested offset. AV_TIME_BASE is microseconds,
+    // flag 1 (BACKWARD) lands on the keyframe at or before the target.
+    if (start_time > 0) {
+        try ic.seek_frame(-1, @intFromFloat(start_time * 1_000_000), 1);
+    }
 
     // Audio decoder.
     const dec_codec = try av.Codec.find_decoder(in_audio.codecpar.codec_id);
@@ -209,7 +215,9 @@ fn transcode(gpa: std.mem.Allocator, path: []const u8, w: *Io.Writer) !void {
         .out_index = out_audio_index,
         .enc_frame = try av.Frame.alloc(),
         .out_packet = try av.Packet.alloc(),
-        .next_pts = 0,
+        .next_pts = @intFromFloat(start_time * @as(f64, @floatFromInt(dec.sample_rate))),
+        .pts_set = false,
+        .in_time_base = in_audio.time_base,
         .sink = &sink,
     };
     defer ctx.enc_frame.free();
@@ -260,6 +268,9 @@ const AudioCtx = struct {
     enc_frame: *av.Frame,
     out_packet: *av.Packet,
     next_pts: i64,
+    /// Set once the first decoded frame anchors the output timeline.
+    pts_set: bool,
+    in_time_base: av.Rational,
     sink: *Sink,
 };
 
@@ -270,6 +281,14 @@ fn drainDecoder(ctx: *AudioCtx, frame: *av.Frame) !void {
             else => return err,
         };
         defer frame.unref();
+        if (!ctx.pts_set) {
+            const ts = frame.best_effort_timestamp;
+            if (ts != av.NOPTS_VALUE) {
+                const seconds = @as(f64, @floatFromInt(ts)) * ctx.in_time_base.q2d();
+                ctx.next_pts = @intFromFloat(seconds * @as(f64, @floatFromInt(ctx.enc.sample_rate)));
+            }
+            ctx.pts_set = true;
+        }
         try pushToFifo(ctx, frame);
         try encodeFifo(ctx, false);
     }

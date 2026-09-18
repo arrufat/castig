@@ -60,6 +60,22 @@ fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://");
 }
 
+/// Distinct from a direct file route so `seek` can tell a remux apart from a
+/// plain .mp4 and reload it with an offset instead of a byte seek.
+const remux_path_name = "remux.mp4";
+
+/// Reads a numeric query parameter from a URL, e.g. "d" from ".../remux.mp4?t=5&d=888".
+fn queryValue(url: []const u8, key: []const u8) ?f64 {
+    const q = std.mem.indexOfScalar(u8, url, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, url[q + 1 ..], '&');
+    while (it.next()) |kv| {
+        if (std.mem.startsWith(u8, kv, key) and kv.len > key.len and kv[key.len] == '=') {
+            return std.fmt.parseFloat(f64, kv[key.len + 1 ..]) catch null;
+        }
+    }
+    return null;
+}
+
 /// Launches the default media receiver, loads the source and follows
 /// playback until it ends. Local files are served from a built-in HTTP
 /// server for as long as the session lasts.
@@ -100,10 +116,15 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             const r = try arena.create(pipeline.Remux);
             r.* = .{ .gpa = arena, .path = opts.source };
             remux = r;
-            media_path = "/media.mp4";
+            // The receiver reports a growing (fake) duration for a live stream,
+            // so carry the real one in the URL for `seek` to read back.
+            media_path = if (p.duration) |d|
+                try std.fmt.allocPrint(arena, "/{s}?d={d}", .{ remux_path_name, @as(u64, @intFromFloat(d)) })
+            else
+                "/" ++ remux_path_name;
             media_content_type = "video/mp4";
             try routes.append(arena, .{
-                .path = "/media.mp4",
+                .path = "/" ++ remux_path_name,
                 .content_type = "video/mp4",
                 .body = .{ .stream = .{ .context = r, .generate = remuxGenerate } },
             });
@@ -241,6 +262,34 @@ pub fn seek(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         return error.InvalidSeek;
     };
     if (target < 0) target = 0;
+
+    // A remuxed stream is not byte-seekable, so a SEEK does nothing. Instead
+    // reload the same URL with a new ?t= offset; the server restarts the
+    // transcode there and the receiver plays from the new position. The real
+    // duration rides in the URL (?d=) because the receiver only reports the
+    // stream's growing length, which would otherwise clamp the target.
+    if (s.media.content_id) |url| if (std.mem.indexOf(u8, url, "/" ++ remux_path_name) != null) {
+        const base = url[0 .. std.mem.indexOfScalar(u8, url, '?') orelse url.len];
+        const total = queryValue(url, "d");
+        if (total) |d| {
+            if (target > d) target = d;
+        }
+        const new_url = if (total) |d|
+            try std.fmt.allocPrint(arena, "{s}?t={d}&d={d}", .{ base, @as(u64, @intFromFloat(target)), @as(u64, @intFromFloat(d)) })
+        else
+            try std.fmt.allocPrint(arena, "{s}?t={d}", .{ base, @as(u64, @intFromFloat(target)) });
+        const media = try s.ch.load(arena, s.transport_id, .{
+            .url = new_url,
+            .content_type = "video/mp4",
+            .title = s.media.title,
+            .subtitles_url = s.media.subtitle_url,
+            .start_time = target,
+            .duration = total,
+        });
+        try report(out, s, media);
+        return;
+    };
+
     if (s.media.duration) |d| if (target > d) {
         target = d;
     };
@@ -289,9 +338,9 @@ test "seek specs" {
     try std.testing.expectError(error.InvalidSeek, parseSeek("abc", 0));
 }
 
-fn remuxGenerate(context: *const anyopaque, w: *Io.Writer) anyerror!void {
+fn remuxGenerate(context: *const anyopaque, start_time: f64, w: *Io.Writer) anyerror!void {
     const r: *const pipeline.Remux = @ptrCast(@alignCast(context));
-    return r.generate(w);
+    return r.generate(start_time, w);
 }
 
 pub fn guessContentType(url: []const u8) []const u8 {

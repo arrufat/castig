@@ -32,7 +32,7 @@ pub const Route = struct {
 
     pub const Stream = struct {
         context: *const anyopaque,
-        generate: *const fn (context: *const anyopaque, w: *std.Io.Writer) anyerror!void,
+        generate: *const fn (context: *const anyopaque, start_time: f64, w: *std.Io.Writer) anyerror!void,
     };
 };
 
@@ -230,17 +230,36 @@ pub const Server = struct {
             return request.respond("", .{ .status = .ok, .extra_headers = &headers });
         }
 
+        const start_time = queryTime(request.head.target);
         var send_buf: [64 * 1024]u8 = undefined;
         var body = try request.respondStreaming(&send_buf, .{
             .respond_options = .{ .status = .ok, .extra_headers = &headers },
         });
-        route.body.stream.generate(route.body.stream.context, &body.writer) catch |err| {
+        route.body.stream.generate(route.body.stream.context, start_time, &body.writer) catch |err| {
             if (s.debug) std.debug.print("stream {s} aborted: {s}\n", .{ route.path, @errorName(err) });
             return; // the connection is torn down by the caller
         };
         try body.end();
     }
 };
+
+/// Reads the `t` query parameter (seconds) from a request target, 0 if absent.
+pub fn queryTime(target: []const u8) f64 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return 0;
+    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
+    while (it.next()) |kv| {
+        if (std.mem.startsWith(u8, kv, "t=")) {
+            return std.fmt.parseFloat(f64, kv[2..]) catch 0;
+        }
+    }
+    return 0;
+}
+
+test "query time" {
+    try std.testing.expectEqual(@as(f64, 0), queryTime("/remux.mp4"));
+    try std.testing.expectEqual(@as(f64, 120), queryTime("/remux.mp4?t=120"));
+    try std.testing.expectEqual(@as(f64, 5.5), queryTime("/remux.mp4?x=1&t=5.5"));
+}
 
 pub const Range = struct { start: u64, end: u64 };
 
