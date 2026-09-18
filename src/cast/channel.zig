@@ -312,6 +312,8 @@ pub const Channel = struct {
         /// Sidecar subtitles, must be WebVTT and reachable by the receiver.
         subtitles_url: ?[]const u8 = null,
         start_time: f64 = 0,
+        /// Total length in seconds, shown by the receiver's progress bar.
+        duration: ?f64 = null,
     };
 
     pub fn load(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, opts: LoadOptions) !MediaStatus {
@@ -321,6 +323,7 @@ pub const Channel = struct {
             .media = .{
                 .contentId = opts.url,
                 .contentType = opts.content_type,
+                .duration = opts.duration,
                 .metadata = if (opts.title) |t| .{ .title = t } else null,
             },
         };
@@ -427,6 +430,7 @@ const Load = struct {
     const Media = struct {
         contentId: []const u8,
         contentType: []const u8,
+        duration: ?f64 = null,
         streamType: []const u8 = "BUFFERED",
         metadata: ?Metadata = null,
         tracks: ?[]const Track = null,

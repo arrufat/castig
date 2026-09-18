@@ -7,6 +7,7 @@ const channel = @import("cast/channel.zig");
 const Channel = channel.Channel;
 const http = @import("http/server.zig");
 const subtitles = @import("media/subtitles.zig");
+const pipeline = @import("media/pipeline.zig");
 
 /// Shared by every command that opens a channel.
 pub const Options = struct {
@@ -71,19 +72,42 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     var routes: std.ArrayList(http.Route) = .empty;
     var media_path: []const u8 = opts.source;
     var subtitles_path: ?[]const u8 = opts.subtitles;
+    var media_content_type: []const u8 = opts.content_type orelse guessContentType(opts.source);
+    var remux: ?*pipeline.Remux = null;
+    var duration: ?f64 = null;
 
     if (!isUrl(opts.source)) {
         Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
             std.debug.print("cannot read {s}: {s}\n", .{ opts.source, @errorName(err) });
             return error.SourceUnreadable;
         };
-        const ext = std.fs.path.extension(opts.source);
-        media_path = try std.fmt.allocPrint(arena, "/media{s}", .{ext});
-        try routes.append(arena, .{
-            .path = media_path,
-            .content_type = opts.content_type orelse guessContentType(opts.source),
-            .body = .{ .file = opts.source },
-        });
+        const p = try pipeline.plan(arena, opts.source);
+        duration = p.duration;
+        if (p.video_unsupported) {
+            std.debug.print("warning: {s} video is not castable and video transcoding is not implemented; trying direct\n", .{p.video_codec});
+        }
+        if (p.direct or p.video_unsupported) {
+            const ext = std.fs.path.extension(opts.source);
+            media_path = try std.fmt.allocPrint(arena, "/media{s}", .{ext});
+            try routes.append(arena, .{
+                .path = media_path,
+                .content_type = media_content_type,
+                .body = .{ .file = opts.source },
+            });
+        } else {
+            // Remux: copy video, transcode audio to AAC, serve fragmented MP4.
+            std.debug.print("remuxing {s} audio to aac\n", .{p.audio_codec});
+            const r = try arena.create(pipeline.Remux);
+            r.* = .{ .gpa = arena, .path = opts.source };
+            remux = r;
+            media_path = "/media.mp4";
+            media_content_type = "video/mp4";
+            try routes.append(arena, .{
+                .path = "/media.mp4",
+                .content_type = "video/mp4",
+                .body = .{ .stream = .{ .context = r, .generate = remuxGenerate } },
+            });
+        }
     }
     if (opts.subtitles) |sub| if (!isUrl(sub)) {
         const srt = Io.Dir.cwd().readFileAlloc(io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
@@ -117,14 +141,14 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     const app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
     try ch.connectTransport(app.transport_id);
 
-    const content_type = opts.content_type orelse guessContentType(opts.source);
     var media = try ch.load(arena, app.transport_id, .{
         .url = media_path,
-        .content_type = content_type,
+        .content_type = media_content_type,
         .title = opts.title orelse (if (isUrl(opts.source)) null else std.fs.path.basename(opts.source)),
         .subtitles_url = subtitles_path,
+        .duration = duration,
     });
-    try out.print("loaded on {f} as {s}\n", .{ address, content_type });
+    try out.print("loaded on {f} as {s}\n", .{ address, media_content_type });
     try printMedia(out, media);
     try out.flush();
 
@@ -263,6 +287,11 @@ test "seek specs" {
     try std.testing.expectEqual(@as(f64, 90), try parseSeek("-10", 100));
     try std.testing.expectError(error.InvalidSeek, parseSeek("1:2:3:4", 0));
     try std.testing.expectError(error.InvalidSeek, parseSeek("abc", 0));
+}
+
+fn remuxGenerate(context: *const anyopaque, w: *Io.Writer) anyerror!void {
+    const r: *const pipeline.Remux = @ptrCast(@alignCast(context));
+    return r.generate(w);
 }
 
 pub fn guessContentType(url: []const u8) []const u8 {

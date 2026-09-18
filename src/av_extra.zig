@@ -54,3 +54,85 @@ test "codec ids resolve to names" {
     // probed here: debug builds of libavcodec assert on them.
     try std.testing.expectEqualStrings("h264", codecName(27));
 }
+
+// --- muxing (libavformat) --------------------------------------------------
+
+pub extern fn avformat_alloc_output_context2(ctx: *?*av.FormatContext, oformat: ?*const av.OutputFormat, format_name: ?[*:0]const u8, filename: ?[*:0]const u8) c_int;
+pub extern fn avformat_new_stream(s: *av.FormatContext, c: ?*const av.Codec) ?*av.Stream;
+pub extern fn avformat_write_header(s: *av.FormatContext, options: ?*av.Dictionary.Mutable) c_int;
+pub extern fn av_interleaved_write_frame(s: *av.FormatContext, pkt: ?*av.Packet) c_int;
+pub extern fn av_write_trailer(s: *av.FormatContext) c_int;
+pub extern fn avcodec_parameters_copy(dst: *av.Codec.Parameters, src: *const av.Codec.Parameters) c_int;
+
+// --- encoding (libavcodec) -------------------------------------------------
+
+pub extern fn avcodec_parameters_from_context(par: *av.Codec.Parameters, codec: *const av.Codec.Context) c_int;
+pub extern fn avcodec_send_frame(avctx: *av.Codec.Context, frame: ?*const av.Frame) c_int;
+pub extern fn avcodec_receive_packet(avctx: *av.Codec.Context, avpkt: *av.Packet) c_int;
+pub extern fn av_packet_rescale_ts(pkt: *av.Packet, tb_src: av.Rational, tb_dst: av.Rational) void;
+
+// --- util ------------------------------------------------------------------
+
+pub extern fn av_channel_layout_copy(dst: *av.ChannelLayout, src: *const av.ChannelLayout) c_int;
+pub extern fn av_frame_get_buffer(frame: *av.Frame, alignment: c_int) c_int;
+
+// --- audio fifo (libavutil) ------------------------------------------------
+
+pub const AudioFifo = opaque {};
+pub extern fn av_audio_fifo_alloc(sample_fmt: av.SampleFormat, channels: c_int, nb_samples: c_int) ?*AudioFifo;
+pub extern fn av_audio_fifo_free(af: *AudioFifo) void;
+pub extern fn av_audio_fifo_write(af: *AudioFifo, data: [*]const ?*anyopaque, nb_samples: c_int) c_int;
+pub extern fn av_audio_fifo_read(af: *AudioFifo, data: [*]const ?*anyopaque, nb_samples: c_int) c_int;
+pub extern fn av_audio_fifo_size(af: *AudioFifo) c_int;
+
+// --- wrappers, returning av.Error through av.wrap --------------------------
+
+/// MP4 muxer sets AVFMT_GLOBALHEADER; the AAC encoder must know so it puts the
+/// AudioSpecificConfig in the container instead of in the stream.
+pub const CODEC_FLAG_GLOBAL_HEADER: c_int = 1 << 22;
+
+pub fn allocOutputContext(format_name: [*:0]const u8) av.Error!*av.FormatContext {
+    var oc: ?*av.FormatContext = null;
+    _ = try av.wrap(avformat_alloc_output_context2(&oc, null, format_name, null));
+    return oc.?;
+}
+
+pub fn newStream(oc: *av.FormatContext) error{OutOfMemory}!*av.Stream {
+    return avformat_new_stream(oc, null) orelse error.OutOfMemory;
+}
+
+pub fn copyParameters(dst: *av.Codec.Parameters, src: *const av.Codec.Parameters) av.Error!void {
+    _ = try av.wrap(avcodec_parameters_copy(dst, src));
+}
+
+pub fn parametersFromContext(par: *av.Codec.Parameters, cc: *const av.Codec.Context) av.Error!void {
+    _ = try av.wrap(avcodec_parameters_from_context(par, cc));
+}
+
+pub fn writeHeader(oc: *av.FormatContext, options: ?*av.Dictionary.Mutable) av.Error!void {
+    _ = try av.wrap(avformat_write_header(oc, options));
+}
+
+pub fn writeFrame(oc: *av.FormatContext, pkt: ?*av.Packet) av.Error!void {
+    _ = try av.wrap(av_interleaved_write_frame(oc, pkt));
+}
+
+pub fn writeTrailer(oc: *av.FormatContext) av.Error!void {
+    _ = try av.wrap(av_write_trailer(oc));
+}
+
+pub fn sendFrame(cc: *av.Codec.Context, frame: ?*const av.Frame) av.Error!void {
+    _ = try av.wrap(avcodec_send_frame(cc, frame));
+}
+
+pub fn receivePacket(cc: *av.Codec.Context, pkt: *av.Packet) av.Error!void {
+    _ = try av.wrap(avcodec_receive_packet(cc, pkt));
+}
+
+pub fn frameGetBuffer(frame: *av.Frame) av.Error!void {
+    _ = try av.wrap(av_frame_get_buffer(frame, 0));
+}
+
+pub fn copyChannelLayout(dst: *av.ChannelLayout, src: *const av.ChannelLayout) av.Error!void {
+    _ = try av.wrap(av_channel_layout_copy(dst, src));
+}

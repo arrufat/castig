@@ -26,6 +26,13 @@ pub const Route = struct {
         file: []const u8,
         /// Fixed content kept in memory.
         bytes: []const u8,
+        /// Live-generated output of unknown length (chunked, no Range).
+        stream: Stream,
+    };
+
+    pub const Stream = struct {
+        context: *const anyopaque,
+        generate: *const fn (context: *const anyopaque, w: *std.Io.Writer) anyerror!void,
     };
 };
 
@@ -136,6 +143,8 @@ pub const Server = struct {
             return request.respond("", .{ .status = .method_not_allowed, .extra_headers = &cors_headers });
         }
 
+        if (route.body == .stream) return s.serveStream(request, route);
+
         var file_reader_buf: [64 * 1024]u8 = undefined;
         var file: ?Io.File = null;
         defer if (file) |f| f.close(s.io);
@@ -149,6 +158,7 @@ pub const Server = struct {
                 file_reader = f.reader(s.io, &file_reader_buf);
                 break :blk try file_reader.getSize();
             },
+            .stream => unreachable, // handled before this point
         };
 
         const range = parseRange(range_header, total) catch {
@@ -203,7 +213,31 @@ pub const Server = struct {
                 try file_reader.seekTo(offset);
                 _ = try body.writer.sendFileAll(&file_reader, .limited(@intCast(len)));
             },
+            .stream => unreachable, // handled before this point
         }
+        try body.end();
+    }
+
+    /// Streams live-generated output. Length is unknown, so the response is
+    /// chunked and Range is not offered. HEAD returns headers only.
+    fn serveStream(s: *Server, request: *http.Server.Request, route: Route) !void {
+        var headers: [cors_headers.len + 2]http.Header = undefined;
+        @memcpy(headers[0..cors_headers.len], &cors_headers);
+        headers[cors_headers.len] = .{ .name = "content-type", .value = route.content_type };
+        headers[cors_headers.len + 1] = .{ .name = "cache-control", .value = "no-store" };
+
+        if (request.head.method == .HEAD) {
+            return request.respond("", .{ .status = .ok, .extra_headers = &headers });
+        }
+
+        var send_buf: [64 * 1024]u8 = undefined;
+        var body = try request.respondStreaming(&send_buf, .{
+            .respond_options = .{ .status = .ok, .extra_headers = &headers },
+        });
+        route.body.stream.generate(route.body.stream.context, &body.writer) catch |err| {
+            if (s.debug) std.debug.print("stream {s} aborted: {s}\n", .{ route.path, @errorName(err) });
+            return; // the connection is torn down by the caller
+        };
         try body.end();
     }
 };

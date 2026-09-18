@@ -19,7 +19,10 @@ Early. What works today:
   Default Media Receiver and follows playback until it ends. Local files are
   served from a built-in HTTP server with Range support, so seeking works.
   Optional `--title`, `--type <mime>` and `--subs <file|url>`; an `.srt`
-  file is converted to WebVTT on the fly.
+  file is converted to WebVTT on the fly. When the audio codec is one the
+  receiver cannot decode (AC3, DTS, TrueHD, ...), castig remuxes on the fly:
+  the video is copied and the audio is transcoded to AAC in a fragmented MP4,
+  with ffmpeg compiled in, no external process.
 - `castig pause`, `play`, `seek <pos>` and `rate <x>` control whatever is
   playing, whoever started it. Positions are seconds, `m:ss`, `h:mm:ss`, or
   `+N` / `-N` relative to the current time. Rates go from 0.5 to 2.0.
@@ -28,10 +31,11 @@ Early. What works today:
 `<device>` is an IP, `ip:port`, or any part of a name shown by `ls`.
 Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
 
-Only files the receiver can decode play today (see `probe`): H.264, VP8,
-VP9 or AV1 video with AAC, MP3, Opus, Vorbis or FLAC audio. Roadmap, in
-order: audio remux to fragmented MP4 (AC3, DTS, TrueHD → AAC) → embedded
-subtitle tracks → software video transcode.
+Video must already be in a codec the receiver decodes (H.264, VP8, VP9 or
+AV1); unplayable audio is remuxed. A remuxed stream is not seekable yet, and
+software video transcoding (for HEVC or other video) is not implemented.
+Roadmap: seek during remux (restart the pipeline at the new position) →
+embedded subtitle tracks → software video transcode.
 
 Some receivers, the Pixel Tablet among them, may show an "allow this cast?"
 prompt on screen. castig waits for it and says so.
@@ -84,6 +88,7 @@ src/cast/proto.zig      Cast channel framing (length prefix + protobuf CastMessa
 src/cast/channel.zig    Cast v2 protocol over TLS: receiver and media namespaces
 src/http/server.zig     media server the receiver pulls from: files with Range, in-memory bodies
 src/media/subtitles.zig SubRip to WebVTT
+src/media/pipeline.zig  remux decision and the libav transcode (copy video, AC3/DTS/... to AAC)
 src/media/pipeline.zig  direct / remux / transcode decision and libav driver (planned)
 ```
 
