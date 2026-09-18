@@ -148,6 +148,7 @@ pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address
             return d.address;
         }
     }
+    std.debug.print("no cast device matches \"{s}\"; try `castig ls`\n", .{spec});
     return error.DeviceNotFound;
 }
 

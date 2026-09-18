@@ -97,8 +97,117 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
 fn printMedia(out: *Io.Writer, m: Channel.MediaStatus) !void {
     try out.print("  {s} at {d:.1} s", .{ m.player_state, m.current_time });
     if (m.duration) |d| try out.print(" of {d:.1} s", .{d});
+    if (m.playback_rate != 1) try out.print(" x{d:.2}", .{m.playback_rate});
     if (m.idle_reason) |r| try out.print(" ({s})", .{r});
     try out.writeAll("\n");
+}
+
+// --- controlling a session started by anyone ---------------------------------
+
+const Session = struct {
+    ch: *Channel,
+    transport_id: []const u8,
+    media: Channel.MediaStatus,
+};
+
+/// Connects to the app that is playing on the device and fetches its media status.
+fn openSession(io: Io, arena: std.mem.Allocator, device: []const u8, options: Options) !Session {
+    const address = try discovery.resolve(io, arena, device);
+    const ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
+    errdefer ch.deinit();
+
+    const st = try ch.getStatus(arena);
+    const app = st.mediaApp() orelse {
+        std.debug.print("nothing is playing on {f}\n", .{address});
+        return error.NoMedia;
+    };
+    try ch.connectTransport(app.transport_id);
+    const media = ch.getMediaStatus(arena, app.transport_id) catch |err| switch (err) {
+        error.NoMedia => {
+            std.debug.print("{s} has no media loaded\n", .{app.display_name});
+            return err;
+        },
+        else => return err,
+    };
+    return .{ .ch = ch, .transport_id = app.transport_id, .media = media };
+}
+
+/// Replies to commands carry no `media` object, so the duration learned at
+/// session start is kept.
+fn report(out: *Io.Writer, s: Session, reply: Channel.MediaStatus) !void {
+    var m = reply;
+    if (m.duration == null) m.duration = s.media.duration;
+    try printMedia(out, m);
+}
+
+pub fn pause(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, options: Options) !void {
+    const s = try openSession(io, arena, device, options);
+    defer s.ch.deinit();
+    try report(out, s, try s.ch.mediaCommand(arena, s.transport_id, s.media.media_session_id, "PAUSE"));
+}
+
+pub fn play(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, options: Options) !void {
+    const s = try openSession(io, arena, device, options);
+    defer s.ch.deinit();
+    try report(out, s, try s.ch.mediaCommand(arena, s.transport_id, s.media.media_session_id, "PLAY"));
+}
+
+/// `spec` is absolute ("90", "1:30", "1:02:03") or relative ("+30", "-10").
+pub fn seek(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, spec: []const u8, options: Options) !void {
+    const s = try openSession(io, arena, device, options);
+    defer s.ch.deinit();
+
+    var target = parseSeek(spec, s.media.current_time) catch {
+        std.debug.print("cannot parse position {s}\n", .{spec});
+        return error.InvalidSeek;
+    };
+    if (target < 0) target = 0;
+    if (s.media.duration) |d| if (target > d) {
+        target = d;
+    };
+    try report(out, s, try s.ch.seek(arena, s.transport_id, s.media.media_session_id, target));
+}
+
+pub fn rate(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, spec: []const u8, options: Options) !void {
+    const value = std.fmt.parseFloat(f64, spec) catch {
+        std.debug.print("rate must be a number\n", .{});
+        return error.InvalidRate;
+    };
+    if (value < 0.5 or value > 2.0) {
+        std.debug.print("rate must be between 0.5 and 2.0\n", .{});
+        return error.InvalidRate;
+    }
+    const s = try openSession(io, arena, device, options);
+    defer s.ch.deinit();
+    try report(out, s, try s.ch.setPlaybackRate(arena, s.transport_id, s.media.media_session_id, value));
+}
+
+pub fn parseSeek(spec: []const u8, current: f64) !f64 {
+    if (spec.len == 0) return error.InvalidSeek;
+    const relative = spec[0] == '+' or spec[0] == '-';
+    const body = if (relative) spec[1..] else spec;
+
+    // h:m:s, m:s or plain seconds, each part may be fractional
+    var seconds: f64 = 0;
+    var parts = std.mem.splitScalar(u8, body, ':');
+    var count: usize = 0;
+    while (parts.next()) |part| : (count += 1) {
+        if (count == 3) return error.InvalidSeek;
+        const v = std.fmt.parseFloat(f64, part) catch return error.InvalidSeek;
+        seconds = seconds * 60 + v;
+    }
+    if (!relative) return seconds;
+    return if (spec[0] == '-') current - seconds else current + seconds;
+}
+
+test "seek specs" {
+    try std.testing.expectEqual(@as(f64, 90), try parseSeek("90", 0));
+    try std.testing.expectEqual(@as(f64, 90), try parseSeek("1:30", 0));
+    try std.testing.expectEqual(@as(f64, 3723.5), try parseSeek("1:02:03.5", 0));
+    try std.testing.expectEqual(@as(f64, 130), try parseSeek("+30", 100));
+    try std.testing.expectEqual(@as(f64, 90), try parseSeek("-10", 100));
+    try std.testing.expectError(error.InvalidSeek, parseSeek("1:2:3:4", 0));
+    try std.testing.expectError(error.InvalidSeek, parseSeek("abc", 0));
 }
 
 pub fn guessContentType(url: []const u8) []const u8 {

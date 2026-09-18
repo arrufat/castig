@@ -18,6 +18,9 @@ Early. What works today:
 - `castig cast <device> <url>` plays a URL the receiver can reach on the
   Default Media Receiver and follows playback until it ends. Optional
   `--title`, `--type <mime>` and `--subs <webvtt-url>`.
+- `castig pause`, `play`, `seek <pos>` and `rate <x>` control whatever is
+  playing, whoever started it. Positions are seconds, `m:ss`, `h:mm:ss`, or
+  `+N` / `-N` relative to the current time. Rates go from 0.5 to 2.0.
 - `castig stop <device>` stops the running app.
 
 `<device>` is an IP, `ip:port`, or any part of a name shown by `ls`.

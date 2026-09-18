@@ -14,6 +14,10 @@ const usage =
     \\  status <device>       show what the receiver is doing
     \\  cast <device> <url> [--title <t>] [--type <mime>] [--subs <vtt-url>]
     \\                        play a URL the receiver can reach, and follow playback
+    \\  pause <device>        pause the current item
+    \\  play <device>         resume the current item
+    \\  seek <device> <pos>   jump to <pos>: seconds, m:ss, h:mm:ss, or +N / -N relative
+    \\  rate <device> <x>     set playback speed, 0.5 to 2.0
     \\  stop <device>         stop whatever app is running on the receiver
     \\
     \\<device> is an IP, IP:port, or part of a name shown by `ls`.
@@ -21,7 +25,19 @@ const usage =
     \\
 ;
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) u8 {
+    run(init) catch |err| switch (err) {
+        // Already explained on stderr by the command.
+        error.InvalidRate, error.InvalidSeek, error.NoMedia, error.RequestFailed, error.DeviceNotFound => return 1,
+        else => {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            return 1;
+        },
+    };
+    return 0;
+}
+
+fn run(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
@@ -55,6 +71,18 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "stop")) {
         if (args.len != 3) fail(usage);
         try commands.stop(io, arena, out, args[2], options);
+    } else if (std.mem.eql(u8, cmd, "pause")) {
+        if (args.len != 3) fail(usage);
+        try commands.pause(io, arena, out, args[2], options);
+    } else if (std.mem.eql(u8, cmd, "play")) {
+        if (args.len != 3) fail(usage);
+        try commands.play(io, arena, out, args[2], options);
+    } else if (std.mem.eql(u8, cmd, "seek")) {
+        if (args.len != 4) fail(usage);
+        try commands.seek(io, arena, out, args[2], args[3], options);
+    } else if (std.mem.eql(u8, cmd, "rate")) {
+        if (args.len != 4) fail(usage);
+        try commands.rate(io, arena, out, args[2], args[3], options);
     } else if (std.mem.eql(u8, cmd, "cast")) {
         if (args.len < 4) fail(usage);
         var opts: commands.CastOptions = .{ .url = args[3] };

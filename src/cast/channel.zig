@@ -42,6 +42,7 @@ pub const Error = error{
     RequestFailed,
     LaunchFailed,
     ConnectionClosed,
+    NoMedia,
 };
 
 pub const Channel = struct {
@@ -194,6 +195,8 @@ pub const Channel = struct {
         session_id: []const u8,
         status_text: []const u8,
         is_idle_screen: bool,
+        /// Whether the app accepts media namespace commands.
+        has_media: bool,
     };
 
     pub const Status = struct {
@@ -203,6 +206,12 @@ pub const Channel = struct {
 
         pub fn find(s: Status, app_id: []const u8) ?App {
             for (s.apps) |a| if (std.mem.eql(u8, a.app_id, app_id)) return a;
+            return null;
+        }
+
+        /// The app currently able to play media, if any.
+        pub fn mediaApp(s: Status) ?App {
+            for (s.apps) |a| if (a.has_media and !a.is_idle_screen) return a;
             return null;
         }
     };
@@ -241,6 +250,7 @@ pub const Channel = struct {
                 .session_id = getStr(a, "sessionId") orelse "",
                 .status_text = getStr(a, "statusText") orelse "",
                 .is_idle_screen = getBool(a, "isIdleScreen") orelse false,
+                .has_media = hasNamespace(a, ns_media),
             });
         }
         const volume = getObj(status, "volume");
@@ -251,6 +261,14 @@ pub const Channel = struct {
         };
     }
 
+    fn hasNamespace(app: Json, namespace: []const u8) bool {
+        const list = getArr(app, "namespaces") orelse return false;
+        for (list) |n| {
+            if (getStr(n, "name")) |name| if (std.mem.eql(u8, name, namespace)) return true;
+        }
+        return false;
+    }
+
     // --- media namespace ----------------------------------------------------
 
     pub const MediaStatus = struct {
@@ -259,6 +277,7 @@ pub const Channel = struct {
         current_time: f64,
         duration: ?f64,
         idle_reason: ?[]const u8,
+        playback_rate: f64,
 
         pub fn isFinished(m: MediaStatus) bool {
             return std.mem.eql(u8, m.player_state, "IDLE") and m.idle_reason != null;
@@ -305,7 +324,22 @@ pub const Channel = struct {
             .current_time = getNum(s, "currentTime") orelse 0,
             .duration = if (media) |m| getNum(m, "duration") else null,
             .idle_reason = getStr(s, "idleReason"),
+            .playback_rate = getNum(s, "playbackRate") orelse 1,
         };
+    }
+
+    /// Asks the app for its media status. `error.NoMedia` when nothing is loaded.
+    pub fn getMediaStatus(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8) !MediaStatus {
+        var req: GetStatus = .{};
+        const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return mediaStatusFrom(json) orelse error.NoMedia;
+    }
+
+    /// Rate between 0.5 and 2.0 on the Default Media Receiver.
+    pub fn setPlaybackRate(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, rate: f64) !MediaStatus {
+        var req: SetPlaybackRate = .{ .mediaSessionId = media_session_id, .playbackRate = rate };
+        const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return mediaStatusFrom(json) orelse error.RequestFailed;
     }
 
     pub fn mediaCommand(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, kind: []const u8) !MediaStatus {
@@ -331,6 +365,7 @@ const Launch = struct { type: []const u8 = "LAUNCH", requestId: u32 = 0, appId: 
 const StopApp = struct { type: []const u8 = "STOP", requestId: u32 = 0, sessionId: []const u8 };
 const MediaCommand = struct { type: []const u8, requestId: u32 = 0, mediaSessionId: i64 };
 const Seek = struct { type: []const u8 = "SEEK", requestId: u32 = 0, mediaSessionId: i64, currentTime: f64 };
+const SetPlaybackRate = struct { type: []const u8 = "SET_PLAYBACK_RATE", requestId: u32 = 0, mediaSessionId: i64, playbackRate: f64 };
 
 const Load = struct {
     type: []const u8 = "LOAD",
