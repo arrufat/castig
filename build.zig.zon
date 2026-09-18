@@ -1,0 +1,19 @@
+.{
+    .name = .castig,
+    .version = "0.1.0",
+    .fingerprint = 0xd66b6941cc96816d,
+    .minimum_zig_version = "0.17.0-dev.2163+89ff10d56",
+    .dependencies = .{
+        .ffmpeg = .{
+            .url = "git+https://github.com/allyourcodebase/ffmpeg#115295bda8cc25b2f468c0aa674891af706ab437",
+            .hash = "ffmpeg-8.1.1-6-zT7QA6DlUQQylPHt_7XeseL7QHuOZ5bWgxovMUNNtMG8",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
