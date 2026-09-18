@@ -93,6 +93,26 @@ fn streamHandle(context: *const anyopaque, s: *http.Server, request: *http.Reque
     try body.end();
 }
 
+/// One embedded subtitle stream, converted to WebVTT the first time the
+/// receiver asks for it (scanning the source), then cached.
+const EmbSubCtx = struct {
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    stream_index: usize,
+    cached: ?[]const u8 = null,
+};
+
+fn embSubHandle(context: *const anyopaque, s: *http.Server, request: *http.Request) anyerror!void {
+    const c: *EmbSubCtx = @constCast(@ptrCast(@alignCast(context)));
+    if (c.cached == null) {
+        c.cached = pipeline.extractSubtitle(c.gpa, c.path, c.stream_index) catch |err| {
+            if (s.debug) std.debug.print("subtitle extract failed: {s}\n", .{@errorName(err)});
+            return request.respond("subtitle extract failed\n", .{ .status = .internal_server_error, .extra_headers = http.cors });
+        };
+    }
+    try http.respondBuffer(request, "text/vtt", c.cached.?);
+}
+
 /// Launches the default media receiver, loads the source and follows
 /// playback until it ends. Local files are served from a built-in HTTP
 /// server for as long as the session lasts.
@@ -102,7 +122,9 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     // Routes for whatever must be served locally.
     var routes: std.ArrayList(http.Route) = .empty;
     var media_path: []const u8 = opts.source;
-    var subtitles_path: ?[]const u8 = opts.subtitles;
+    var text_tracks: std.ArrayList(Channel.TextTrack) = .empty;
+    var active_tracks: std.ArrayList(u32) = .empty;
+    var next_track_id: u32 = 1;
     var media_content_type: []const u8 = opts.content_type orelse guessContentType(opts.source);
     var duration: ?f64 = null;
     // Also true for an HLS URL the receiver fetches directly, so it gets the
@@ -194,18 +216,55 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             },
         }
     }
-    if (opts.subtitles) |sub| if (!isUrl(sub)) {
-        const srt = Io.Dir.cwd().readFileAlloc(io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
-            std.debug.print("cannot read {s}: {s}\n", .{ sub, @errorName(err) });
-            return error.SourceUnreadable;
+    // Subtitles: an explicit --subs track (a file converted to WebVTT, or a
+    // URL), enabled by default; plus any text subtitle streams embedded in a
+    // local source, advertised but off by default and extracted on demand.
+    if (opts.subtitles) |sub| {
+        const url = if (isUrl(sub)) sub else blk: {
+            const srt = Io.Dir.cwd().readFileAlloc(io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
+                std.debug.print("cannot read {s}: {s}\n", .{ sub, @errorName(err) });
+                return error.SourceUnreadable;
+            };
+            try routes.append(arena, .{
+                .path = "/sub.vtt",
+                .content_type = "text/vtt",
+                .body = .{ .bytes = try subtitles.srtToVtt(arena, srt) },
+            });
+            break :blk "/sub.vtt";
         };
-        subtitles_path = "/sub.vtt";
-        try routes.append(arena, .{
-            .path = "/sub.vtt",
-            .content_type = "text/vtt",
-            .body = .{ .bytes = try subtitles.srtToVtt(arena, srt) },
-        });
-    };
+        const id = next_track_id;
+        next_track_id += 1;
+        try text_tracks.append(arena, .{ .id = id, .url = url, .name = "Subtitles" });
+        try active_tracks.append(arena, id);
+    }
+    if (!isUrl(opts.source)) {
+        if (pipeline.listSubtitles(arena, opts.source)) |embedded| {
+            for (embedded) |e| {
+                const id = next_track_id;
+                next_track_id += 1;
+                const path = try std.fmt.allocPrint(arena, "/embsub{d}.vtt", .{e.index});
+                const ctx = try arena.create(EmbSubCtx);
+                ctx.* = .{ .gpa = arena, .path = opts.source, .stream_index = e.index };
+                try routes.append(arena, .{
+                    .path = path,
+                    .content_type = "text/vtt",
+                    .body = .{ .dynamic = .{ .context = ctx, .handle = embSubHandle } },
+                });
+                const name = if (e.title.len > 0)
+                    e.title
+                else if (!std.mem.eql(u8, e.language, "und"))
+                    subtitles.languageName(e.language)
+                else
+                    "Subtitles";
+                try text_tracks.append(arena, .{ .id = id, .url = path, .language = e.language, .name = name });
+            }
+            if (embedded.len > 0) {
+                std.debug.print("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu\n", .{embedded.len});
+            }
+        } else |err| {
+            std.debug.print("could not read embedded subtitles: {s}\n", .{@errorName(err)});
+        }
+    }
 
     // Connect only now: a `--remux mp4` transcode above can take minutes, and
     // an idle control channel gets dropped by the receiver (unanswered
@@ -222,8 +281,8 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         const ip = try ch.localIp4();
         const base = try std.fmt.allocPrint(arena, "http://{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], s.port });
         if (!isUrl(opts.source)) media_path = try std.mem.concat(arena, u8, &.{ base, media_path });
-        if (subtitles_path) |p| if (!isUrl(p)) {
-            subtitles_path = try std.mem.concat(arena, u8, &.{ base, p });
+        for (text_tracks.items) |*t| if (!isUrl(t.url)) {
+            t.url = try std.mem.concat(arena, u8, &.{ base, t.url });
         };
         try out.print("serving at {s}\n", .{base});
         try out.flush();
@@ -237,7 +296,8 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         .url = media_path,
         .content_type = media_content_type,
         .title = opts.title orelse (if (isUrl(opts.source)) null else std.fs.path.basename(opts.source)),
-        .subtitles_url = subtitles_path,
+        .text_tracks = text_tracks.items,
+        .active_track_ids = active_tracks.items,
         .duration = duration,
         .hls = is_hls,
     });

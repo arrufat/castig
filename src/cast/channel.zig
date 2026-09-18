@@ -325,12 +325,24 @@ pub const Channel = struct {
         }
     };
 
+    /// A side-loaded WebVTT track offered to the receiver.
+    pub const TextTrack = struct {
+        id: u32,
+        /// WebVTT URL the receiver fetches.
+        url: []const u8,
+        language: []const u8 = "und",
+        /// Shown in the receiver's subtitle menu.
+        name: []const u8 = "Subtitles",
+    };
+
     pub const LoadOptions = struct {
         url: []const u8,
         content_type: []const u8,
         title: ?[]const u8 = null,
-        /// Sidecar subtitles, must be WebVTT and reachable by the receiver.
-        subtitles_url: ?[]const u8 = null,
+        /// Sidecar subtitle tracks, each WebVTT and reachable by the receiver.
+        text_tracks: []const TextTrack = &.{},
+        /// Which track ids start enabled; empty means subtitles off.
+        active_track_ids: []const u32 = &.{},
         start_time: f64 = 0,
         /// Total length in seconds, shown by the receiver's progress bar.
         duration: ?f64 = null,
@@ -340,7 +352,13 @@ pub const Channel = struct {
     };
 
     pub fn load(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, opts: LoadOptions) !MediaStatus {
-        var tracks: [1]Load.Track = undefined;
+        const tracks = try arena.alloc(Load.Track, opts.text_tracks.len);
+        for (opts.text_tracks, 0..) |t, i| tracks[i] = .{
+            .trackId = t.id,
+            .trackContentId = t.url,
+            .language = t.language,
+            .name = t.name,
+        };
         var req: Load = .{
             .currentTime = opts.start_time,
             .media = .{
@@ -352,15 +370,14 @@ pub const Channel = struct {
                 .hlsVideoSegmentFormat = if (opts.hls) "MPEG2_TS" else null,
             },
         };
-        if (opts.subtitles_url) |vtt| {
-            tracks[0] = .{ .trackContentId = vtt, .name = "Subtitles" };
-            req.media.tracks = &tracks;
+        if (tracks.len > 0) {
+            req.media.tracks = tracks;
             req.media.textTrackStyle = .{};
-            req.activeTrackIds = &.{1};
+            // activeTrackIds in the LOAD selects the enabled tracks; a
+            // follow-up EDIT_TRACKS_INFO only raced the not-yet-ready session
+            // and drew INVALID_MEDIA_SESSION_ID.
+            req.activeTrackIds = opts.active_track_ids;
         }
-        // activeTrackIds in the LOAD already selects the subtitle track; a
-        // follow-up EDIT_TRACKS_INFO only raced the not-yet-ready session and
-        // drew INVALID_MEDIA_SESSION_ID.
         const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
         return mediaStatusFrom(json) orelse error.RequestFailed;
     }

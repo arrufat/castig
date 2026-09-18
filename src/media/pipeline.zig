@@ -18,6 +18,7 @@ const Io = std.Io;
 const av = @import("av");
 const extra = @import("../av_extra.zig");
 const probe = @import("../probe.zig");
+const subtitles = @import("subtitles.zig");
 
 const av_time_base: f64 = 1_000_000;
 const io_buffer_len = 64 * 1024;
@@ -83,6 +84,93 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
         .audio_codec = audio_codec,
         .video_height = video_height,
     };
+}
+
+// --- embedded subtitles -----------------------------------------------------
+
+/// A text subtitle stream embedded in the source that we can side-load as a
+/// WebVTT track. `codec`, `language` and `title` point into caller memory.
+pub const SubtitleStream = struct {
+    index: usize,
+    codec: []const u8,
+    language: []const u8,
+    title: []const u8,
+};
+
+fn dictGet(dict: av.Dictionary.Mutable, key: [*:0]const u8) ?[]const u8 {
+    const entry = dict.get(key, null, .{}) orelse return null;
+    return std.mem.span(entry.value);
+}
+
+/// Lists the text subtitle streams embedded in `path`. Bitmap subtitles are
+/// skipped (they cannot become WebVTT). Strings are duped into `gpa`.
+pub fn listSubtitles(gpa: std.mem.Allocator, path: []const u8) ![]SubtitleStream {
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
+    defer gpa.free(path_z);
+
+    av.LOG.set_level(.ERROR);
+    const ic = try av.FormatContext.open_input(path_z, null, null, null);
+    defer ic.close_input();
+    try ic.find_stream_info(null);
+
+    var list: std.ArrayList(SubtitleStream) = .empty;
+    errdefer list.deinit(gpa);
+    for (ic.streams[0..ic.nb_streams], 0..) |st, i| {
+        if (st.codecpar.codec_type != .SUBTITLE) continue;
+        const codec = extra.codecName(extra.codecId(st.codecpar));
+        if (!subtitles.textIsSupported(codec)) continue;
+        try list.append(gpa, .{
+            .index = i,
+            .codec = try gpa.dupe(u8, codec),
+            .language = try gpa.dupe(u8, dictGet(st.metadata, "language") orelse "und"),
+            .title = try gpa.dupe(u8, dictGet(st.metadata, "title") orelse ""),
+        });
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+/// Demuxes subtitle stream `stream_index` from `path` and returns it as WebVTT.
+/// Reads the whole container (subtitle packets are interleaved), so callers
+/// should do this lazily, only when the receiver requests the track.
+pub fn extractSubtitle(gpa: std.mem.Allocator, path: []const u8, stream_index: usize) ![]u8 {
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
+    defer gpa.free(path_z);
+
+    av.LOG.set_level(.ERROR);
+    const ic = try av.FormatContext.open_input(path_z, null, null, null);
+    defer ic.close_input();
+    try ic.find_stream_info(null);
+    if (stream_index >= ic.nb_streams) return error.NoSuchStream;
+
+    const st = ic.streams[stream_index];
+    const tb = st.time_base;
+    const codec = extra.codecName(extra.codecId(st.codecpar));
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try subtitles.writeVttHeader(gpa, &out);
+
+    const pkt = try av.Packet.alloc();
+    defer pkt.free();
+    while (true) {
+        ic.read_frame(pkt) catch |err| switch (err) {
+            error.EndOfFile => break,
+            else => return err,
+        };
+        defer pkt.unref();
+        if (pkt.stream_index != @as(c_int, @intCast(stream_index))) continue;
+        if (pkt.pts == av.NOPTS_VALUE) continue;
+
+        const start_ms = ptsToMs(pkt.pts, tb);
+        const end_ms = if (pkt.duration > 0) ptsToMs(pkt.pts + pkt.duration, tb) else start_ms + 2000;
+        const data = pkt.data[0..@intCast(pkt.size)];
+        try subtitles.writeVttCue(gpa, &out, start_ms, end_ms, codec, data);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn ptsToMs(pts: i64, tb: av.Rational) i64 {
+    return @intFromFloat(@as(f64, @floatFromInt(pts)) * tb.q2d() * 1000.0);
 }
 
 // --- AVIO bridge ------------------------------------------------------------

@@ -13,11 +13,13 @@ const usage =
     \\  probe <file>          print the streams of a media file and whether it can be cast directly
     \\  status <device>       show what the receiver is doing
     \\  cast <device> <file|url> [--title <t>] [--type <mime>] [--subs <file|url>] [--remux <mode>]
-    \\                        play a local file or a URL and follow playback;
-    \\                        subtitles may be .srt or .vtt. When audio must be
-    \\                        remuxed, --remux picks how: hls (default, seekable,
-    \\                        up to ~720p), mp4 (seekable, transcodes first), or
-    \\                        stream (instant, no seek)
+    \\                        play a local file or a URL and follow playback.
+    \\                        --subs adds a .srt or .vtt track (on by default);
+    \\                        embedded text subtitles are offered too, pick one
+    \\                        from the receiver's subtitle menu. When audio must
+    \\                        be remuxed, --remux picks how: hls (default,
+    \\                        seekable, up to ~720p), mp4 (seekable, transcodes
+    \\                        first), or stream (instant, no seek)
     \\  pause <device>        pause the current item
     \\  play <device>         resume the current item
     \\  seek <device> <pos>   jump to <pos>: seconds, m:ss, h:mm:ss, or +N / -N relative
