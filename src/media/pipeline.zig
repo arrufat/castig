@@ -1,20 +1,16 @@
-//! Decides how a file reaches the receiver and drives libav to remux it.
+//! Decides how a file reaches the receiver, and remuxes a time window of it.
 //!
-//! Input is inspected once:
+//! `plan` inspects a file once:
 //!   video playable + audio playable   -> serve the file directly (no remux)
-//!   video playable + audio unplayable -> remux to fragmented MP4, copy the
-//!                                        video stream, transcode audio to AAC
+//!   video playable + audio unplayable -> remux (copy video, audio to AAC)
 //!   video unplayable                  -> caller falls back to direct; software
 //!                                        video transcode is not implemented yet
 //!
-//! The remux output is written through a custom `av.IOContext` whose write
-//! callback feeds an `std.Io.Writer` (the HTTP response body), so nothing
-//! touches the disk. The muxer uses `movflags=frag_keyframe+empty_moov+
-//! default_base_moof`, which streams forward without ever seeking back, so the
-//! AVIO seek callback is null.
-//!
-//! Seeking a transcoded stream restarts the pipeline; that is not wired up
-//! yet, so the receiver treats the remuxed stream as unseekable.
+//! `remuxWindow` transcodes the window [start, end) of a file into a chosen
+//! container, writing through a custom `av.IOContext` whose callback feeds an
+//! `std.Io.Writer`, so nothing touches the disk. The HLS segmenter
+//! (`hls.zig`) calls it once per MPEG-TS segment; the seek callback is null
+//! because both mp4-fragment and mpegts output only stream forward.
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,7 +19,7 @@ const extra = @import("../av_extra.zig");
 const probe = @import("../probe.zig");
 
 /// AV_TIME_BASE: container-level timestamps are microseconds.
-const time_base_q: av.Rational = .{ .num = 1, .den = 1_000_000 };
+const av_time_base: f64 = 1_000_000;
 
 pub const Plan = struct {
     /// True when the file can be served untouched.
@@ -85,16 +81,6 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     };
 }
 
-/// A remux job. `generate` runs the whole transcode, writing MP4 to `w`.
-pub const Remux = struct {
-    gpa: std.mem.Allocator,
-    path: []const u8,
-
-    pub fn generate(ctx: *const Remux, start_time: f64, w: *Io.Writer) anyerror!void {
-        try transcode(ctx.gpa, ctx.path, start_time, w);
-    }
-};
-
 /// Bridges libav's AVIO to an `std.Io.Writer`.
 const Sink = struct {
     w: *Io.Writer,
@@ -115,7 +101,17 @@ fn writeCallback(userdata: ?*anyopaque, buf: [*:0]u8, size: c_int) callconv(.c) 
 const io_buffer_len = 64 * 1024;
 const aac_bitrate = 192_000;
 
-fn transcode(gpa: std.mem.Allocator, path: []const u8, start_time: f64, w: *Io.Writer) !void {
+/// Transcodes the window [start_time, end_time) of `path` into `format`
+/// ("mpegts" or "mp4"), copying video and encoding audio to AAC, writing the
+/// container to `w`. `end_time` null runs to end of file.
+pub fn remuxWindow(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    start_time: f64,
+    end_time: ?f64,
+    format: [*:0]const u8,
+    w: *Io.Writer,
+) !void {
     const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
 
@@ -128,10 +124,10 @@ fn transcode(gpa: std.mem.Allocator, path: []const u8, start_time: f64, w: *Io.W
     const audio_index: usize = if (ic.find_best_stream(.AUDIO, -1, -1)) |a| @intCast(a[0]) else |_| return error.NoAudioStream;
     const in_audio = ic.streams[audio_index];
 
-    // Seek the input to the requested offset. AV_TIME_BASE is microseconds,
+    // Seek the input to the window start. AV_TIME_BASE is microseconds,
     // flag 1 (BACKWARD) lands on the keyframe at or before the target.
     if (start_time > 0) {
-        try ic.seek_frame(-1, @intFromFloat(start_time * 1_000_000), 1);
+        try ic.seek_frame(-1, @intFromFloat(start_time * av_time_base), 1);
     }
 
     // Audio decoder.
@@ -153,8 +149,8 @@ fn transcode(gpa: std.mem.Allocator, path: []const u8, start_time: f64, w: *Io.W
     enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
     try enc.open(enc_codec, null);
 
-    // Output: fragmented MP4 to a custom AVIO backed by the HTTP writer.
-    const oc = try extra.allocOutputContext("mp4");
+    // Output to a custom AVIO backed by the HTTP writer.
+    const oc = try extra.allocOutputContext(format);
     defer av.avformat_free_context(oc);
 
     var sink: Sink = .{ .w = w };
@@ -182,7 +178,9 @@ fn transcode(gpa: std.mem.Allocator, path: []const u8, start_time: f64, w: *Io.W
 
     var opts: av.Dictionary.Mutable = .empty;
     defer opts.free();
-    try opts.set("movflags", "frag_keyframe+empty_moov+default_base_moof", .{});
+    if (std.mem.orderZ(u8, format, "mp4") == .eq) {
+        try opts.set("movflags", "frag_keyframe+empty_moov+default_base_moof", .{});
+    }
     try extra.writeHeader(oc, &opts);
 
     // Audio pipeline: decode -> resample to the encoder format -> FIFO ->
@@ -200,9 +198,7 @@ fn transcode(gpa: std.mem.Allocator, path: []const u8, start_time: f64, w: *Io.W
     defer swr.free();
     try swr.init();
 
-    const fifo = av_fifo: {
-        break :av_fifo extra.av_audio_fifo_alloc(enc.sample_fmt, enc.ch_layout.nb_channels, 1) orelse return error.OutOfMemory;
-    };
+    const fifo = extra.av_audio_fifo_alloc(enc.sample_fmt, enc.ch_layout.nb_channels, 1) orelse return error.OutOfMemory;
     defer extra.av_audio_fifo_free(fifo);
 
     var ctx: AudioCtx = .{
@@ -238,10 +234,19 @@ fn transcode(gpa: std.mem.Allocator, path: []const u8, start_time: f64, w: *Io.W
 
         if (out_video_index != null and pkt.stream_index == @as(c_int, @intCast(video_index.?))) {
             const in_video = ic.streams[video_index.?];
+            // Stop once we reach the segment's end keyframe (video is copied,
+            // so segment boundaries fall on keyframes).
+            if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
+                if (@as(f64, @floatFromInt(pkt.pts)) * in_video.time_base.q2d() >= end) break;
+            };
             extra.av_packet_rescale_ts(pkt, in_video.time_base, oc.streams[@intCast(out_video_index.?)].time_base);
             pkt.stream_index = out_video_index.?;
             try extra.writeFrame(oc, pkt);
         } else if (pkt.stream_index == @as(c_int, @intCast(audio_index))) {
+            // With no video, an audio packet past the window ends the segment.
+            if (out_video_index == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
+                if (@as(f64, @floatFromInt(pkt.pts)) * in_audio.time_base.q2d() >= end) break;
+            };
             try dec.send_packet(pkt);
             try drainDecoder(&ctx, dec_frame);
         }

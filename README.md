@@ -22,10 +22,10 @@ Early. What works today:
   file is converted to WebVTT on the fly. When the audio codec is one the
   receiver cannot decode (AC3, DTS, TrueHD, ...), castig remuxes on the fly:
   the video is copied and the audio is transcoded to AAC in a fragmented MP4,
-  with ffmpeg compiled in, no external process.
-- `castig seek` on a remuxed stream reloads it at the new position, so seeking
-  works there too. The receiver's progress bar restarts at zero after such a
-  seek, because a live stream cannot report an absolute position.
+  with ffmpeg compiled in, no external process. The remux is served as
+  on-demand HLS (a VOD playlist plus MPEG-TS segments transcoded as the
+  receiver asks for them), so playback starts at once and seeking is native
+  with a correct progress bar.
 - `castig pause`, `play`, `seek <pos>` and `rate <x>` control whatever is
   playing, whoever started it. Positions are seconds, `m:ss`, `h:mm:ss`, or
   `+N` / `-N` relative to the current time. Rates go from 0.5 to 2.0.
@@ -36,8 +36,7 @@ Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
 
 Video must already be in a codec the receiver decodes (H.264, VP8, VP9 or
 AV1); unplayable audio is remuxed. Software video transcoding (for HEVC or
-other video) is not implemented. Roadmap: HLS/DASH output so a remuxed
-stream seeks with a correct progress bar → embedded subtitle tracks →
+other video) is not implemented. Roadmap: embedded subtitle tracks →
 software video transcode.
 
 Some receivers, the Pixel Tablet among them, may show an "allow this cast?"
@@ -91,7 +90,8 @@ src/cast/proto.zig      Cast channel framing (length prefix + protobuf CastMessa
 src/cast/channel.zig    Cast v2 protocol over TLS: receiver and media namespaces
 src/http/server.zig     media server the receiver pulls from: files with Range, in-memory bodies
 src/media/subtitles.zig SubRip to WebVTT
-src/media/pipeline.zig  remux decision and the libav transcode (copy video, AC3/DTS/... to AAC)
+src/media/pipeline.zig  remux decision and remuxWindow (copy video, AC3/DTS/... to AAC)
+src/media/hls.zig       on-demand HLS: keyframe segmenter, playlist, per-segment TS
 src/media/pipeline.zig  direct / remux / transcode decision and libav driver (planned)
 ```
 

@@ -1,22 +1,24 @@
 //! Media server the receiver pulls from.
 //!
 //! One listener on an ephemeral port, one task per connection, each running
-//! `std.http.Server`. Routes are fixed at start: a file served with Range
-//! support (206 Partial Content), or an in-memory body such as converted
-//! subtitles. The receiver probes with HEAD first and needs
-//! `Access-Control-Allow-Origin: *` on subtitle tracks, so every response
-//! carries it.
-//!
-//! Live remux/transcode output will be a third route kind, chunked and
-//! without Range, once the media pipeline exists.
+//! `std.http.Server`. A route serves a file with Range support (206 Partial
+//! Content), an in-memory body such as converted subtitles, or a dynamic
+//! handler that writes its own response (used for HLS, where one prefix serves
+//! the playlist and every segment). The receiver probes with HEAD first and
+//! needs `Access-Control-Allow-Origin: *` on everything, so every response
+//! carries CORS headers.
 
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const http = std.http;
 
+/// Convenience alias for dynamic handlers.
+pub const Request = http.Server.Request;
+
 pub const Route = struct {
-    /// Request target, e.g. "/media.mkv". Query strings are ignored on match.
+    /// Request target to match. A trailing '/' matches by prefix (for dynamic
+    /// handlers), otherwise the match is exact. Query strings are ignored.
     path: []const u8,
     content_type: []const u8,
     body: Body,
@@ -26,13 +28,13 @@ pub const Route = struct {
         file: []const u8,
         /// Fixed content kept in memory.
         bytes: []const u8,
-        /// Live-generated output of unknown length (chunked, no Range).
-        stream: Stream,
+        /// A handler that writes the whole response itself.
+        dynamic: Dynamic,
     };
 
-    pub const Stream = struct {
+    pub const Dynamic = struct {
         context: *const anyopaque,
-        generate: *const fn (context: *const anyopaque, start_time: f64, w: *std.Io.Writer) anyerror!void,
+        handle: *const fn (context: *const anyopaque, s: *Server, request: *Request) anyerror!void,
     };
 };
 
@@ -99,16 +101,7 @@ pub const Server = struct {
         }
     }
 
-    /// Sent with every response. The receiver loads side-loaded tracks (and
-    /// adaptive media) through XHR, so it needs CORS on everything, including
-    /// a preflight for the Range header.
-    const cors_headers = [_]http.Header{
-        .{ .name = "access-control-allow-origin", .value = "*" },
-        .{ .name = "access-control-allow-methods", .value = "GET, HEAD, OPTIONS" },
-        .{ .name = "access-control-allow-headers", .value = "Range, Content-Type, Accept-Encoding" },
-        .{ .name = "access-control-expose-headers", .value = "Content-Range, Content-Length, Accept-Ranges, Content-Type" },
-        .{ .name = "access-control-max-age", .value = "86400" },
-    };
+    const cors_headers = cors_array;
 
     fn serve(s: *Server, request: *http.Server.Request) !void {
         const target = request.head.target;
@@ -133,7 +126,11 @@ pub const Server = struct {
 
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
         const route = for (s.routes) |r| {
-            if (std.mem.eql(u8, r.path, path)) break r;
+            const matched = if (std.mem.endsWith(u8, r.path, "/"))
+                std.mem.startsWith(u8, path, r.path)
+            else
+                std.mem.eql(u8, r.path, path);
+            if (matched) break r;
         } else {
             if (s.debug) std.debug.print("http {s} {s} -> 404\n", .{ @tagName(method), target });
             return request.respond("not found\n", .{ .status = .not_found, .extra_headers = &cors_headers });
@@ -143,7 +140,7 @@ pub const Server = struct {
             return request.respond("", .{ .status = .method_not_allowed, .extra_headers = &cors_headers });
         }
 
-        if (route.body == .stream) return s.serveStream(request, route);
+        if (route.body == .dynamic) return route.body.dynamic.handle(route.body.dynamic.context, s, request);
 
         var file_reader_buf: [64 * 1024]u8 = undefined;
         var file: ?Io.File = null;
@@ -158,7 +155,7 @@ pub const Server = struct {
                 file_reader = f.reader(s.io, &file_reader_buf);
                 break :blk try file_reader.getSize();
             },
-            .stream => unreachable, // handled before this point
+            .dynamic => unreachable, // handled before this point
         };
 
         const range = parseRange(range_header, total) catch {
@@ -213,52 +210,45 @@ pub const Server = struct {
                 try file_reader.seekTo(offset);
                 _ = try body.writer.sendFileAll(&file_reader, .limited(@intCast(len)));
             },
-            .stream => unreachable, // handled before this point
+            .dynamic => unreachable, // handled before this point
         }
-        try body.end();
-    }
-
-    /// Streams live-generated output. Length is unknown, so the response is
-    /// chunked and Range is not offered. HEAD returns headers only.
-    fn serveStream(s: *Server, request: *http.Server.Request, route: Route) !void {
-        var headers: [cors_headers.len + 2]http.Header = undefined;
-        @memcpy(headers[0..cors_headers.len], &cors_headers);
-        headers[cors_headers.len] = .{ .name = "content-type", .value = route.content_type };
-        headers[cors_headers.len + 1] = .{ .name = "cache-control", .value = "no-store" };
-
-        if (request.head.method == .HEAD) {
-            return request.respond("", .{ .status = .ok, .extra_headers = &headers });
-        }
-
-        const start_time = queryTime(request.head.target);
-        var send_buf: [64 * 1024]u8 = undefined;
-        var body = try request.respondStreaming(&send_buf, .{
-            .respond_options = .{ .status = .ok, .extra_headers = &headers },
-        });
-        route.body.stream.generate(route.body.stream.context, start_time, &body.writer) catch |err| {
-            if (s.debug) std.debug.print("stream {s} aborted: {s}\n", .{ route.path, @errorName(err) });
-            return; // the connection is torn down by the caller
-        };
         try body.end();
     }
 };
 
-/// Reads the `t` query parameter (seconds) from a request target, 0 if absent.
-pub fn queryTime(target: []const u8) f64 {
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse return 0;
-    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
-    while (it.next()) |kv| {
-        if (std.mem.startsWith(u8, kv, "t=")) {
-            return std.fmt.parseFloat(f64, kv[2..]) catch 0;
-        }
-    }
-    return 0;
+/// CORS sent with every response, including preflight for the Range header.
+/// `cors` is the pointer form dynamic handlers pass as `extra_headers`.
+const cors_array = [_]http.Header{
+    .{ .name = "access-control-allow-origin", .value = "*" },
+    .{ .name = "access-control-allow-methods", .value = "GET, HEAD, OPTIONS" },
+    .{ .name = "access-control-allow-headers", .value = "Range, Content-Type, Accept-Encoding" },
+    .{ .name = "access-control-expose-headers", .value = "Content-Range, Content-Length, Accept-Ranges, Content-Type" },
+    .{ .name = "access-control-max-age", .value = "86400" },
+};
+pub const cors: []const http.Header = &cors_array;
+
+fn streamHeaders(content_type: []const u8) [cors_array.len + 2]http.Header {
+    var headers: [cors_array.len + 2]http.Header = undefined;
+    @memcpy(headers[0..cors_array.len], &cors_array);
+    headers[cors_array.len] = .{ .name = "content-type", .value = content_type };
+    headers[cors_array.len + 1] = .{ .name = "cache-control", .value = "no-store" };
+    return headers;
 }
 
-test "query time" {
-    try std.testing.expectEqual(@as(f64, 0), queryTime("/remux.mp4"));
-    try std.testing.expectEqual(@as(f64, 120), queryTime("/remux.mp4?t=120"));
-    try std.testing.expectEqual(@as(f64, 5.5), queryTime("/remux.mp4?x=1&t=5.5"));
+/// For a dynamic handler's HEAD: headers only, no body.
+pub fn respondHead(request: *Request, content_type: []const u8) !void {
+    const headers = streamHeaders(content_type);
+    return request.respond("", .{ .status = .ok, .extra_headers = &headers });
+}
+
+/// For a dynamic handler's GET: begins a chunked response of unknown length.
+/// `buffer` must outlive the returned writer; the caller writes the body and
+/// calls `end()`.
+pub fn beginStream(request: *Request, buffer: []u8, content_type: []const u8) !http.BodyWriter {
+    const headers = streamHeaders(content_type);
+    return request.respondStreaming(buffer, .{
+        .respond_options = .{ .status = .ok, .extra_headers = &headers },
+    });
 }
 
 pub const Range = struct { start: u64, end: u64 };

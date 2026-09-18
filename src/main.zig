@@ -126,4 +126,5 @@ test {
     _ = @import("cast/channel.zig");
     _ = @import("http/server.zig");
     _ = @import("media/pipeline.zig");
+    _ = @import("media/hls.zig");
 }

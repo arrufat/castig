@@ -325,6 +325,9 @@ pub const Channel = struct {
         start_time: f64 = 0,
         /// Total length in seconds, shown by the receiver's progress bar.
         duration: ?f64 = null,
+        /// True when the URL is an HLS playlist with MPEG-TS segments; the
+        /// receiver must be told, or it assumes fMP4 and fails to load.
+        hls: bool = false,
     };
 
     pub fn load(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, opts: LoadOptions) !MediaStatus {
@@ -336,6 +339,8 @@ pub const Channel = struct {
                 .contentType = opts.content_type,
                 .duration = opts.duration,
                 .metadata = if (opts.title) |t| .{ .title = t } else null,
+                .hlsSegmentFormat = if (opts.hls) "ts" else null,
+                .hlsVideoSegmentFormat = if (opts.hls) "MPEG2_TS" else null,
             },
         };
         if (opts.subtitles_url) |vtt| {
@@ -462,6 +467,8 @@ const Load = struct {
         metadata: ?Metadata = null,
         tracks: ?[]const Track = null,
         textTrackStyle: ?TextTrackStyle = null,
+        hlsSegmentFormat: ?[]const u8 = null,
+        hlsVideoSegmentFormat: ?[]const u8 = null,
     };
     const Metadata = struct { metadataType: u32 = 0, title: []const u8 };
     const Track = struct {

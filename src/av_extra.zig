@@ -136,3 +136,24 @@ pub fn frameGetBuffer(frame: *av.Frame) av.Error!void {
 pub fn copyChannelLayout(dst: *av.ChannelLayout, src: *const av.ChannelLayout) av.Error!void {
     _ = try av.wrap(av_channel_layout_copy(dst, src));
 }
+
+// --- demuxer index (libavformat) -------------------------------------------
+
+pub const AV_PKT_FLAG_KEY: c_int = 1;
+pub const AVINDEX_KEYFRAME: c_int = 1;
+
+/// AVIndexEntry. In C, `flags:2` and `size:30` are bitfields packed into one
+/// 32-bit word; on little-endian x86-64 `flags` occupies the low two bits.
+pub const IndexEntry = extern struct {
+    pos: i64,
+    timestamp: i64,
+    flags_size: u32,
+    min_distance: c_int,
+
+    pub fn isKeyframe(e: *const IndexEntry) bool {
+        return (e.flags_size & @as(u32, @intCast(AVINDEX_KEYFRAME))) != 0;
+    }
+};
+
+pub extern fn avformat_index_get_entries_count(st: *const av.Stream) c_int;
+pub extern fn avformat_index_get_entry(st: *av.Stream, idx: c_int) ?*const IndexEntry;
