@@ -251,6 +251,63 @@ pub fn beginStream(request: *Request, buffer: []u8, content_type: []const u8) !h
     });
 }
 
+/// Serves an in-memory body with a Content-Length and single-range support
+/// (206). Used by dynamic handlers that produce the whole body first (the
+/// Cast receiver's HLS loader needs a Content-Length on segments). Handles
+/// HEAD. `content_range_buf` must outlive the call.
+pub fn respondBuffer(request: *Request, content_type: []const u8, bytes: []const u8) !void {
+    var range_header: ?[]const u8 = null;
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "range")) range_header = h.value;
+    }
+
+    const total: u64 = bytes.len;
+    const range = parseRange(range_header, total) catch {
+        var buf: [64]u8 = undefined;
+        const cr = try std.fmt.bufPrint(&buf, "bytes */{d}", .{total});
+        return request.respond("", .{
+            .status = .range_not_satisfiable,
+            .extra_headers = &(cors_array ++ [_]http.Header{.{ .name = "content-range", .value = cr }}),
+        });
+    };
+
+    var content_range_buf: [96]u8 = undefined;
+    var headers: [cors_array.len + 4]http.Header = undefined;
+    var n: usize = cors_array.len;
+    @memcpy(headers[0..n], &cors_array);
+    headers[n] = .{ .name = "content-type", .value = content_type };
+    n += 1;
+    headers[n] = .{ .name = "accept-ranges", .value = "bytes" };
+    n += 1;
+    headers[n] = .{ .name = "cache-control", .value = "no-store" };
+    n += 1;
+    if (range) |r| {
+        headers[n] = .{ .name = "content-range", .value = try std.fmt.bufPrint(&content_range_buf, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }) };
+        n += 1;
+    }
+
+    const offset: u64 = if (range) |r| r.start else 0;
+    const len: u64 = if (range) |r| r.end - r.start + 1 else total;
+
+    var send_buf: [64 * 1024]u8 = undefined;
+    var body = try request.respondStreaming(&send_buf, .{
+        .content_length = len,
+        .respond_options = .{
+            .status = if (range != null) .partial_content else .ok,
+            .extra_headers = headers[0..n],
+        },
+    });
+    if (request.head.method == .HEAD) {
+        try body.writer.flush();
+        body.state = .end;
+        try body.http_protocol_output.flush();
+        return;
+    }
+    try body.writer.writeAll(bytes[@intCast(offset)..][0..@intCast(len)]);
+    try body.end();
+}
+
 pub const Range = struct { start: u64, end: u64 };
 
 /// Parses a single `bytes=` range against `total`. Null when there is no

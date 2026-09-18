@@ -18,7 +18,9 @@ const pipeline = @import("pipeline.zig");
 const server = @import("../http/server.zig");
 
 pub const url_prefix = "/hls/";
+pub const master_name = "master.m3u8";
 pub const playlist_name = "index.m3u8";
+pub const master_content_type = "application/vnd.apple.mpegurl";
 pub const playlist_content_type = "application/vnd.apple.mpegurl";
 pub const segment_content_type = "video/mp2t";
 /// Cast expects this content type on the LOAD for an HLS source.
@@ -32,6 +34,13 @@ pub const Segmenter = struct {
     /// Start time of each segment, in seconds; ascending, first is 0.
     starts: []f64,
     duration: f64,
+    width: c_int,
+    height: c_int,
+    /// RFC 6381 codecs string for the master playlist, e.g.
+    /// "avc1.640028,mp4a.40.2". The Default Media Receiver needs this to
+    /// initialise its media source, or it never fetches a segment.
+    codecs: []const u8,
+    bandwidth: u64,
 
     pub fn init(gpa: std.mem.Allocator, path: []const u8) !Segmenter {
         const path_z = try gpa.dupeSentinel(u8, path, 0);
@@ -48,11 +57,22 @@ pub const Segmenter = struct {
             return error.NoVideoStream;
         const vstream = ic.streams[video_index];
         const tb = vstream.time_base;
+        const vpar = vstream.codecpar;
 
         const duration: f64 = if (ic.duration != av.NOPTS_VALUE)
             @as(f64, @floatFromInt(ic.duration)) / 1_000_000
         else
             return error.UnknownDuration;
+
+        // avc1 profile/compat/level come from the AVCDecoderConfigurationRecord
+        // (extradata bytes 1..4); fall back to High@4.0 if unavailable.
+        var avc1: [16]u8 = undefined;
+        const avc1_str = if (vpar.extradata_size >= 4)
+            try std.fmt.bufPrint(&avc1, "avc1.{x:0>2}{x:0>2}{x:0>2}", .{ vpar.extradata[1], vpar.extradata[2], vpar.extradata[3] })
+        else
+            "avc1.640028";
+        const codecs = try std.fmt.allocPrint(gpa, "{s},mp4a.40.2", .{avc1_str});
+        const bandwidth: u64 = if (vpar.bit_rate > 0) @as(u64, @intCast(vpar.bit_rate)) + 192_000 else 6_000_000;
 
         var keyframes: std.ArrayList(f64) = .empty;
         defer keyframes.deinit(gpa);
@@ -78,7 +98,17 @@ pub const Segmenter = struct {
             .path = try gpa.dupe(u8, path),
             .starts = starts,
             .duration = duration,
+            .width = vpar.width,
+            .height = vpar.height,
+            .codecs = codecs,
+            .bandwidth = bandwidth,
         };
+    }
+
+    pub fn writeMaster(s: *const Segmenter, w: *Io.Writer) !void {
+        try w.writeAll("#EXTM3U\n#EXT-X-VERSION:3\n");
+        try w.print("#EXT-X-STREAM-INF:BANDWIDTH={d},RESOLUTION={d}x{d},CODECS=\"{s}\"\n", .{ s.bandwidth, s.width, s.height, s.codecs });
+        try w.print("{s}\n", .{playlist_name});
     }
 
     pub fn count(s: *const Segmenter) usize {
@@ -162,27 +192,34 @@ pub fn handleRoute(context: *const anyopaque, s: *server.Server, request: *serve
     const tail = path[url_prefix.len..];
     const head = request.head.method == .HEAD;
 
+    _ = head;
+
+    if (std.mem.eql(u8, tail, master_name)) {
+        var aw: Io.Writer.Allocating = .init(seg.gpa);
+        defer aw.deinit();
+        try seg.writeMaster(&aw.writer);
+        return server.respondBuffer(request, master_content_type, aw.written());
+    }
+
     if (std.mem.eql(u8, tail, playlist_name)) {
-        if (head) return server.respondHead(request, playlist_content_type);
-        var buffer: [16 * 1024]u8 = undefined;
-        var body = try server.beginStream(request, &buffer, playlist_content_type);
-        try seg.writePlaylist(&body.writer);
-        try body.end();
-        return;
+        var aw: Io.Writer.Allocating = .init(seg.gpa);
+        defer aw.deinit();
+        try seg.writePlaylist(&aw.writer);
+        return server.respondBuffer(request, playlist_content_type, aw.written());
     }
 
     if (std.mem.startsWith(u8, tail, "seg") and std.mem.endsWith(u8, tail, ".ts")) {
         const digits = tail["seg".len .. tail.len - ".ts".len];
         const index = std.fmt.parseInt(usize, digits, 10) catch return notFound(request);
-        if (head) return server.respondHead(request, segment_content_type);
-        var buffer: [64 * 1024]u8 = undefined;
-        var body = try server.beginStream(request, &buffer, segment_content_type);
-        seg.writeSegment(index, &body.writer) catch |err| {
-            if (s.debug) std.debug.print("segment {d} aborted: {s}\n", .{ index, @errorName(err) });
-            return; // connection torn down by the caller
+        // Transcode the whole segment first: the Cast receiver's HLS loader
+        // needs a Content-Length, so it cannot be streamed chunked.
+        var aw: Io.Writer.Allocating = .init(seg.gpa);
+        defer aw.deinit();
+        seg.writeSegment(index, &aw.writer) catch |err| {
+            if (s.debug) std.debug.print("segment {d} failed: {s}\n", .{ index, @errorName(err) });
+            return notFound(request);
         };
-        try body.end();
-        return;
+        return server.respondBuffer(request, segment_content_type, aw.written());
     }
 
     return notFound(request);
@@ -205,10 +242,25 @@ test "boundaries group keyframes by target" {
     try std.testing.expect(starts.len >= 9 and starts.len <= 10);
 }
 
+test "master playlist declares codecs and resolution" {
+    const gpa = std.testing.allocator;
+    const starts = try gpa.dupe(f64, &.{0});
+    var seg: Segmenter = .{ .gpa = gpa, .path = "", .starts = starts, .duration = 5, .width = 1920, .height = 818, .codecs = "avc1.640028,mp4a.40.2", .bandwidth = 6000000 };
+    defer gpa.free(seg.starts);
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try seg.writeMaster(&aw.writer);
+    const text = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "#EXT-X-STREAM-INF:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "RESOLUTION=1920x818") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "CODECS=\"avc1.640028,mp4a.40.2\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "index.m3u8\n"));
+}
+
 test "playlist renders a VOD list" {
     const gpa = std.testing.allocator;
     const starts = try gpa.dupe(f64, &.{ 0, 6, 12 });
-    var seg: Segmenter = .{ .gpa = gpa, .path = "", .starts = starts, .duration = 15 };
+    var seg: Segmenter = .{ .gpa = gpa, .path = "", .starts = starts, .duration = 15, .width = 1920, .height = 818, .codecs = "avc1.640028,mp4a.40.2", .bandwidth = 6000000 };
     defer gpa.free(seg.starts);
 
     var aw: Io.Writer.Allocating = .init(gpa);

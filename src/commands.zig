@@ -75,7 +75,9 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     var subtitles_path: ?[]const u8 = opts.subtitles;
     var media_content_type: []const u8 = opts.content_type orelse guessContentType(opts.source);
     var duration: ?f64 = null;
-    var is_hls = false;
+    // Also true for an HLS URL the receiver fetches directly, so it gets the
+    // MPEG-TS segment hint too.
+    var is_hls = std.ascii.findIgnoreCase(media_content_type, "mpegurl") != null;
 
     if (!isUrl(opts.source)) {
         Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
@@ -101,7 +103,7 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             std.debug.print("remuxing {s} audio to aac (hls)\n", .{p.audio_codec});
             const seg = try arena.create(hls.Segmenter);
             seg.* = try hls.Segmenter.init(arena, opts.source);
-            media_path = hls.url_prefix ++ hls.playlist_name;
+            media_path = hls.url_prefix ++ hls.master_name;
             media_content_type = hls.cast_content_type;
             is_hls = true;
             try routes.append(arena, .{

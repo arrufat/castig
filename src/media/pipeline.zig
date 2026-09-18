@@ -159,12 +159,33 @@ pub fn remuxWindow(
     oc.pb = avio;
     defer av.IOContext.free(avio);
 
-    // Copy the video stream as is.
+    // Copy the video stream as is. H.264/HEVC from MP4/MKV keeps its parameter
+    // sets in extradata, so route copied packets through the Annex-B bitstream
+    // filter, which repeats SPS/PPS in-band before each keyframe (MPEG-TS and
+    // the Cast decoder need that; the muxer API will not do it for us).
     var out_video_index: ?c_int = null;
+    var video_bsf: ?*extra.BSFContext = null;
+    defer if (video_bsf) |b| {
+        var bb: ?*extra.BSFContext = b;
+        extra.av_bsf_free(&bb);
+    };
     if (video_index) |vi| {
         const in_video = ic.streams[vi];
         const out_video = try extra.newStream(oc);
-        try extra.copyParameters(out_video.codecpar, in_video.codecpar);
+        const vcodec = extra.codecName(extra.codecId(in_video.codecpar));
+        if (extra.annexbFilterName(vcodec)) |filter_name| {
+            const filter = extra.av_bsf_get_by_name(filter_name) orelse return error.BsfNotFound;
+            var ctx: ?*extra.BSFContext = null;
+            _ = try av.wrap(extra.av_bsf_alloc(filter, &ctx));
+            const b = ctx.?;
+            try extra.copyParameters(b.par_in, in_video.codecpar);
+            b.time_base_in = in_video.time_base;
+            _ = try av.wrap(extra.av_bsf_init(b));
+            video_bsf = b;
+            try extra.copyParameters(out_video.codecpar, b.par_out);
+        } else {
+            try extra.copyParameters(out_video.codecpar, in_video.codecpar);
+        }
         out_video.codecpar.codec_tag = 0;
         out_video.time_base = in_video.time_base;
         out_video_index = out_video.index;
@@ -221,6 +242,8 @@ pub fn remuxWindow(
 
     const pkt = try av.Packet.alloc();
     defer pkt.free();
+    const vpkt = try av.Packet.alloc();
+    defer vpkt.free();
     const dec_frame = try av.Frame.alloc();
     defer dec_frame.free();
 
@@ -234,14 +257,29 @@ pub fn remuxWindow(
 
         if (out_video_index != null and pkt.stream_index == @as(c_int, @intCast(video_index.?))) {
             const in_video = ic.streams[video_index.?];
+            const out_tb = oc.streams[@intCast(out_video_index.?)].time_base;
             // Stop once we reach the segment's end keyframe (video is copied,
             // so segment boundaries fall on keyframes).
             if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
                 if (@as(f64, @floatFromInt(pkt.pts)) * in_video.time_base.q2d() >= end) break;
             };
-            extra.av_packet_rescale_ts(pkt, in_video.time_base, oc.streams[@intCast(out_video_index.?)].time_base);
-            pkt.stream_index = out_video_index.?;
-            try extra.writeFrame(oc, pkt);
+            if (video_bsf) |b| {
+                try extra.bsfSend(b, pkt); // takes ownership of pkt
+                while (true) {
+                    extra.bsfReceive(b, vpkt) catch |err| switch (err) {
+                        error.WouldBlock, error.EndOfFile => break,
+                        else => return err,
+                    };
+                    extra.av_packet_rescale_ts(vpkt, in_video.time_base, out_tb);
+                    vpkt.stream_index = out_video_index.?;
+                    try extra.writeFrame(oc, vpkt);
+                    vpkt.unref();
+                }
+            } else {
+                extra.av_packet_rescale_ts(pkt, in_video.time_base, out_tb);
+                pkt.stream_index = out_video_index.?;
+                try extra.writeFrame(oc, pkt);
+            }
         } else if (pkt.stream_index == @as(c_int, @intCast(audio_index))) {
             // With no video, an audio packet past the window ends the segment.
             if (out_video_index == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
