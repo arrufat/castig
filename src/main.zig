@@ -12,8 +12,9 @@ const usage =
     \\  ls [--timeout <ms>]   discover cast devices on the local network (default 2000 ms)
     \\  probe <file>          print the streams of a media file and whether it can be cast directly
     \\  status <device>       show what the receiver is doing
-    \\  cast <device> <url> [--title <t>] [--type <mime>] [--subs <vtt-url>]
-    \\                        play a URL the receiver can reach, and follow playback
+    \\  cast <device> <file|url> [--title <t>] [--type <mime>] [--subs <file|url>]
+    \\                        play a local file or a URL and follow playback;
+    \\                        subtitles may be .srt or .vtt
     \\  pause <device>        pause the current item
     \\  play <device>         resume the current item
     \\  seek <device> <pos>   jump to <pos>: seconds, m:ss, h:mm:ss, or +N / -N relative
@@ -85,7 +86,7 @@ fn run(init: std.process.Init) !void {
         try commands.rate(io, arena, out, args[2], args[3], options);
     } else if (std.mem.eql(u8, cmd, "cast")) {
         if (args.len < 4) fail(usage);
-        var opts: commands.CastOptions = .{ .url = args[3] };
+        var opts: commands.CastOptions = .{ .source = args[3] };
         var i: usize = 4;
         while (i < args.len) : (i += 1) {
             const flag = args[i];
@@ -96,7 +97,7 @@ fn run(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, flag, "--type")) {
                 opts.content_type = args[i];
             } else if (std.mem.eql(u8, flag, "--subs")) {
-                opts.subtitles_url = args[i];
+                opts.subtitles = args[i];
             } else fail(usage);
         }
         try commands.cast(io, arena, out, args[2], opts, options);
@@ -119,6 +120,7 @@ test {
     _ = @import("discovery.zig");
     _ = @import("probe.zig");
     _ = @import("commands.zig");
+    _ = @import("media/subtitles.zig");
     _ = @import("av_extra.zig");
     _ = @import("cast/proto.zig");
     _ = @import("cast/channel.zig");

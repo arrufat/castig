@@ -113,6 +113,16 @@ pub const Channel = struct {
         ch.gpa.destroy(ch);
     }
 
+    /// Our own address on the interface that reaches the receiver, for URLs
+    /// the receiver must fetch from us.
+    pub fn localIp4(ch: *const Channel) ![4]u8 {
+        var addr: std.os.linux.sockaddr.in = undefined;
+        var len: std.os.linux.socklen_t = @sizeOf(@TypeOf(addr));
+        const rc = std.os.linux.getsockname(ch.stream.socket.handle, @ptrCast(&addr), &len);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.Unexpected;
+        return @bitCast(addr.addr);
+    }
+
     pub fn send(ch: *Channel, destination: []const u8, namespace: []const u8, payload_utf8: []const u8) !void {
         if (ch.debug) std.debug.print("-> {s} {s}\n   {s}\n", .{ destination, namespace, payload_utf8 });
         try proto.encode(.{
@@ -176,6 +186,17 @@ pub const Channel = struct {
                 continue;
             }
             const json = try parsePayload(arena, msg);
+            // Progress of our LAUNCH: the device may ask its user first.
+            if (getInt(json, "launchRequestId") == ch.request_id) {
+                const status = getStr(json, "status") orelse "";
+                if (std.mem.eql(u8, status, "USER_PENDING_AUTHORIZATION")) {
+                    std.debug.print("waiting for the cast to be allowed on the device...\n", .{});
+                } else if (std.mem.eql(u8, status, "USER_NOT_ALLOWED")) {
+                    std.debug.print("the cast was denied on the device\n", .{});
+                    return error.RequestFailed;
+                }
+                continue;
+            }
             if (getInt(json, "requestId") != ch.request_id) continue;
             const kind = getStr(json, "type") orelse continue;
             if (std.mem.eql(u8, kind, expected_type)) return json;

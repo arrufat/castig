@@ -15,9 +15,11 @@ Early. What works today:
 - `castig probe <file>` lists the streams of a file and says whether a
   default receiver can play them directly.
 - `castig status <device>` shows the running app and volume.
-- `castig cast <device> <url>` plays a URL the receiver can reach on the
-  Default Media Receiver and follows playback until it ends. Optional
-  `--title`, `--type <mime>` and `--subs <webvtt-url>`.
+- `castig cast <device> <file|url>` plays a local file or a URL on the
+  Default Media Receiver and follows playback until it ends. Local files are
+  served from a built-in HTTP server with Range support, so seeking works.
+  Optional `--title`, `--type <mime>` and `--subs <file|url>`; an `.srt`
+  file is converted to WebVTT on the fly.
 - `castig pause`, `play`, `seek <pos>` and `rate <x>` control whatever is
   playing, whoever started it. Positions are seconds, `m:ss`, `h:mm:ss`, or
   `+N` / `-N` relative to the current time. Rates go from 0.5 to 2.0.
@@ -26,8 +28,13 @@ Early. What works today:
 `<device>` is an IP, `ip:port`, or any part of a name shown by `ls`.
 Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
 
-Roadmap, in order: direct play of local files over a built-in HTTP server →
-audio remux to fragmented MP4 → subtitles → software video transcode.
+Only files the receiver can decode play today (see `probe`): H.264, VP8,
+VP9 or AV1 video with AAC, MP3, Opus, Vorbis or FLAC audio. Roadmap, in
+order: audio remux to fragmented MP4 (AC3, DTS, TrueHD → AAC) → embedded
+subtitle tracks → software video transcode.
+
+Some receivers, the Pixel Tablet among them, may show an "allow this cast?"
+prompt on screen. castig waits for it and says so.
 
 ## Building
 
@@ -75,7 +82,8 @@ src/commands.zig        `status`, `cast`, `stop`
 src/av_extra.zig        libav declarations missing from the bindings
 src/cast/proto.zig      Cast channel framing (length prefix + protobuf CastMessage)
 src/cast/channel.zig    Cast v2 protocol over TLS: receiver and media namespaces
-src/http/server.zig     media server the receiver pulls from (planned)
+src/http/server.zig     media server the receiver pulls from: files with Range, in-memory bodies
+src/media/subtitles.zig SubRip to WebVTT
 src/media/pipeline.zig  direct / remux / transcode decision and libav driver (planned)
 ```
 

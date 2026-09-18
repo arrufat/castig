@@ -5,6 +5,8 @@ const Io = std.Io;
 const discovery = @import("discovery.zig");
 const channel = @import("cast/channel.zig");
 const Channel = channel.Channel;
+const http = @import("http/server.zig");
+const subtitles = @import("media/subtitles.zig");
 
 /// Shared by every command that opens a channel.
 pub const Options = struct {
@@ -45,29 +47,82 @@ pub fn stop(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
 }
 
 pub const CastOptions = struct {
-    url: []const u8,
+    /// http(s) URL the receiver fetches itself, or a local path castig serves.
+    source: []const u8,
     title: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
-    subtitles_url: ?[]const u8 = null,
+    /// WebVTT URL, or a local .srt/.vtt file castig converts and serves.
+    subtitles: ?[]const u8 = null,
 };
 
-/// Launches the default media receiver, loads the URL and follows playback
-/// until it ends. The URL must be reachable by the receiver, not by us.
+fn isUrl(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://");
+}
+
+/// Launches the default media receiver, loads the source and follows
+/// playback until it ends. Local files are served from a built-in HTTP
+/// server for as long as the session lasts.
 pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, opts: CastOptions, options: Options) !void {
     const address = try discovery.resolve(io, arena, device);
     const ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
     defer ch.deinit();
 
+    // Routes for whatever must be served locally.
+    var routes: std.ArrayList(http.Route) = .empty;
+    var media_path: []const u8 = opts.source;
+    var subtitles_path: ?[]const u8 = opts.subtitles;
+
+    if (!isUrl(opts.source)) {
+        Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
+            std.debug.print("cannot read {s}: {s}\n", .{ opts.source, @errorName(err) });
+            return error.SourceUnreadable;
+        };
+        const ext = std.fs.path.extension(opts.source);
+        media_path = try std.fmt.allocPrint(arena, "/media{s}", .{ext});
+        try routes.append(arena, .{
+            .path = media_path,
+            .content_type = opts.content_type orelse guessContentType(opts.source),
+            .body = .{ .file = opts.source },
+        });
+    }
+    if (opts.subtitles) |sub| if (!isUrl(sub)) {
+        const srt = Io.Dir.cwd().readFileAlloc(io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
+            std.debug.print("cannot read {s}: {s}\n", .{ sub, @errorName(err) });
+            return error.SourceUnreadable;
+        };
+        subtitles_path = "/sub.vtt";
+        try routes.append(arena, .{
+            .path = "/sub.vtt",
+            .content_type = "text/vtt",
+            .body = .{ .bytes = try subtitles.srtToVtt(arena, srt) },
+        });
+    };
+
+    var server: ?*http.Server = null;
+    defer if (server) |s| s.stop();
+    if (routes.items.len > 0) {
+        const s = try http.Server.start(io, arena, routes.items);
+        server = s;
+        const ip = try ch.localIp4();
+        const base = try std.fmt.allocPrint(arena, "http://{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], s.port });
+        if (!isUrl(opts.source)) media_path = try std.mem.concat(arena, u8, &.{ base, media_path });
+        if (subtitles_path) |p| if (!isUrl(p)) {
+            subtitles_path = try std.mem.concat(arena, u8, &.{ base, p });
+        };
+        try out.print("serving at {s}\n", .{base});
+        try out.flush();
+    }
+
     const st = try ch.getStatus(arena);
     const app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
     try ch.connectTransport(app.transport_id);
 
-    const content_type = opts.content_type orelse guessContentType(opts.url);
+    const content_type = opts.content_type orelse guessContentType(opts.source);
     var media = try ch.load(arena, app.transport_id, .{
-        .url = opts.url,
+        .url = media_path,
         .content_type = content_type,
-        .title = opts.title,
-        .subtitles_url = opts.subtitles_url,
+        .title = opts.title orelse (if (isUrl(opts.source)) null else std.fs.path.basename(opts.source)),
+        .subtitles_url = subtitles_path,
     });
     try out.print("loaded on {f} as {s}\n", .{ address, content_type });
     try printMedia(out, media);
