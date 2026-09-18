@@ -126,6 +126,31 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
     try devices.append(gpa, dev);
 }
 
+/// Turns a device argument into an address: "192.168.1.39", "192.168.1.39:8009",
+/// or a case-insensitive fragment of the friendly name, model or id, which
+/// triggers a discovery round.
+pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address {
+    if (spec.len > 0 and std.ascii.isDigit(spec[0])) {
+        if (std.mem.indexOfScalar(u8, spec, ':')) |colon| {
+            const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return error.InvalidAddress;
+            return net.Ip4Address.parse(spec[0..colon], port) catch error.InvalidAddress;
+        }
+        return net.Ip4Address.parse(spec, default_port) catch error.InvalidAddress;
+    }
+
+    const devices = try discover(io, gpa, 2000);
+    defer gpa.free(devices);
+    for (devices) |d| {
+        if (std.ascii.findIgnoreCase(d.friendly_name, spec) != null or
+            std.ascii.findIgnoreCase(d.model, spec) != null or
+            std.mem.startsWith(u8, d.id, spec))
+        {
+            return d.address;
+        }
+    }
+    return error.DeviceNotFound;
+}
+
 pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, timeout_ms: u32) !void {
     const devices = try discover(io, gpa, timeout_ms);
     if (devices.len == 0) {

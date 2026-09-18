@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const commands = @import("commands.zig");
 const discovery = @import("discovery.zig");
 const probe = @import("probe.zig");
 
@@ -10,6 +11,12 @@ const usage =
     \\commands:
     \\  ls [--timeout <ms>]   discover cast devices on the local network (default 2000 ms)
     \\  probe <file>          print the streams of a media file and whether it can be cast directly
+    \\  status <device>       show what the receiver is doing
+    \\  cast <device> <url> [--title <t>] [--type <mime>] [--subs <vtt-url>]
+    \\                        play a URL the receiver can reach, and follow playback
+    \\  stop <device>         stop whatever app is running on the receiver
+    \\
+    \\<device> is an IP, IP:port, or part of a name shown by `ls`.
     \\  help                  show this message
     \\
 ;
@@ -25,6 +32,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len < 2) fail(usage);
     const cmd = args[1];
+    const options: commands.Options = .{
+        .debug = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false,
+    };
 
     if (std.mem.eql(u8, cmd, "ls")) {
         var timeout_ms: u32 = 2000;
@@ -39,6 +49,29 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "probe")) {
         if (args.len != 3) fail(usage);
         try probe.run(arena, out, args[2]);
+    } else if (std.mem.eql(u8, cmd, "status")) {
+        if (args.len != 3) fail(usage);
+        try commands.status(io, arena, out, args[2], options);
+    } else if (std.mem.eql(u8, cmd, "stop")) {
+        if (args.len != 3) fail(usage);
+        try commands.stop(io, arena, out, args[2], options);
+    } else if (std.mem.eql(u8, cmd, "cast")) {
+        if (args.len < 4) fail(usage);
+        var opts: commands.CastOptions = .{ .url = args[3] };
+        var i: usize = 4;
+        while (i < args.len) : (i += 1) {
+            const flag = args[i];
+            if (i + 1 >= args.len) fail(usage);
+            i += 1;
+            if (std.mem.eql(u8, flag, "--title")) {
+                opts.title = args[i];
+            } else if (std.mem.eql(u8, flag, "--type")) {
+                opts.content_type = args[i];
+            } else if (std.mem.eql(u8, flag, "--subs")) {
+                opts.subtitles_url = args[i];
+            } else fail(usage);
+        }
+        try commands.cast(io, arena, out, args[2], opts, options);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try out.writeAll(usage);
     } else {
@@ -57,6 +90,7 @@ test {
     _ = @import("dns.zig");
     _ = @import("discovery.zig");
     _ = @import("probe.zig");
+    _ = @import("commands.zig");
     _ = @import("av_extra.zig");
     _ = @import("cast/proto.zig");
     _ = @import("cast/channel.zig");

@@ -9,15 +9,22 @@ runtime dependency.
 
 ## Status
 
-Scaffold. What works today:
+Early. What works today:
 
 - `castig ls` finds Cast receivers on the LAN through mDNS.
 - `castig probe <file>` lists the streams of a file and says whether a
   default receiver can play them directly.
+- `castig status <device>` shows the running app and volume.
+- `castig cast <device> <url>` plays a URL the receiver can reach on the
+  Default Media Receiver and follows playback until it ends. Optional
+  `--title`, `--type <mime>` and `--subs <webvtt-url>`.
+- `castig stop <device>` stops the running app.
 
-Roadmap, in order: cast channel (TLS + protobuf) → direct play over a local
-HTTP server → audio remux to fragmented MP4 → subtitles → software video
-transcode.
+`<device>` is an IP, `ip:port`, or any part of a name shown by `ls`.
+Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
+
+Roadmap, in order: direct play of local files over a built-in HTTP server →
+audio remux to fragmented MP4 → subtitles → software video transcode.
 
 ## Building
 
@@ -30,6 +37,7 @@ zig build                 # debug build, compiles ffmpeg from source the first t
 zig build test            # unit tests
 zig build run -- ls
 zig build run -- probe movie.mkv
+zig build run -- cast "living room" https://example.com/clip.mp4
 ```
 
 Static release binary:
@@ -60,9 +68,10 @@ src/main.zig            command-line entry point
 src/probe.zig           `probe`: stream listing and cast verdict
 src/discovery.zig       `ls`: mDNS discovery
 src/dns.zig             DNS wire format (query builder, record parser)
+src/commands.zig        `status`, `cast`, `stop`
 src/av_extra.zig        libav declarations missing from the bindings
-src/cast/proto.zig      Cast channel framing (planned)
-src/cast/channel.zig    Cast v2 protocol (planned)
+src/cast/proto.zig      Cast channel framing (length prefix + protobuf CastMessage)
+src/cast/channel.zig    Cast v2 protocol over TLS: receiver and media namespaces
 src/http/server.zig     media server the receiver pulls from (planned)
 src/media/pipeline.zig  direct / remux / transcode decision and libav driver (planned)
 ```
