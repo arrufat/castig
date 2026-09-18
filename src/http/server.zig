@@ -36,8 +36,10 @@ pub const Server = struct {
     routes: []const Route,
     group: Io.Group = .init,
     port: u16,
+    /// Log every request on stderr.
+    debug: bool = false,
 
-    pub fn start(io: Io, gpa: std.mem.Allocator, routes: []const Route) !*Server {
+    pub fn start(io: Io, gpa: std.mem.Allocator, routes: []const Route, debug: bool) !*Server {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         const any: net.IpAddress = .{ .ip4 = .unspecified(0) };
@@ -48,6 +50,7 @@ pub const Server = struct {
             .listener = listener,
             .routes = routes,
             .port = listener.socket.address.getPort(),
+            .debug = debug,
         };
         try s.group.concurrent(io, acceptLoop, .{s});
         return s;
@@ -89,15 +92,42 @@ pub const Server = struct {
         }
     }
 
+    /// Sent with every response. The receiver loads side-loaded tracks (and
+    /// adaptive media) through XHR, so it needs CORS on everything, including
+    /// a preflight for the Range header.
+    const cors_headers = [_]http.Header{
+        .{ .name = "access-control-allow-origin", .value = "*" },
+        .{ .name = "access-control-allow-methods", .value = "GET, HEAD, OPTIONS" },
+        .{ .name = "access-control-allow-headers", .value = "Range, Content-Type, Accept-Encoding" },
+        .{ .name = "access-control-expose-headers", .value = "Content-Range, Content-Length, Accept-Ranges, Content-Type" },
+        .{ .name = "access-control-max-age", .value = "86400" },
+    };
+
     fn serve(s: *Server, request: *http.Server.Request) !void {
         const target = request.head.target;
+        const method = request.head.method;
+
+        var range_header: ?[]const u8 = null;
+        var it = request.iterateHeaders();
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "range")) range_header = h.value;
+        }
+        if (s.debug) std.debug.print("http {s} {s} range={s}\n", .{ @tagName(method), target, range_header orelse "-" });
+
+        if (method == .OPTIONS) {
+            return request.respond("", .{ .status = .no_content, .extra_headers = &cors_headers });
+        }
+
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
         const route = for (s.routes) |r| {
             if (std.mem.eql(u8, r.path, path)) break r;
-        } else return request.respond("not found\n", .{ .status = .not_found });
+        } else {
+            if (s.debug) std.debug.print("http {s} {s} -> 404\n", .{ @tagName(method), target });
+            return request.respond("not found\n", .{ .status = .not_found, .extra_headers = &cors_headers });
+        };
 
-        if (request.head.method != .GET and request.head.method != .HEAD) {
-            return request.respond("", .{ .status = .method_not_allowed });
+        if (method != .GET and method != .HEAD) {
+            return request.respond("", .{ .status = .method_not_allowed, .extra_headers = &cors_headers });
         }
 
         var file_reader_buf: [64 * 1024]u8 = undefined;
@@ -115,29 +145,22 @@ pub const Server = struct {
             },
         };
 
-        var range_header: ?[]const u8 = null;
-        var it = request.iterateHeaders();
-        while (it.next()) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "range")) range_header = h.value;
-        }
-
         const range = parseRange(range_header, total) catch {
             var buf: [64]u8 = undefined;
             const content_range = try std.fmt.bufPrint(&buf, "bytes */{d}", .{total});
             return request.respond("", .{
                 .status = .range_not_satisfiable,
-                .extra_headers = &.{.{ .name = "content-range", .value = content_range }},
+                .extra_headers = &(cors_headers ++ [_]http.Header{.{ .name = "content-range", .value = content_range }}),
             });
         };
 
         var content_range_buf: [96]u8 = undefined;
-        var headers: [5]http.Header = undefined;
-        var n: usize = 0;
+        var headers: [cors_headers.len + 4]http.Header = undefined;
+        var n: usize = cors_headers.len;
+        @memcpy(headers[0..n], &cors_headers);
         headers[n] = .{ .name = "content-type", .value = route.content_type };
         n += 1;
         headers[n] = .{ .name = "accept-ranges", .value = "bytes" };
-        n += 1;
-        headers[n] = .{ .name = "access-control-allow-origin", .value = "*" };
         n += 1;
         headers[n] = .{ .name = "cache-control", .value = "no-store" };
         n += 1;
@@ -160,7 +183,7 @@ pub const Server = struct {
                 .extra_headers = headers[0..n],
             },
         });
-        if (request.head.method == .HEAD) {
+        if (method == .HEAD) {
             // Headers only. The eliding writer would still insist on seeing
             // every byte pass through, so finish the response by hand.
             try body.writer.flush();

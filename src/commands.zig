@@ -101,7 +101,7 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     var server: ?*http.Server = null;
     defer if (server) |s| s.stop();
     if (routes.items.len > 0) {
-        const s = try http.Server.start(io, arena, routes.items);
+        const s = try http.Server.start(io, arena, routes.items, options.debug);
         server = s;
         const ip = try ch.localIp4();
         const base = try std.fmt.allocPrint(arena, "http://{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], s.port });
