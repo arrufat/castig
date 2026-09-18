@@ -325,12 +325,19 @@ pub const Channel = struct {
             },
         };
         if (opts.subtitles_url) |vtt| {
-            tracks[0] = .{ .trackContentId = vtt };
+            tracks[0] = .{ .trackContentId = vtt, .name = "Subtitles" };
             req.media.tracks = &tracks;
+            req.media.textTrackStyle = .{};
             req.activeTrackIds = &.{1};
         }
         const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(json) orelse error.RequestFailed;
+        const status = mediaStatusFrom(json) orelse return error.RequestFailed;
+        if (opts.subtitles_url != null and status.media_session_id != 0) {
+            // Some receivers only switch the track on when asked again after the load.
+            var edit: EditTracks = .{ .mediaSessionId = status.media_session_id, .activeTrackIds = &.{1} };
+            _ = ch.request(arena, transport_id, ns_media, &edit, "MEDIA_STATUS") catch {};
+        }
+        return status;
     }
 
     /// Extracts the first entry of a MEDIA_STATUS message, or null if it has none.
@@ -388,6 +395,27 @@ const MediaCommand = struct { type: []const u8, requestId: u32 = 0, mediaSession
 const Seek = struct { type: []const u8 = "SEEK", requestId: u32 = 0, mediaSessionId: i64, currentTime: f64 };
 const SetPlaybackRate = struct { type: []const u8 = "SET_PLAYBACK_RATE", requestId: u32 = 0, mediaSessionId: i64, playbackRate: f64 };
 
+const EditTracks = struct {
+    type: []const u8 = "EDIT_TRACKS_INFO",
+    requestId: u32 = 0,
+    mediaSessionId: i64,
+    activeTrackIds: []const u32,
+    textTrackStyle: TextTrackStyle = .{},
+};
+
+/// Readable defaults; without a style some receivers render nothing.
+const TextTrackStyle = struct {
+    backgroundColor: []const u8 = "#00000080",
+    foregroundColor: []const u8 = "#FFFFFFFF",
+    edgeType: []const u8 = "DROP_SHADOW",
+    edgeColor: []const u8 = "#000000FF",
+    fontScale: f64 = 1.0,
+    fontStyle: []const u8 = "NORMAL",
+    fontFamily: []const u8 = "Droid Sans",
+    fontGenericFamily: []const u8 = "SANS_SERIF",
+    windowType: []const u8 = "NONE",
+};
+
 const Load = struct {
     type: []const u8 = "LOAD",
     requestId: u32 = 0,
@@ -402,6 +430,7 @@ const Load = struct {
         streamType: []const u8 = "BUFFERED",
         metadata: ?Metadata = null,
         tracks: ?[]const Track = null,
+        textTrackStyle: ?TextTrackStyle = null,
     };
     const Metadata = struct { metadataType: u32 = 0, title: []const u8 };
     const Track = struct {
@@ -411,6 +440,7 @@ const Load = struct {
         trackContentId: []const u8,
         trackContentType: []const u8 = "text/vtt",
         language: []const u8 = "en",
+        name: []const u8 = "Subtitles",
     };
 };
 

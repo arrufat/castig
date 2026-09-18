@@ -108,14 +108,20 @@ pub const Server = struct {
         const method = request.head.method;
 
         var range_header: ?[]const u8 = null;
+        var requested_headers: ?[]const u8 = null;
         var it = request.iterateHeaders();
+        if (s.debug) std.debug.print("http {s} {s}\n", .{ @tagName(method), target });
         while (it.next()) |h| {
+            if (s.debug) std.debug.print("     {s}: {s}\n", .{ h.name, h.value });
             if (std.ascii.eqlIgnoreCase(h.name, "range")) range_header = h.value;
+            if (std.ascii.eqlIgnoreCase(h.name, "access-control-request-headers")) requested_headers = h.value;
         }
-        if (s.debug) std.debug.print("http {s} {s} range={s}\n", .{ @tagName(method), target, range_header orelse "-" });
 
         if (method == .OPTIONS) {
-            return request.respond("", .{ .status = .no_content, .extra_headers = &cors_headers });
+            // Allow exactly what the preflight asks for, on top of the fixed list.
+            var preflight = cors_headers;
+            if (requested_headers) |rh| preflight[2] = .{ .name = "access-control-allow-headers", .value = rh };
+            return request.respond("", .{ .status = .no_content, .extra_headers = &preflight });
         }
 
         const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
