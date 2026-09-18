@@ -6,11 +6,12 @@
 //!   video unplayable                  -> caller falls back to direct; software
 //!                                        video transcode is not implemented yet
 //!
-//! `remuxWindow` transcodes the window [start, end) of a file into a chosen
-//! container, writing through a custom `av.IOContext` whose callback feeds an
-//! `std.Io.Writer`, so nothing touches the disk. The HLS segmenter
-//! (`hls.zig`) calls it once per MPEG-TS segment; the seek callback is null
-//! because both mp4-fragment and mpegts output only stream forward.
+//! `remuxWindow(gpa, path, start, end, format, w)` transcodes the window
+//! [start, end) into `format` ("mpegts" for HLS segments), copying video and
+//! encoding audio to AAC, written through a custom `av.IOContext` into an
+//! `std.Io.Writer` so nothing hits disk. For MPEG-TS the copied H.264/HEVC is
+//! passed through the Annex-B bitstream filter (in-band SPS/PPS). Audio is
+//! downmixed to stereo.
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,21 +19,20 @@ const av = @import("av");
 const extra = @import("../av_extra.zig");
 const probe = @import("../probe.zig");
 
-/// AV_TIME_BASE: container-level timestamps are microseconds.
 const av_time_base: f64 = 1_000_000;
+const io_buffer_len = 64 * 1024;
+const aac_bitrate = 192_000;
+/// fMP4: init is ftyp+moov, each fragment is moof+mdat, timestamps kept absolute.
+const fmp4_movflags = "frag_keyframe+empty_moov+default_base_moof";
 
 pub const Plan = struct {
-    /// True when the file can be served untouched.
     direct: bool,
-    /// True when the video codec is not playable and remux cannot help.
     video_unsupported: bool,
     duration: ?f64,
     video_codec: []const u8,
     audio_codec: []const u8,
 };
 
-/// Opens the file, looks at the primary video and audio streams, and decides
-/// whether a remux is needed. Codecs are matched by name (see `av_extra`).
 pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
@@ -68,7 +68,7 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     }
 
     const duration: ?f64 = if (ic.duration != av.NOPTS_VALUE)
-        @as(f64, @floatFromInt(ic.duration)) / 1_000_000
+        @as(f64, @floatFromInt(ic.duration)) / av_time_base
     else
         null;
 
@@ -81,7 +81,8 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     };
 }
 
-/// Bridges libav's AVIO to an `std.Io.Writer`.
+// --- AVIO bridge ------------------------------------------------------------
+
 const Sink = struct {
     w: *Io.Writer,
     failed: bool = false,
@@ -93,212 +94,240 @@ fn writeCallback(userdata: ?*anyopaque, buf: [*:0]u8, size: c_int) callconv(.c) 
     const bytes: [*]const u8 = @ptrCast(buf);
     sink.w.writeAll(bytes[0..n]) catch {
         sink.failed = true;
-        return -1; // any negative value aborts the muxer
+        return -1;
     };
     return size;
 }
 
-const io_buffer_len = 64 * 1024;
-const aac_bitrate = 192_000;
+// --- session ----------------------------------------------------------------
 
-/// Transcodes the window [start_time, end_time) of `path` into `format`
-/// ("mpegts" or "mp4"), copying video and encoding audio to AAC, writing the
-/// container to `w`. `end_time` null runs to end of file.
-pub fn remuxWindow(
+/// Everything libav needs to remux one file into one output, minus the header
+/// write and the packet loop, which the callers drive differently.
+const Session = struct {
     gpa: std.mem.Allocator,
-    path: []const u8,
-    start_time: f64,
-    end_time: ?f64,
-    format: [*:0]const u8,
-    w: *Io.Writer,
-) !void {
-    const path_z = try gpa.dupeSentinel(u8, path, 0);
-    defer gpa.free(path_z);
+    sink: *Sink,
+    ic: *av.FormatContext,
+    video_index: ?usize,
+    audio_index: usize,
+    dec: *av.Codec.Context,
+    enc: *av.Codec.Context,
+    oc: *av.FormatContext,
+    avio: *av.IOContext,
+    out_video_index: ?c_int,
+    video_bsf: ?*extra.BSFContext,
+    out_audio_index: c_int,
 
-    av.LOG.set_level(.ERROR);
-    const ic = try av.FormatContext.open_input(path_z, null, null, null);
-    defer ic.close_input();
-    try ic.find_stream_info(null);
+    /// `format` is an ffmpeg muxer name ("mp4" or "mpegts"). MPEG-TS gets the
+    /// Annex-B bitstream filter on copied video; MP4 keeps AVCC.
+    fn open(gpa: std.mem.Allocator, path: []const u8, format: [*:0]const u8, sink: *Sink) !Session {
+        const path_z = try gpa.dupeSentinel(u8, path, 0);
+        defer gpa.free(path_z);
 
-    const video_index: ?usize = if (ic.find_best_stream(.VIDEO, -1, -1)) |v| @intCast(v[0]) else |_| null;
-    const audio_index: usize = if (ic.find_best_stream(.AUDIO, -1, -1)) |a| @intCast(a[0]) else |_| return error.NoAudioStream;
-    const in_audio = ic.streams[audio_index];
+        av.LOG.set_level(.ERROR);
+        const ic = try av.FormatContext.open_input(path_z, null, null, null);
+        errdefer ic.close_input();
+        try ic.find_stream_info(null);
 
-    // Seek the input to the window start. AV_TIME_BASE is microseconds,
-    // flag 1 (BACKWARD) lands on the keyframe at or before the target.
-    if (start_time > 0) {
-        try ic.seek_frame(-1, @intFromFloat(start_time * av_time_base), 1);
-    }
+        const video_index: ?usize = if (ic.find_best_stream(.VIDEO, -1, -1)) |v| @intCast(v[0]) else |_| null;
+        const audio_index: usize = if (ic.find_best_stream(.AUDIO, -1, -1)) |a| @intCast(a[0]) else |_| return error.NoAudioStream;
+        const in_audio = ic.streams[audio_index];
 
-    // Audio decoder.
-    const dec_codec = try av.Codec.find_decoder(in_audio.codecpar.codec_id);
-    const dec = try av.Codec.Context.alloc(dec_codec);
-    defer dec.free();
-    try dec.parameters_to_context(in_audio.codecpar);
-    try dec.open(dec_codec, null);
+        const dec_codec = try av.Codec.find_decoder(in_audio.codecpar.codec_id);
+        const dec = try av.Codec.Context.alloc(dec_codec);
+        errdefer dec.free();
+        try dec.parameters_to_context(in_audio.codecpar);
+        try dec.open(dec_codec, null);
 
-    // AAC encoder, same sample rate and channel layout as the source.
-    const enc_codec = try av.Codec.find_encoder_by_name("aac");
-    const enc = try av.Codec.Context.alloc(enc_codec);
-    defer enc.free();
-    enc.sample_rate = dec.sample_rate;
-    try extra.copyChannelLayout(&enc.ch_layout, &dec.ch_layout);
-    enc.sample_fmt = .FLTP;
-    enc.bit_rate = aac_bitrate;
-    enc.time_base = .{ .num = 1, .den = dec.sample_rate };
-    enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
-    try enc.open(enc_codec, null);
+        const enc_codec = try av.Codec.find_encoder_by_name("aac");
+        const enc = try av.Codec.Context.alloc(enc_codec);
+        errdefer enc.free();
+        enc.sample_rate = dec.sample_rate;
+        // Downmix to stereo. Many receivers (and stereo devices like the Pixel
+        // Tablet) reject multichannel AAC in an HLS stream; swr does the mix.
+        extra.av_channel_layout_default(&enc.ch_layout, 2);
+        enc.sample_fmt = .FLTP;
+        enc.bit_rate = aac_bitrate;
+        enc.time_base = .{ .num = 1, .den = dec.sample_rate };
+        enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
+        try enc.open(enc_codec, null);
 
-    // Output to a custom AVIO backed by the HTTP writer.
-    const oc = try extra.allocOutputContext(format);
-    defer av.avformat_free_context(oc);
+        const oc = try extra.allocOutputContext(format);
+        errdefer av.avformat_free_context(oc);
 
-    var sink: Sink = .{ .w = w };
-    const io_buffer = try av.malloc(io_buffer_len);
-    const avio = try av.IOContext.alloc(io_buffer, .writable, &sink, null, writeCallback, null);
-    oc.pb = avio;
-    defer av.IOContext.free(avio);
+        const io_buffer = try av.malloc(io_buffer_len);
+        const avio = try av.IOContext.alloc(io_buffer, .writable, sink, null, writeCallback, null);
+        oc.pb = avio;
+        errdefer av.IOContext.free(avio);
 
-    // Copy the video stream as is. H.264/HEVC from MP4/MKV keeps its parameter
-    // sets in extradata, so route copied packets through the Annex-B bitstream
-    // filter, which repeats SPS/PPS in-band before each keyframe (MPEG-TS and
-    // the Cast decoder need that; the muxer API will not do it for us).
-    var out_video_index: ?c_int = null;
-    var video_bsf: ?*extra.BSFContext = null;
-    defer if (video_bsf) |b| {
-        var bb: ?*extra.BSFContext = b;
-        extra.av_bsf_free(&bb);
-    };
-    if (video_index) |vi| {
-        const in_video = ic.streams[vi];
-        const out_video = try extra.newStream(oc);
-        const vcodec = extra.codecName(extra.codecId(in_video.codecpar));
-        if (extra.annexbFilterName(vcodec)) |filter_name| {
-            const filter = extra.av_bsf_get_by_name(filter_name) orelse return error.BsfNotFound;
-            var ctx: ?*extra.BSFContext = null;
-            _ = try av.wrap(extra.av_bsf_alloc(filter, &ctx));
-            const b = ctx.?;
-            try extra.copyParameters(b.par_in, in_video.codecpar);
-            b.time_base_in = in_video.time_base;
-            _ = try av.wrap(extra.av_bsf_init(b));
-            video_bsf = b;
-            try extra.copyParameters(out_video.codecpar, b.par_out);
-        } else {
-            try extra.copyParameters(out_video.codecpar, in_video.codecpar);
-        }
-        out_video.codecpar.codec_tag = 0;
-        out_video.time_base = in_video.time_base;
-        out_video_index = out_video.index;
-    }
+        const annexb = std.mem.orderZ(u8, format, "mpegts") == .eq;
 
-    // Transcoded audio stream.
-    const out_audio = try extra.newStream(oc);
-    try extra.parametersFromContext(out_audio.codecpar, enc);
-    out_audio.time_base = enc.time_base;
-    const out_audio_index = out_audio.index;
-
-    var opts: av.Dictionary.Mutable = .empty;
-    defer opts.free();
-    if (std.mem.orderZ(u8, format, "mp4") == .eq) {
-        try opts.set("movflags", "frag_keyframe+empty_moov+default_base_moof", .{});
-    }
-    try extra.writeHeader(oc, &opts);
-
-    // Audio pipeline: decode -> resample to the encoder format -> FIFO ->
-    // encode in fixed-size frames.
-    const swr = try av.swr.Context.alloc_set_opts(
-        &enc.ch_layout,
-        enc.sample_fmt,
-        enc.sample_rate,
-        &dec.ch_layout,
-        dec.sample_fmt,
-        dec.sample_rate,
-        0,
-        null,
-    );
-    defer swr.free();
-    try swr.init();
-
-    const fifo = extra.av_audio_fifo_alloc(enc.sample_fmt, enc.ch_layout.nb_channels, 1) orelse return error.OutOfMemory;
-    defer extra.av_audio_fifo_free(fifo);
-
-    var ctx: AudioCtx = .{
-        .gpa = gpa,
-        .dec = dec,
-        .enc = enc,
-        .swr = swr,
-        .fifo = fifo,
-        .oc = oc,
-        .out_index = out_audio_index,
-        .enc_frame = try av.Frame.alloc(),
-        .out_packet = try av.Packet.alloc(),
-        .next_pts = @intFromFloat(start_time * @as(f64, @floatFromInt(dec.sample_rate))),
-        .pts_set = false,
-        .in_time_base = in_audio.time_base,
-        .sink = &sink,
-    };
-    defer ctx.enc_frame.free();
-    defer ctx.out_packet.free();
-
-    const pkt = try av.Packet.alloc();
-    defer pkt.free();
-    const vpkt = try av.Packet.alloc();
-    defer vpkt.free();
-    const dec_frame = try av.Frame.alloc();
-    defer dec_frame.free();
-
-    while (true) {
-        ic.read_frame(pkt) catch |err| switch (err) {
-            error.EndOfFile => break,
-            else => return err,
+        var out_video_index: ?c_int = null;
+        var video_bsf: ?*extra.BSFContext = null;
+        errdefer if (video_bsf) |b| {
+            var bb: ?*extra.BSFContext = b;
+            extra.av_bsf_free(&bb);
         };
-        defer pkt.unref();
-        if (sink.failed) return error.WriteFailed;
-
-        if (out_video_index != null and pkt.stream_index == @as(c_int, @intCast(video_index.?))) {
-            const in_video = ic.streams[video_index.?];
-            const out_tb = oc.streams[@intCast(out_video_index.?)].time_base;
-            // Stop once we reach the segment's end keyframe (video is copied,
-            // so segment boundaries fall on keyframes).
-            if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
-                if (@as(f64, @floatFromInt(pkt.pts)) * in_video.time_base.q2d() >= end) break;
+        if (video_index) |vi| {
+            const in_video = ic.streams[vi];
+            const out_video = try extra.newStream(oc);
+            const vcodec = extra.codecName(extra.codecId(in_video.codecpar));
+            if (annexb) if (extra.annexbFilterName(vcodec)) |filter_name| {
+                const filter = extra.av_bsf_get_by_name(filter_name) orelse return error.BsfNotFound;
+                var ctx: ?*extra.BSFContext = null;
+                _ = try av.wrap(extra.av_bsf_alloc(filter, &ctx));
+                const b = ctx.?;
+                try extra.copyParameters(b.par_in, in_video.codecpar);
+                b.time_base_in = in_video.time_base;
+                _ = try av.wrap(extra.av_bsf_init(b));
+                video_bsf = b;
             };
             if (video_bsf) |b| {
-                try extra.bsfSend(b, pkt); // takes ownership of pkt
-                while (true) {
-                    extra.bsfReceive(b, vpkt) catch |err| switch (err) {
-                        error.WouldBlock, error.EndOfFile => break,
-                        else => return err,
-                    };
-                    extra.av_packet_rescale_ts(vpkt, in_video.time_base, out_tb);
-                    vpkt.stream_index = out_video_index.?;
-                    try extra.writeFrame(oc, vpkt);
-                    vpkt.unref();
-                }
+                try extra.copyParameters(out_video.codecpar, b.par_out);
             } else {
-                extra.av_packet_rescale_ts(pkt, in_video.time_base, out_tb);
-                pkt.stream_index = out_video_index.?;
-                try extra.writeFrame(oc, pkt);
+                try extra.copyParameters(out_video.codecpar, in_video.codecpar);
             }
-        } else if (pkt.stream_index == @as(c_int, @intCast(audio_index))) {
-            // With no video, an audio packet past the window ends the segment.
-            if (out_video_index == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
-                if (@as(f64, @floatFromInt(pkt.pts)) * in_audio.time_base.q2d() >= end) break;
-            };
-            try dec.send_packet(pkt);
-            try drainDecoder(&ctx, dec_frame);
+            out_video.codecpar.codec_tag = 0;
+            out_video.time_base = in_video.time_base;
+            out_video_index = out_video.index;
         }
+
+        const out_audio = try extra.newStream(oc);
+        try extra.parametersFromContext(out_audio.codecpar, enc);
+        out_audio.time_base = enc.time_base;
+
+        return .{
+            .gpa = gpa,
+            .sink = sink,
+            .ic = ic,
+            .video_index = video_index,
+            .audio_index = audio_index,
+            .dec = dec,
+            .enc = enc,
+            .oc = oc,
+            .avio = avio,
+            .out_video_index = out_video_index,
+            .video_bsf = video_bsf,
+            .out_audio_index = out_audio.index,
+        };
     }
 
-    // Flush the decoder, then the FIFO tail, then the encoder.
-    try dec.send_packet(null);
-    try drainDecoder(&ctx, dec_frame);
-    try encodeFifo(&ctx, true);
-    try encodeFrame(&ctx, null);
+    fn deinit(s: *Session) void {
+        if (s.video_bsf) |b| {
+            var bb: ?*extra.BSFContext = b;
+            extra.av_bsf_free(&bb);
+        }
+        av.IOContext.free(s.avio);
+        av.avformat_free_context(s.oc);
+        s.enc.free();
+        s.dec.free();
+        s.ic.close_input();
+    }
 
+    fn writeHeader(s: *Session, movflags: ?[*:0]const u8, keep_absolute_ts: bool) !void {
+        if (keep_absolute_ts) s.oc.avoid_negative_ts = 0; // AVFMT_AVOID_NEG_TS_DISABLED
+        var opts: av.Dictionary.Mutable = .empty;
+        defer opts.free();
+        if (movflags) |f| try opts.set("movflags", f, .{});
+        try extra.writeHeader(s.oc, &opts);
+    }
+
+    /// Copies video and transcodes audio for [start_time, end_time) into the
+    /// already-headered output. `end_time` null runs to end of file.
+    fn runWindow(s: *Session, start_time: f64, end_time: ?f64) !void {
+        if (start_time > 0) try s.ic.seek_frame(-1, @intFromFloat(start_time * av_time_base), 1);
+
+        const in_audio = s.ic.streams[s.audio_index];
+        var ctx: AudioCtx = .{
+            .gpa = s.gpa,
+            .dec = s.dec,
+            .enc = s.enc,
+            .swr = try av.swr.Context.alloc_set_opts(&s.enc.ch_layout, s.enc.sample_fmt, s.enc.sample_rate, &s.dec.ch_layout, s.dec.sample_fmt, s.dec.sample_rate, 0, null),
+            .fifo = extra.av_audio_fifo_alloc(s.enc.sample_fmt, s.enc.ch_layout.nb_channels, 1) orelse return error.OutOfMemory,
+            .oc = s.oc,
+            .out_index = s.out_audio_index,
+            .enc_frame = try av.Frame.alloc(),
+            .out_packet = try av.Packet.alloc(),
+            .next_pts = @intFromFloat(start_time * @as(f64, @floatFromInt(s.dec.sample_rate))),
+            .pts_set = false,
+            .in_time_base = in_audio.time_base,
+            .sink = s.sink,
+        };
+        try ctx.swr.init();
+        defer ctx.swr.free();
+        defer extra.av_audio_fifo_free(ctx.fifo);
+        defer ctx.enc_frame.free();
+        defer ctx.out_packet.free();
+
+        const pkt = try av.Packet.alloc();
+        defer pkt.free();
+        const vpkt = try av.Packet.alloc();
+        defer vpkt.free();
+        const dec_frame = try av.Frame.alloc();
+        defer dec_frame.free();
+
+        while (true) {
+            s.ic.read_frame(pkt) catch |err| switch (err) {
+                error.EndOfFile => break,
+                else => return err,
+            };
+            defer pkt.unref();
+            if (s.sink.failed) return error.WriteFailed;
+
+            if (s.out_video_index != null and pkt.stream_index == @as(c_int, @intCast(s.video_index.?))) {
+                const in_video = s.ic.streams[s.video_index.?];
+                const out_tb = s.oc.streams[@intCast(s.out_video_index.?)].time_base;
+                if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
+                    if (@as(f64, @floatFromInt(pkt.pts)) * in_video.time_base.q2d() >= end) break;
+                };
+                if (s.video_bsf) |b| {
+                    try extra.bsfSend(b, pkt);
+                    while (true) {
+                        extra.bsfReceive(b, vpkt) catch |err| switch (err) {
+                            error.WouldBlock, error.EndOfFile => break,
+                            else => return err,
+                        };
+                        extra.av_packet_rescale_ts(vpkt, in_video.time_base, out_tb);
+                        vpkt.stream_index = s.out_video_index.?;
+                        try extra.writeFrame(s.oc, vpkt);
+                        vpkt.unref();
+                    }
+                } else {
+                    extra.av_packet_rescale_ts(pkt, in_video.time_base, out_tb);
+                    pkt.stream_index = s.out_video_index.?;
+                    try extra.writeFrame(s.oc, pkt);
+                }
+            } else if (pkt.stream_index == @as(c_int, @intCast(s.audio_index))) {
+                if (s.out_video_index == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
+                    if (@as(f64, @floatFromInt(pkt.pts)) * in_audio.time_base.q2d() >= end) break;
+                };
+                try s.dec.send_packet(pkt);
+                try drainDecoder(&ctx, dec_frame);
+            }
+        }
+
+        try s.dec.send_packet(null);
+        try drainDecoder(&ctx, dec_frame);
+        try encodeFifo(&ctx, true);
+        try encodeFrame(&ctx, null);
+    }
+};
+
+// --- public entry points ----------------------------------------------------
+
+/// Generic remux of a window into `format` (used for MPEG-TS). Writes a full
+/// container: header, body, trailer.
+pub fn remuxWindow(gpa: std.mem.Allocator, path: []const u8, start_time: f64, end_time: ?f64, format: [*:0]const u8, w: *Io.Writer) !void {
+    var sink: Sink = .{ .w = w };
+    var s = try Session.open(gpa, path, format, &sink);
+    defer s.deinit();
+    const is_mp4 = std.mem.orderZ(u8, format, "mp4") == .eq;
+    try s.writeHeader(if (is_mp4) fmp4_movflags else null, is_mp4);
+    try s.runWindow(start_time, end_time);
     if (sink.failed) return error.WriteFailed;
-    try extra.writeTrailer(oc);
+    try extra.writeTrailer(s.oc);
 }
+
+// --- audio transcode helpers ------------------------------------------------
 
 const AudioCtx = struct {
     gpa: std.mem.Allocator,
@@ -311,7 +340,6 @@ const AudioCtx = struct {
     enc_frame: *av.Frame,
     out_packet: *av.Packet,
     next_pts: i64,
-    /// Set once the first decoded frame anchors the output timeline.
     pts_set: bool,
     in_time_base: av.Rational,
     sink: *Sink,
@@ -337,7 +365,6 @@ fn drainDecoder(ctx: *AudioCtx, frame: *av.Frame) !void {
     }
 }
 
-/// Resamples one decoded frame into the encoder format and appends it to the FIFO.
 fn pushToFifo(ctx: *AudioCtx, frame: *av.Frame) !void {
     const out_samples = frame.nb_samples + 32;
     var converted: [8]?[*]u8 = @splat(null);
@@ -354,8 +381,6 @@ fn pushToFifo(ctx: *AudioCtx, frame: *av.Frame) !void {
     }
 }
 
-/// Pulls encoder-sized chunks out of the FIFO and encodes them. When `final`
-/// is set, a smaller last chunk is flushed too.
 fn encodeFifo(ctx: *AudioCtx, final: bool) !void {
     const frame_size = ctx.enc.frame_size;
     while (extra.av_audio_fifo_size(ctx.fifo) >= frame_size or (final and extra.av_audio_fifo_size(ctx.fifo) > 0)) {

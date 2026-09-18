@@ -99,7 +99,8 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             });
         } else {
             // Remux: copy video, transcode audio to AAC, serve on-demand HLS
-            // so playback starts at once and the receiver seeks natively.
+            // with fragmented-MP4 (CMAF) segments. Instant start and exact
+            // native seeking via the VOD playlist.
             std.debug.print("remuxing {s} audio to aac (hls)\n", .{p.audio_codec});
             const seg = try arena.create(hls.Segmenter);
             seg.* = try hls.Segmenter.init(arena, opts.source);

@@ -36,8 +36,13 @@ Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
 
 Video must already be in a codec the receiver decodes (H.264, VP8, VP9 or
 AV1); unplayable audio is remuxed. Software video transcoding (for HEVC or
-other video) is not implemented. Roadmap: embedded subtitle tracks →
-software video transcode.
+other video) is not implemented.
+
+Device note: the remux uses HLS with MPEG-TS segments. The Chromecast tested
+(Pixel Tablet) accepts HLS-TS only up to 720p; a 1080p remux is refused by its
+HLS pipeline (though it plays 1080p over direct MP4).
+1080p files with unplayable audio are the open case; the planned fix is a
+pre-transcoded MP4 fallback.
 
 Some receivers, the Pixel Tablet among them, may show an "allow this cast?"
 prompt on screen. castig waits for it and says so.
@@ -90,8 +95,8 @@ src/cast/proto.zig      Cast channel framing (length prefix + protobuf CastMessa
 src/cast/channel.zig    Cast v2 protocol over TLS: receiver and media namespaces
 src/http/server.zig     media server the receiver pulls from: files with Range, in-memory bodies
 src/media/subtitles.zig SubRip to WebVTT
-src/media/pipeline.zig  remux decision and remuxWindow (copy video, AC3/DTS/... to AAC)
-src/media/hls.zig       on-demand HLS: keyframe segmenter, playlist, per-segment TS
+src/media/pipeline.zig  remux decision and remuxWindow (copy video, AC3/DTS/... to AAC, MPEG-TS)
+src/media/hls.zig       on-demand HLS: keyframe segmenter, master+media playlists, per-segment TS
 src/media/pipeline.zig  direct / remux / transcode decision and libav driver (planned)
 ```
 

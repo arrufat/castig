@@ -125,19 +125,13 @@ pub const Segmenter = struct {
         for (0..s.starts.len) |i| max = @max(max, s.segmentDuration(i));
 
         try w.writeAll("#EXTM3U\n#EXT-X-VERSION:3\n");
+        try w.writeAll("#EXT-X-PLAYLIST-TYPE:VOD\n");
         try w.print("#EXT-X-TARGETDURATION:{d}\n", .{@as(u64, @intFromFloat(@ceil(max)))});
-        try w.writeAll("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n");
+        try w.writeAll("#EXT-X-MEDIA-SEQUENCE:0\n");
         for (0..s.starts.len) |i| {
             try w.print("#EXTINF:{d:.3},\nseg{d}.ts\n", .{ s.segmentDuration(i), i });
         }
         try w.writeAll("#EXT-X-ENDLIST\n");
-    }
-
-    pub fn writeSegment(s: *const Segmenter, index: usize, w: *Io.Writer) !void {
-        if (index >= s.starts.len) return error.NoSuchSegment;
-        const start = s.starts[index];
-        const end: ?f64 = if (index + 1 < s.starts.len) s.starts[index + 1] else null;
-        try pipeline.remuxWindow(s.gpa, s.path, start, end, "mpegts", w);
     }
 };
 
@@ -190,9 +184,6 @@ pub fn handleRoute(context: *const anyopaque, s: *server.Server, request: *serve
     const target = request.head.target;
     const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
     const tail = path[url_prefix.len..];
-    const head = request.head.method == .HEAD;
-
-    _ = head;
 
     if (std.mem.eql(u8, tail, master_name)) {
         var aw: Io.Writer.Allocating = .init(seg.gpa);
@@ -211,15 +202,20 @@ pub fn handleRoute(context: *const anyopaque, s: *server.Server, request: *serve
     if (std.mem.startsWith(u8, tail, "seg") and std.mem.endsWith(u8, tail, ".ts")) {
         const digits = tail["seg".len .. tail.len - ".ts".len];
         const index = std.fmt.parseInt(usize, digits, 10) catch return notFound(request);
-        // Transcode the whole segment first: the Cast receiver's HLS loader
-        // needs a Content-Length, so it cannot be streamed chunked.
-        var aw: Io.Writer.Allocating = .init(seg.gpa);
-        defer aw.deinit();
-        seg.writeSegment(index, &aw.writer) catch |err| {
-            if (s.debug) std.debug.print("segment {d} failed: {s}\n", .{ index, @errorName(err) });
-            return notFound(request);
+        if (index >= seg.starts.len) return notFound(request);
+        if (request.head.method == .HEAD) return server.respondHead(request, segment_content_type);
+        // Stream the segment as it is muxed. Buffering the whole thing first
+        // delayed the first byte by seconds and the receiver timed the load out.
+        const start = seg.starts[index];
+        const end: ?f64 = if (index + 1 < seg.starts.len) seg.starts[index + 1] else null;
+        var buffer: [64 * 1024]u8 = undefined;
+        var body = try server.beginStream(request, &buffer, segment_content_type);
+        pipeline.remuxWindow(seg.gpa, seg.path, start, end, "mpegts", &body.writer) catch |err| {
+            if (s.debug) std.debug.print("segment {d} aborted: {s}\n", .{ index, @errorName(err) });
+            return; // connection torn down by the caller
         };
-        return server.respondBuffer(request, segment_content_type, aw.written());
+        try body.end();
+        return;
     }
 
     return notFound(request);

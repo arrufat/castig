@@ -349,14 +349,11 @@ pub const Channel = struct {
             req.media.textTrackStyle = .{};
             req.activeTrackIds = &.{1};
         }
+        // activeTrackIds in the LOAD already selects the subtitle track; a
+        // follow-up EDIT_TRACKS_INFO only raced the not-yet-ready session and
+        // drew INVALID_MEDIA_SESSION_ID.
         const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        const status = mediaStatusFrom(json) orelse return error.RequestFailed;
-        if (opts.subtitles_url != null and status.media_session_id != 0) {
-            // Some receivers only switch the track on when asked again after the load.
-            var edit: EditTracks = .{ .mediaSessionId = status.media_session_id, .activeTrackIds = &.{1} };
-            _ = ch.request(arena, transport_id, ns_media, &edit, "MEDIA_STATUS") catch {};
-        }
-        return status;
+        return mediaStatusFrom(json) orelse error.RequestFailed;
     }
 
     /// Extracts the first entry of a MEDIA_STATUS message, or null if it has none.

@@ -196,3 +196,6 @@ pub fn bsfSend(ctx: *BSFContext, pkt: ?*av.Packet) av.Error!void {
 pub fn bsfReceive(ctx: *BSFContext, pkt: *av.Packet) av.Error!void {
     _ = try av.wrap(av_bsf_receive_packet(ctx, pkt));
 }
+
+// --- channel layout default (libavutil) ------------------------------------
+pub extern fn av_channel_layout_default(ch_layout: *av.ChannelLayout, nb_channels: c_int) void;
