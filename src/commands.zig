@@ -216,7 +216,7 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             .mp4 => {
                 // Seekable MP4 assembled on the fly: video copied, audio to AAC
                 // in memory, moov precomputed for byte-range seeking. No temp.
-                std.debug.print("preparing seekable mp4 (audio to aac, in memory) for {s} ...\n", .{p.audio_codec});
+                // addMp4Route shows a std.Progress bar during the build pass.
                 try out.flush();
                 media_path = "/media.mp4";
                 media_content_type = "video/mp4";

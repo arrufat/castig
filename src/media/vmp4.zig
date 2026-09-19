@@ -406,7 +406,7 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
         0;
     const root = std.Progress.start(io, .{});
     defer root.end();
-    const node = root.start("preparing mp4 (seconds)", total_secs);
+    const node = root.start("preparing seekable mp4 (seconds)", total_secs);
     defer node.end();
 
     while (true) {
