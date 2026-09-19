@@ -453,6 +453,11 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     // both streams shift together, keeping A/V sync and a valid MP4 timeline.
     oc.avoid_negative_ts = 1; // AVFMT_AVOID_NEG_TS_MAKE_NON_NEGATIVE
     try extra.writeHeader(oc, null);
+    // The mov muxer may change the track timescales in write_header, so read
+    // them back and rescale each packet from its source time base; otherwise the
+    // video plays at the wrong speed (timestamps interpreted in the new scale).
+    const vtb_out = oc.streams[@intCast(out_video_index)].time_base;
+    const atb_out = oc.streams[@intCast(out_audio_index)].time_base;
 
     const fp = try av.Packet.alloc();
     defer fp.free();
@@ -494,6 +499,8 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
             is_audio = true;
             src = s.buf_off;
         }
+        // Rescale from the source time base to the muxer's chosen output scale.
+        if (is_audio) extra.av_packet_rescale_ts(fp, enc_tb, atb_out) else extra.av_packet_rescale_ts(fp, in_vtb, vtb_out);
         const before = cap.pos;
         try extra.writeFrameDirect(oc, fp);
         extra.avio_flush(oc.pb.?);
