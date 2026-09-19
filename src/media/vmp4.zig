@@ -278,33 +278,11 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     }
 
     var collector: AudioCollector = .{ .gpa = gpa, .aac = &aac_buf, .samples = &aac_samples };
-    var ctx: pipeline.AudioCtx = .{
-        .gpa = gpa,
-        .dec = dec,
-        .enc = enc,
-        .swr = try av.swr.Context.alloc_set_opts(&enc.ch_layout, enc.sample_fmt, enc.sample_rate, &dec.ch_layout, dec.sample_fmt, dec.sample_rate, 0, null),
-        .fifo = extra.av_audio_fifo_alloc(enc.sample_fmt, enc.ch_layout.nb_channels, 1) orelse return error.OutOfMemory,
-        .oc = oc,
-        .out_index = out_audio_index,
-        .enc_frame = try av.Frame.alloc(),
-        .out_packet = try av.Packet.alloc(),
-        .next_pts = 0,
-        .pts_set = false,
-        .in_time_base = in_audio.time_base,
-        .sink = null,
-        .collect = AudioCollector.cb,
-        .collect_ctx = &collector,
-    };
-    try ctx.swr.init();
-    defer ctx.swr.free();
-    defer extra.av_audio_fifo_free(ctx.fifo);
-    defer ctx.enc_frame.free();
-    defer ctx.out_packet.free();
+    var ctx = try pipeline.AudioCtx.init(dec, enc, in_audio.time_base, 0, AudioCollector.cb, &collector);
+    defer ctx.deinit();
 
     const pkt = try av.Packet.alloc();
     defer pkt.free();
-    const dec_frame = try av.Frame.alloc();
-    defer dec_frame.free();
 
     var verify_buf: std.ArrayList(u8) = .empty;
     defer verify_buf.deinit(gpa);
@@ -340,14 +318,10 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
                 .key = (pkt.flags & 1) != 0,
             });
         } else if (pkt.stream_index == @as(c_int, @intCast(audio_index))) {
-            try dec.send_packet(pkt);
-            try pipeline.drainDecoder(&ctx, dec_frame);
+            try ctx.feed(pkt);
         }
     }
-    try dec.send_packet(null);
-    try pipeline.drainDecoder(&ctx, dec_frame);
-    try pipeline.encodeFifo(&ctx, true);
-    try pipeline.encodeFrame(&ctx, null);
+    try ctx.finish();
 
     for (aac_samples.items) |a| {
         if (a.size > max_size) max_size = a.size;

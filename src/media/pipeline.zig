@@ -334,33 +334,14 @@ const Session = struct {
         if (start_time > 0) try s.ic.seek_frame(-1, @intFromFloat(start_time * av_time_base), 1);
 
         const in_audio = s.ic.streams[s.audio_index];
-        var ctx: AudioCtx = .{
-            .gpa = s.gpa,
-            .dec = s.dec,
-            .enc = s.enc,
-            .swr = try av.swr.Context.alloc_set_opts(&s.enc.ch_layout, s.enc.sample_fmt, s.enc.sample_rate, &s.dec.ch_layout, s.dec.sample_fmt, s.dec.sample_rate, 0, null),
-            .fifo = extra.av_audio_fifo_alloc(s.enc.sample_fmt, s.enc.ch_layout.nb_channels, 1) orelse return error.OutOfMemory,
-            .oc = s.oc,
-            .out_index = s.out_audio_index,
-            .enc_frame = try av.Frame.alloc(),
-            .out_packet = try av.Packet.alloc(),
-            .next_pts = @intFromFloat(start_time * @as(f64, @floatFromInt(s.dec.sample_rate))),
-            .pts_set = false,
-            .in_time_base = in_audio.time_base,
-            .sink = s.sink,
-        };
-        try ctx.swr.init();
-        defer ctx.swr.free();
-        defer extra.av_audio_fifo_free(ctx.fifo);
-        defer ctx.enc_frame.free();
-        defer ctx.out_packet.free();
+        var mux: MuxEmit = .{ .oc = s.oc, .out_index = s.out_audio_index, .enc = s.enc, .sink = s.sink };
+        var ctx = try AudioCtx.init(s.dec, s.enc, in_audio.time_base, start_time, MuxEmit.emit, &mux);
+        defer ctx.deinit();
 
         const pkt = try av.Packet.alloc();
         defer pkt.free();
         const vpkt = try av.Packet.alloc();
         defer vpkt.free();
-        const dec_frame = try av.Frame.alloc();
-        defer dec_frame.free();
 
         while (true) {
             s.ic.read_frame(pkt) catch |err| switch (err) {
@@ -398,15 +379,11 @@ const Session = struct {
                 if (s.out_video_index == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
                     if (@as(f64, @floatFromInt(pkt.pts)) * in_audio.time_base.q2d() >= end) break;
                 };
-                try s.dec.send_packet(pkt);
-                try drainDecoder(&ctx, dec_frame);
+                try ctx.feed(pkt);
             }
         }
 
-        try s.dec.send_packet(null);
-        try drainDecoder(&ctx, dec_frame);
-        try encodeFifo(&ctx, true);
-        try encodeFrame(&ctx, null);
+        try ctx.finish();
     }
 };
 
@@ -426,106 +403,166 @@ pub fn remuxWindow(gpa: std.mem.Allocator, path: []const u8, start_time: f64, en
     try extra.writeTrailer(s.oc);
 }
 
-// --- audio transcode helpers ------------------------------------------------
+// --- audio transcoder -------------------------------------------------------
 
+/// Where an `AudioCtx` sends each encoded AAC packet (in the encoder time_base).
+pub const Emit = *const fn (ctx: *anyopaque, pkt: *av.Packet) anyerror!void;
+
+/// Decodes the source audio, downmixes/resamples through a FIFO, and encodes
+/// AAC. Each finished packet goes to `emit` — the remux `Session` muxes it, the
+/// virtual-MP4 assembler stores it. Drive it with `feed` per packet, then
+/// `finish`.
 pub const AudioCtx = struct {
-    gpa: std.mem.Allocator,
     dec: *av.Codec.Context,
     enc: *av.Codec.Context,
     swr: *av.swr.Context,
     fifo: *extra.AudioFifo,
-    oc: *av.FormatContext,
-    out_index: c_int,
     enc_frame: *av.Frame,
     out_packet: *av.Packet,
+    dec_frame: *av.Frame,
     next_pts: i64,
-    pts_set: bool,
+    pts_set: bool = false,
     in_time_base: av.Rational,
-    sink: ?*Sink,
-    /// When set, encoded packets go here (in encoder time_base) instead of being
-    /// muxed. Used by the virtual-MP4 assembler to capture AAC packets.
-    collect: ?*const fn (*anyopaque, *av.Packet) anyerror!void = null,
-    collect_ctx: ?*anyopaque = null,
+    emit: Emit,
+    emit_ctx: *anyopaque,
+
+    pub fn init(dec: *av.Codec.Context, enc: *av.Codec.Context, in_time_base: av.Rational, start_time: f64, emit: Emit, emit_ctx: *anyopaque) !AudioCtx {
+        const swr = try av.swr.Context.alloc_set_opts(&enc.ch_layout, enc.sample_fmt, enc.sample_rate, &dec.ch_layout, dec.sample_fmt, dec.sample_rate, 0, null);
+        errdefer swr.free();
+        try swr.init();
+        const fifo = extra.av_audio_fifo_alloc(enc.sample_fmt, enc.ch_layout.nb_channels, 1) orelse return error.OutOfMemory;
+        errdefer extra.av_audio_fifo_free(fifo);
+        const enc_frame = try av.Frame.alloc();
+        errdefer enc_frame.free();
+        const out_packet = try av.Packet.alloc();
+        errdefer out_packet.free();
+        const dec_frame = try av.Frame.alloc();
+        errdefer dec_frame.free();
+        return .{
+            .dec = dec,
+            .enc = enc,
+            .swr = swr,
+            .fifo = fifo,
+            .enc_frame = enc_frame,
+            .out_packet = out_packet,
+            .dec_frame = dec_frame,
+            .next_pts = @intFromFloat(start_time * @as(f64, @floatFromInt(dec.sample_rate))),
+            .in_time_base = in_time_base,
+            .emit = emit,
+            .emit_ctx = emit_ctx,
+        };
+    }
+
+    pub fn deinit(ctx: *AudioCtx) void {
+        ctx.swr.free();
+        extra.av_audio_fifo_free(ctx.fifo);
+        ctx.enc_frame.free();
+        ctx.out_packet.free();
+        ctx.dec_frame.free();
+    }
+
+    /// Decodes one audio packet, emitting any AAC packets it completes.
+    pub fn feed(ctx: *AudioCtx, pkt: *av.Packet) !void {
+        try ctx.dec.send_packet(pkt);
+        try ctx.drain();
+    }
+
+    /// Flushes the decoder and encoder at end of stream.
+    pub fn finish(ctx: *AudioCtx) !void {
+        try ctx.dec.send_packet(null);
+        try ctx.drain();
+        try ctx.encodeFifo(true);
+        try ctx.encodeFrame(null);
+    }
+
+    fn drain(ctx: *AudioCtx) !void {
+        const frame = ctx.dec_frame;
+        while (true) {
+            ctx.dec.receive_frame(frame) catch |err| switch (err) {
+                error.WouldBlock, error.EndOfFile => return,
+                else => return err,
+            };
+            defer frame.unref();
+            if (!ctx.pts_set) {
+                const ts = frame.best_effort_timestamp;
+                if (ts != av.NOPTS_VALUE) {
+                    const seconds = @as(f64, @floatFromInt(ts)) * ctx.in_time_base.q2d();
+                    ctx.next_pts = @intFromFloat(seconds * @as(f64, @floatFromInt(ctx.enc.sample_rate)));
+                }
+                ctx.pts_set = true;
+            }
+            try ctx.pushToFifo(frame);
+            try ctx.encodeFifo(false);
+        }
+    }
+
+    fn pushToFifo(ctx: *AudioCtx, frame: *av.Frame) !void {
+        const out_samples = frame.nb_samples + 32;
+        var converted: [8]?[*]u8 = @splat(null);
+        _ = try av.wrap(av.av_samples_alloc(&converted, null, ctx.enc.ch_layout.nb_channels, out_samples, ctx.enc.sample_fmt, 0));
+        defer av.freep(@ptrCast(&converted[0]));
+
+        const in_ptr: [*]const [*]const u8 = @ptrCast(&frame.extended_data[0]);
+        const out_ptr: [*]const [*]u8 = @ptrCast(&converted[0]);
+        const n = try ctx.swr.convert(out_ptr, out_samples, in_ptr, frame.nb_samples);
+
+        if (n > 0) {
+            const data_ptr: [*]const ?*anyopaque = @ptrCast(&converted[0]);
+            if (extra.av_audio_fifo_write(ctx.fifo, data_ptr, @intCast(n)) < 0) return error.FifoWrite;
+        }
+    }
+
+    fn encodeFifo(ctx: *AudioCtx, final: bool) !void {
+        const frame_size = ctx.enc.frame_size;
+        while (extra.av_audio_fifo_size(ctx.fifo) >= frame_size or (final and extra.av_audio_fifo_size(ctx.fifo) > 0)) {
+            const have = extra.av_audio_fifo_size(ctx.fifo);
+            const n = @min(frame_size, have);
+
+            const frame = ctx.enc_frame;
+            frame.unref();
+            frame.nb_samples = n;
+            frame.format = .{ .sample = ctx.enc.sample_fmt };
+            try extra.copyChannelLayout(&frame.ch_layout, &ctx.enc.ch_layout);
+            frame.sample_rate = ctx.enc.sample_rate;
+            try extra.frameGetBuffer(frame);
+
+            const data_ptr: [*]const ?*anyopaque = @ptrCast(&frame.data[0]);
+            if (extra.av_audio_fifo_read(ctx.fifo, data_ptr, n) < n) return error.FifoRead;
+
+            frame.pts = ctx.next_pts;
+            ctx.next_pts += n;
+            try ctx.encodeFrame(frame);
+        }
+    }
+
+    fn encodeFrame(ctx: *AudioCtx, frame: ?*av.Frame) !void {
+        try extra.sendFrame(ctx.enc, frame);
+        while (true) {
+            extra.receivePacket(ctx.enc, ctx.out_packet) catch |err| switch (err) {
+                error.WouldBlock, error.EndOfFile => return,
+                else => return err,
+            };
+            defer ctx.out_packet.unref();
+            try ctx.emit(ctx.emit_ctx, ctx.out_packet);
+        }
+    }
 };
 
-pub fn drainDecoder(ctx: *AudioCtx, frame: *av.Frame) !void {
-    while (true) {
-        ctx.dec.receive_frame(frame) catch |err| switch (err) {
-            error.WouldBlock, error.EndOfFile => return,
-            else => return err,
-        };
-        defer frame.unref();
-        if (!ctx.pts_set) {
-            const ts = frame.best_effort_timestamp;
-            if (ts != av.NOPTS_VALUE) {
-                const seconds = @as(f64, @floatFromInt(ts)) * ctx.in_time_base.q2d();
-                ctx.next_pts = @intFromFloat(seconds * @as(f64, @floatFromInt(ctx.enc.sample_rate)));
-            }
-            ctx.pts_set = true;
-        }
-        try pushToFifo(ctx, frame);
-        try encodeFifo(ctx, false);
+/// Muxes each encoded AAC packet into `oc` (used by the remux `Session`).
+const MuxEmit = struct {
+    oc: *av.FormatContext,
+    out_index: c_int,
+    enc: *av.Codec.Context,
+    sink: *Sink,
+
+    fn emit(ectx: *anyopaque, pkt: *av.Packet) anyerror!void {
+        const m: *MuxEmit = @ptrCast(@alignCast(ectx));
+        pkt.stream_index = m.out_index;
+        extra.av_packet_rescale_ts(pkt, m.enc.time_base, m.oc.streams[@intCast(m.out_index)].time_base);
+        try extra.writeFrame(m.oc, pkt);
+        if (m.sink.failed) return error.WriteFailed;
     }
-}
-
-pub fn pushToFifo(ctx: *AudioCtx, frame: *av.Frame) !void {
-    const out_samples = frame.nb_samples + 32;
-    var converted: [8]?[*]u8 = @splat(null);
-    _ = try av.wrap(av.av_samples_alloc(&converted, null, ctx.enc.ch_layout.nb_channels, out_samples, ctx.enc.sample_fmt, 0));
-    defer av.freep(@ptrCast(&converted[0]));
-
-    const in_ptr: [*]const [*]const u8 = @ptrCast(&frame.extended_data[0]);
-    const out_ptr: [*]const [*]u8 = @ptrCast(&converted[0]);
-    const n = try ctx.swr.convert(out_ptr, out_samples, in_ptr, frame.nb_samples);
-
-    if (n > 0) {
-        const data_ptr: [*]const ?*anyopaque = @ptrCast(&converted[0]);
-        if (extra.av_audio_fifo_write(ctx.fifo, data_ptr, @intCast(n)) < 0) return error.FifoWrite;
-    }
-}
-
-pub fn encodeFifo(ctx: *AudioCtx, final: bool) !void {
-    const frame_size = ctx.enc.frame_size;
-    while (extra.av_audio_fifo_size(ctx.fifo) >= frame_size or (final and extra.av_audio_fifo_size(ctx.fifo) > 0)) {
-        const have = extra.av_audio_fifo_size(ctx.fifo);
-        const n = @min(frame_size, have);
-
-        const frame = ctx.enc_frame;
-        frame.unref();
-        frame.nb_samples = n;
-        frame.format = .{ .sample = ctx.enc.sample_fmt };
-        try extra.copyChannelLayout(&frame.ch_layout, &ctx.enc.ch_layout);
-        frame.sample_rate = ctx.enc.sample_rate;
-        try extra.frameGetBuffer(frame);
-
-        const data_ptr: [*]const ?*anyopaque = @ptrCast(&frame.data[0]);
-        if (extra.av_audio_fifo_read(ctx.fifo, data_ptr, n) < n) return error.FifoRead;
-
-        frame.pts = ctx.next_pts;
-        ctx.next_pts += n;
-        try encodeFrame(ctx, frame);
-    }
-}
-
-pub fn encodeFrame(ctx: *AudioCtx, frame: ?*av.Frame) !void {
-    try extra.sendFrame(ctx.enc, frame);
-    while (true) {
-        extra.receivePacket(ctx.enc, ctx.out_packet) catch |err| switch (err) {
-            error.WouldBlock, error.EndOfFile => return,
-            else => return err,
-        };
-        defer ctx.out_packet.unref();
-        if (ctx.collect) |collect| {
-            // Hand the encoder-time_base packet to the assembler; do not mux.
-            try collect(ctx.collect_ctx.?, ctx.out_packet);
-            continue;
-        }
-        ctx.out_packet.stream_index = ctx.out_index;
-        extra.av_packet_rescale_ts(ctx.out_packet, ctx.enc.time_base, ctx.oc.streams[@intCast(ctx.out_index)].time_base);
-        try extra.writeFrame(ctx.oc, ctx.out_packet);
-        if (ctx.sink) |sk| if (sk.failed) return error.WriteFailed;
-    }
-}
+};
 
 test {
     std.testing.refAllDecls(@This());
