@@ -399,12 +399,29 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
 
     var max_size: u32 = 0;
 
+    // Progress over the single pass this build makes over the source.
+    const total_secs: usize = if (ic.duration != av.NOPTS_VALUE)
+        @intFromFloat(@as(f64, @floatFromInt(ic.duration)) / 1_000_000.0)
+    else
+        0;
+    const root = std.Progress.start(io, .{});
+    defer root.end();
+    const node = root.start("preparing mp4 (seconds)", total_secs);
+    defer node.end();
+
     while (true) {
         ic.read_frame(pkt) catch |err| switch (err) {
             error.EndOfFile => break,
             else => return err,
         };
         defer pkt.unref();
+        if (pkt.pts != av.NOPTS_VALUE and
+            (pkt.stream_index == @as(c_int, @intCast(video_index)) or pkt.stream_index == @as(c_int, @intCast(audio_index))))
+        {
+            const tb = if (pkt.stream_index == @as(c_int, @intCast(video_index))) in_vtb else in_audio.time_base;
+            const secs = @as(f64, @floatFromInt(pkt.pts)) * tb.q2d();
+            if (secs > 0) node.setCompletedItems(@intFromFloat(secs));
+        }
         if (pkt.stream_index == @as(c_int, @intCast(video_index))) {
             // pread mode needs a real file offset; redemux serves by DTS.
             if (pkt.size <= 0 or (video_src == .pread and pkt.pos < 0)) {
