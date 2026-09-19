@@ -17,8 +17,9 @@ const usage =
     \\                        --subs adds a .srt or .vtt track (on by default);
     \\                        embedded text subtitles are offered too, pick one
     \\                        from the receiver's subtitle menu. When audio must
-    \\                        be remuxed, --remux picks how: hls (default,
-    \\                        seekable, up to ~720p), mp4 (seekable, no temp
+    \\                        be remuxed, --remux picks how: auto (default: hls,
+    \\                        falling back to mp4 if the receiver refuses it),
+    \\                        hls (seekable, instant), mp4 (seekable, no temp
     \\                        file, brief startup), or stream (instant, no seek)
     \\  pause <device>        pause the current item
     \\  play <device>         resume the current item
@@ -108,14 +109,16 @@ fn run(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, flag, "--subs")) {
                 opts.subtitles = args[i];
             } else if (std.mem.eql(u8, flag, "--remux")) {
-                opts.remux = if (std.mem.eql(u8, args[i], "hls"))
+                opts.remux = if (std.mem.eql(u8, args[i], "auto"))
+                    .auto
+                else if (std.mem.eql(u8, args[i], "hls"))
                     .hls
                 else if (std.mem.eql(u8, args[i], "mp4"))
                     .mp4
                 else if (std.mem.eql(u8, args[i], "stream"))
                     .stream
                 else
-                    fail("--remux expects hls, mp4, or stream\n");
+                    fail("--remux expects auto, hls, mp4, or stream\n");
             } else fail(usage);
         }
         try commands.cast(io, arena, out, args[2], opts, options);

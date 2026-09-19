@@ -51,11 +51,14 @@ pub fn stop(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
 
 /// How to deliver a file whose audio must be remuxed.
 pub const Remux = enum {
+    /// Pick by resolution: hls for video up to ~720p (instant + seek), mp4
+    /// above that (seekable where hls is refused). The default.
+    auto,
     /// On-demand HLS (MPEG-TS), instant + native seek. Best for video up to
     /// ~720p; some receivers refuse higher-resolution HLS-TS.
     hls,
-    /// Pre-transcode to a seekable MP4 on disk, then serve with Range. Plays
-    /// where HLS is refused and seeks natively, but starts after a delay.
+    /// On-the-fly seekable MP4 (no temp file). Plays where HLS is refused and
+    /// seeks natively, but starts after a one-time pass over the source.
     mp4,
     /// Fragmented-MP4 live stream. Instant start, no seek.
     stream,
@@ -68,15 +71,12 @@ pub const CastOptions = struct {
     content_type: ?[]const u8 = null,
     /// WebVTT URL, or a local .srt/.vtt file castig converts and serves.
     subtitles: ?[]const u8 = null,
-    remux: Remux = .hls,
+    remux: Remux = .auto,
 };
 
 fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://");
 }
-
-/// The tested Chromecast refuses HLS-TS above this height.
-const hls_height_limit: c_int = 720;
 
 /// Streams a fragmented-MP4 (`--remux stream`) as it is muxed.
 const StreamCtx = struct { gpa: std.mem.Allocator, path: []const u8 };
@@ -114,6 +114,21 @@ fn addStreamRoute(arena: std.mem.Allocator, routes: *std.ArrayList(http.Route), 
         .content_type = "video/mp4",
         .body = .{ .dynamic = .{ .context = c, .handle = streamHandle } },
     });
+}
+
+/// Registers the on-the-fly seekable-mp4 route at /media.mp4, or the no-seek
+/// stream route if the file cannot be made seekable byte-exactly.
+fn addMp4Route(arena: std.mem.Allocator, io: Io, routes: *std.ArrayList(http.Route), source: []const u8, debug: bool) !void {
+    if (try vmp4.build(arena, io, source, debug)) |vm| {
+        try routes.append(arena, .{
+            .path = "/media.mp4",
+            .content_type = "video/mp4",
+            .body = .{ .dynamic = .{ .context = vm, .handle = vmp4Handle } },
+        });
+    } else {
+        std.debug.print("note: this file cannot be made seekable without a copy; serving without seek.\n", .{});
+        try addStreamRoute(arena, routes, source);
+    }
 }
 
 /// One embedded subtitle stream, converted to WebVTT the first time the
@@ -176,13 +191,10 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
                 .body = .{ .file = opts.source },
             });
         } else switch (opts.remux) {
-            .hls => {
-                // On-demand HLS (MPEG-TS): copy video, audio to AAC, instant
-                // start and native seek via the VOD playlist.
+            // Auto starts with HLS (instant + seek); if the receiver refuses it
+            // (e.g. high-resolution HLS-TS), the load below falls back to mp4.
+            .auto, .hls => {
                 std.debug.print("remuxing {s} audio to aac (hls)\n", .{p.audio_codec});
-                if (p.video_height > hls_height_limit) {
-                    std.debug.print("note: video is {d}p; some receivers refuse HLS above {d}p. If it fails, retry with --remux mp4 (seekable, slower start) or --remux stream (instant, no seek).\n", .{ p.video_height, hls_height_limit });
-                }
                 const seg = try arena.create(hls.Segmenter);
                 seg.* = try hls.Segmenter.init(arena, opts.source);
                 media_path = hls.url_prefix ++ hls.master_name;
@@ -202,25 +214,13 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
                 try addStreamRoute(arena, &routes, opts.source);
             },
             .mp4 => {
-                // Seekable MP4 assembled on the fly: video copied from the
-                // source, audio re-encoded to AAC held in memory, and the moov
-                // precomputed so the receiver seeks by byte range. No temp file.
+                // Seekable MP4 assembled on the fly: video copied, audio to AAC
+                // in memory, moov precomputed for byte-range seeking. No temp.
                 std.debug.print("preparing seekable mp4 (audio to aac, in memory) for {s} ...\n", .{p.audio_codec});
                 try out.flush();
                 media_path = "/media.mp4";
                 media_content_type = "video/mp4";
-                if (try vmp4.build(arena, io, opts.source, options.debug)) |vm| {
-                    try routes.append(arena, .{
-                        .path = "/media.mp4",
-                        .content_type = "video/mp4",
-                        .body = .{ .dynamic = .{ .context = vm, .handle = vmp4Handle } },
-                    });
-                } else {
-                    // Byte-exact seeking is not possible for this file; serve the
-                    // temp-free fragmented-MP4 stream instead (plays, no seek).
-                    std.debug.print("note: this file cannot be made seekable without a copy; serving without seek. Use --remux hls for a seekable option.\n", .{});
-                    try addStreamRoute(arena, &routes, opts.source);
-                }
+                try addMp4Route(arena, io, &routes, opts.source, options.debug);
             },
         }
     }
@@ -272,16 +272,17 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     // an idle control channel gets dropped by the receiver (unanswered
     // heartbeat PINGs), which then surfaces as ConnectionClosed on the first
     // request. Opening it after the heavy work keeps it live through LOAD.
-    const ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
+    var ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
     defer ch.deinit();
 
     var server: ?*http.Server = null;
     defer if (server) |s| s.stop();
+    var base: []const u8 = "";
     if (routes.items.len > 0) {
         const s = try http.Server.start(io, arena, routes.items, options.debug);
         server = s;
         const ip = try ch.localIp4();
-        const base = try std.fmt.allocPrint(arena, "http://{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], s.port });
+        base = try std.fmt.allocPrint(arena, "http://{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], s.port });
         if (!isUrl(opts.source)) media_path = try std.mem.concat(arena, u8, &.{ base, media_path });
         for (text_tracks.items) |*t| if (!isUrl(t.url)) {
             t.url = try std.mem.concat(arena, u8, &.{ base, t.url });
@@ -290,19 +291,47 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         try out.flush();
     }
 
-    const st = try ch.getStatus(arena);
-    const app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
+    const title = opts.title orelse (if (isUrl(opts.source)) null else std.fs.path.basename(opts.source));
+    var st = try ch.getStatus(arena);
+    var app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
     try ch.connectTransport(app.transport_id);
 
-    var media = try ch.load(arena, app.transport_id, .{
+    var media = ch.load(arena, app.transport_id, .{
         .url = media_path,
         .content_type = media_content_type,
-        .title = opts.title orelse (if (isUrl(opts.source)) null else std.fs.path.basename(opts.source)),
+        .title = title,
         .text_tracks = text_tracks.items,
         .active_track_ids = active_tracks.items,
         .duration = duration,
         .hls = is_hls,
-    });
+    }) catch |err| fallback: {
+        // Auto mode: if the receiver refuses the HLS load, build a seekable mp4
+        // and retry. The mp4 build can take a while, so close the channel first
+        // (an idle one gets dropped) and reconnect after.
+        if (opts.remux != .auto or !is_hls or isUrl(opts.source) or err != error.RequestFailed) return err;
+        std.debug.print("receiver refused HLS; falling back to seekable mp4 ...\n", .{});
+        try out.flush();
+        ch.deinit();
+        try addMp4Route(arena, io, &routes, opts.source, options.debug);
+        if (server) |s| s.setRoutes(routes.items);
+        media_content_type = "video/mp4";
+        is_hls = false;
+        media_path = try std.mem.concat(arena, u8, &.{ base, "/media.mp4" });
+
+        ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
+        st = try ch.getStatus(arena);
+        app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
+        try ch.connectTransport(app.transport_id);
+        break :fallback try ch.load(arena, app.transport_id, .{
+            .url = media_path,
+            .content_type = media_content_type,
+            .title = title,
+            .text_tracks = text_tracks.items,
+            .active_track_ids = active_tracks.items,
+            .duration = duration,
+            .hls = false,
+        });
+    };
     try out.print("loaded on {f} as {s}\n", .{ address, media_content_type });
     try printMedia(out, media);
     try out.flush();

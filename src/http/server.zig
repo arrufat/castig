@@ -65,6 +65,13 @@ pub const Server = struct {
         return s;
     }
 
+    /// Replaces the route table (used when the cast falls back to another
+    /// delivery mode after the server is already running). The new slice must
+    /// outlive the server.
+    pub fn setRoutes(s: *Server, routes: []const Route) void {
+        s.routes = routes;
+    }
+
     pub fn stop(s: *Server) void {
         // Wake the blocked accept, then cancel the connection tasks.
         _ = std.os.linux.shutdown(s.listener.socket.handle, std.os.linux.SHUT.RDWR);
