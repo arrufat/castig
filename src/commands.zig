@@ -104,6 +104,18 @@ fn vmp4Handle(context: *const anyopaque, s: *http.Server, request: *http.Request
     try http.respondVirtual(request, "video/mp4", vm.totalSize(), vm, vmp4ReadFn);
 }
 
+/// Registers the fragmented-MP4 live-stream route at /media.mp4 (instant, no
+/// seek). Used by `--remux stream` and as the `--remux mp4` fallback.
+fn addStreamRoute(arena: std.mem.Allocator, routes: *std.ArrayList(http.Route), source: []const u8) !void {
+    const c = try arena.create(StreamCtx);
+    c.* = .{ .gpa = arena, .path = source };
+    try routes.append(arena, .{
+        .path = "/media.mp4",
+        .content_type = "video/mp4",
+        .body = .{ .dynamic = .{ .context = c, .handle = streamHandle } },
+    });
+}
+
 /// One embedded subtitle stream, converted to WebVTT the first time the
 /// receiver asks for it (scanning the source), then cached.
 const EmbSubCtx = struct {
@@ -182,15 +194,9 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             .stream => {
                 // Fragmented-MP4 live stream: instant, no seek.
                 std.debug.print("remuxing {s} audio to aac (fragmented mp4, no seek)\n", .{p.audio_codec});
-                const c = try arena.create(StreamCtx);
-                c.* = .{ .gpa = arena, .path = opts.source };
                 media_path = "/media.mp4";
                 media_content_type = "video/mp4";
-                try routes.append(arena, .{
-                    .path = "/media.mp4",
-                    .content_type = "video/mp4",
-                    .body = .{ .dynamic = .{ .context = c, .handle = streamHandle } },
-                });
+                try addStreamRoute(arena, &routes, opts.source);
             },
             .mp4 => {
                 // Seekable MP4 assembled on the fly: video copied from the
@@ -210,13 +216,7 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
                     // Byte-exact seeking is not possible for this file; serve the
                     // temp-free fragmented-MP4 stream instead (plays, no seek).
                     std.debug.print("note: this file cannot be made seekable without a copy; serving without seek. Use --remux hls for a seekable option.\n", .{});
-                    const c = try arena.create(StreamCtx);
-                    c.* = .{ .gpa = arena, .path = opts.source };
-                    try routes.append(arena, .{
-                        .path = "/media.mp4",
-                        .content_type = "video/mp4",
-                        .body = .{ .dynamic = .{ .context = c, .handle = streamHandle } },
-                    });
+                    try addStreamRoute(arena, &routes, opts.source);
                 }
             },
         }

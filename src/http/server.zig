@@ -252,65 +252,24 @@ pub fn beginStream(request: *Request, buffer: []u8, content_type: []const u8) !h
 }
 
 /// Serves an in-memory body with a Content-Length and single-range support
-/// (206). Used by dynamic handlers that produce the whole body first (the
-/// Cast receiver's HLS loader needs a Content-Length on segments). Handles
-/// HEAD. `content_range_buf` must outlive the call.
+/// (206), handling HEAD. Used by dynamic handlers that produce the whole body
+/// first (the Cast receiver's HLS loader needs a Content-Length on segments).
 pub fn respondBuffer(request: *Request, content_type: []const u8, bytes: []const u8) !void {
-    var range_header: ?[]const u8 = null;
-    var it = request.iterateHeaders();
-    while (it.next()) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "range")) range_header = h.value;
-    }
-
-    const total: u64 = bytes.len;
-    const range = parseRange(range_header, total) catch {
-        var buf: [64]u8 = undefined;
-        const cr = try std.fmt.bufPrint(&buf, "bytes */{d}", .{total});
-        return request.respond("", .{
-            .status = .range_not_satisfiable,
-            .extra_headers = &(cors_array ++ [_]http.Header{.{ .name = "content-range", .value = cr }}),
-        });
+    const Ctx = struct {
+        data: []const u8,
+        fn read(ctx: *anyopaque, offset: u64, dest: []u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(dest, self.data[@intCast(offset)..][0..dest.len]);
+        }
     };
-
-    var content_range_buf: [96]u8 = undefined;
-    var headers: [cors_array.len + 4]http.Header = undefined;
-    var n: usize = cors_array.len;
-    @memcpy(headers[0..n], &cors_array);
-    headers[n] = .{ .name = "content-type", .value = content_type };
-    n += 1;
-    headers[n] = .{ .name = "accept-ranges", .value = "bytes" };
-    n += 1;
-    headers[n] = .{ .name = "cache-control", .value = "no-store" };
-    n += 1;
-    if (range) |r| {
-        headers[n] = .{ .name = "content-range", .value = try std.fmt.bufPrint(&content_range_buf, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }) };
-        n += 1;
-    }
-
-    const offset: u64 = if (range) |r| r.start else 0;
-    const len: u64 = if (range) |r| r.end - r.start + 1 else total;
-
-    var send_buf: [64 * 1024]u8 = undefined;
-    var body = try request.respondStreaming(&send_buf, .{
-        .content_length = len,
-        .respond_options = .{
-            .status = if (range != null) .partial_content else .ok,
-            .extra_headers = headers[0..n],
-        },
-    });
-    if (request.head.method == .HEAD) {
-        try body.writer.flush();
-        body.state = .end;
-        try body.http_protocol_output.flush();
-        return;
-    }
-    try body.writer.writeAll(bytes[@intCast(offset)..][0..@intCast(len)]);
-    try body.end();
+    var ctx: Ctx = .{ .data = bytes };
+    return respondVirtual(request, content_type, bytes.len, &ctx, Ctx.read);
 }
 
-/// Like `respondBuffer` but for a body that is not in memory: `readFn(ctx,
-/// offset, dest)` fills `dest` with the virtual file's bytes at `offset`. Used
-/// by the on-the-fly MP4 assembler. Handles HEAD and a single Range (206).
+/// Serves a body of `total` bytes with Content-Length, single-range (206) and
+/// HEAD support. `readFn(ctx, offset, dest)` fills `dest` with the bytes at
+/// `offset`; the body may live anywhere (the on-the-fly MP4 assembler, or an
+/// in-memory slice via `respondBuffer`).
 pub fn respondVirtual(
     request: *Request,
     content_type: []const u8,
@@ -366,11 +325,12 @@ pub fn respondVirtual(
         return;
     }
 
-    var chunk: [64 * 1024]u8 = undefined;
+    // Fill the streaming writer's own buffer directly (no intermediate copy).
     while (remaining > 0) {
-        const take: usize = @intCast(@min(@as(u64, chunk.len), remaining));
-        try readFn(ctx, offset, chunk[0..take]);
-        try body.writer.writeAll(chunk[0..take]);
+        const dst = try body.writer.writableSliceGreedy(1);
+        const take: usize = @intCast(@min(@as(u64, dst.len), remaining));
+        try readFn(ctx, offset, dst[0..take]);
+        body.writer.advance(take);
         offset += take;
         remaining -= take;
     }

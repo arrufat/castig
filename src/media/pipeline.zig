@@ -191,20 +191,43 @@ fn writeCallback(userdata: ?*anyopaque, buf: [*:0]u8, size: c_int) callconv(.c) 
     return size;
 }
 
+// --- audio transcoder setup -------------------------------------------------
+
+/// A decoder for the input audio and an AAC encoder that downmixes to stereo.
+/// Shared by the remux `Session` and the on-the-fly MP4 assembler so their
+/// encoder parameters (bitrate, stereo policy, global header) never diverge.
+pub const AacTranscode = struct { dec: *av.Codec.Context, enc: *av.Codec.Context };
+
+pub fn openStereoAac(par: *av.Codec.Parameters) !AacTranscode {
+    const dec_codec = try av.Codec.find_decoder(par.codec_id);
+    const dec = try av.Codec.Context.alloc(dec_codec);
+    errdefer dec.free();
+    try dec.parameters_to_context(par);
+    try dec.open(dec_codec, null);
+
+    const enc_codec = try av.Codec.find_encoder_by_name("aac");
+    const enc = try av.Codec.Context.alloc(enc_codec);
+    errdefer enc.free();
+    enc.sample_rate = dec.sample_rate;
+    // Downmix to stereo. Many receivers (and stereo devices like the Pixel
+    // Tablet) reject multichannel AAC in an HLS stream; swr does the mix.
+    extra.av_channel_layout_default(&enc.ch_layout, 2);
+    enc.sample_fmt = .FLTP;
+    enc.bit_rate = aac_bitrate;
+    enc.time_base = .{ .num = 1, .den = dec.sample_rate };
+    enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
+    try enc.open(enc_codec, null);
+    return .{ .dec = dec, .enc = enc };
+}
+
 // --- session ----------------------------------------------------------------
 
 /// Everything libav needs to remux one file into one output, minus the header
-/// write and the packet loop, which the callers drive differently.
-/// Where a session writes its output: a streaming sink (custom AVIO to an
-/// `Io.Writer`) or a real file on disk (ffmpeg's own IO, seekable).
-const Dest = union(enum) {
-    sink: *Sink,
-    file: [*:0]const u8,
-};
-
+/// write and the packet loop, which the callers drive differently. Output goes
+/// to a streaming `Sink` (a custom AVIO writing to an `Io.Writer`).
 const Session = struct {
     gpa: std.mem.Allocator,
-    sink: ?*Sink,
+    sink: *Sink,
     ic: *av.FormatContext,
     video_index: ?usize,
     audio_index: usize,
@@ -212,16 +235,13 @@ const Session = struct {
     enc: *av.Codec.Context,
     oc: *av.FormatContext,
     avio: *av.IOContext,
-    file_avio: bool,
     out_video_index: ?c_int,
     video_bsf: ?*extra.BSFContext,
     out_audio_index: c_int,
-    /// Progress node for a long remux (mp4 mode); updated with elapsed seconds.
-    progress: ?std.Progress.Node = null,
 
     /// `format` is an ffmpeg muxer name ("mp4" or "mpegts"). MPEG-TS gets the
     /// Annex-B bitstream filter on copied video; MP4 keeps AVCC.
-    fn open(gpa: std.mem.Allocator, path: []const u8, format: [*:0]const u8, dest: Dest) !Session {
+    fn open(gpa: std.mem.Allocator, path: []const u8, format: [*:0]const u8, sink: *Sink) !Session {
         const path_z = try gpa.dupeSentinel(u8, path, 0);
         defer gpa.free(path_z);
 
@@ -234,43 +254,19 @@ const Session = struct {
         const audio_index: usize = if (ic.find_best_stream(.AUDIO, -1, -1)) |a| @intCast(a[0]) else |_| return error.NoAudioStream;
         const in_audio = ic.streams[audio_index];
 
-        const dec_codec = try av.Codec.find_decoder(in_audio.codecpar.codec_id);
-        const dec = try av.Codec.Context.alloc(dec_codec);
-        errdefer dec.free();
-        try dec.parameters_to_context(in_audio.codecpar);
-        try dec.open(dec_codec, null);
-
-        const enc_codec = try av.Codec.find_encoder_by_name("aac");
-        const enc = try av.Codec.Context.alloc(enc_codec);
-        errdefer enc.free();
-        enc.sample_rate = dec.sample_rate;
-        // Downmix to stereo. Many receivers (and stereo devices like the Pixel
-        // Tablet) reject multichannel AAC in an HLS stream; swr does the mix.
-        extra.av_channel_layout_default(&enc.ch_layout, 2);
-        enc.sample_fmt = .FLTP;
-        enc.bit_rate = aac_bitrate;
-        enc.time_base = .{ .num = 1, .den = dec.sample_rate };
-        enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
-        try enc.open(enc_codec, null);
+        const at = try openStereoAac(in_audio.codecpar);
+        errdefer at.dec.free();
+        errdefer at.enc.free();
+        const dec = at.dec;
+        const enc = at.enc;
 
         const oc = try extra.allocOutputContext(format);
         errdefer av.avformat_free_context(oc);
 
-        var file_avio = false;
-        const avio = switch (dest) {
-            .sink => |sk| blk: {
-                const io_buffer = try av.malloc(io_buffer_len);
-                break :blk try av.IOContext.alloc(io_buffer, .writable, sk, null, writeCallback, null);
-            },
-            .file => |fname| blk: {
-                file_avio = true;
-                break :blk try extra.avioOpen(fname);
-            },
-        };
+        const io_buffer = try av.malloc(io_buffer_len);
+        const avio = try av.IOContext.alloc(io_buffer, .writable, sink, null, writeCallback, null);
         oc.pb = avio;
-        errdefer if (file_avio) {
-            _ = extra.avio_closep(&oc.pb);
-        } else av.IOContext.free(avio);
+        errdefer av.IOContext.free(avio);
 
         const annexb = std.mem.orderZ(u8, format, "mpegts") == .eq;
 
@@ -310,10 +306,7 @@ const Session = struct {
 
         return .{
             .gpa = gpa,
-            .sink = switch (dest) {
-                .sink => |sk| sk,
-                .file => null,
-            },
+            .sink = sink,
             .ic = ic,
             .video_index = video_index,
             .audio_index = audio_index,
@@ -321,11 +314,9 @@ const Session = struct {
             .enc = enc,
             .oc = oc,
             .avio = avio,
-            .file_avio = file_avio,
             .out_video_index = out_video_index,
             .video_bsf = video_bsf,
             .out_audio_index = out_audio.index,
-            .progress = null,
         };
     }
 
@@ -334,11 +325,7 @@ const Session = struct {
             var bb: ?*extra.BSFContext = b;
             extra.av_bsf_free(&bb);
         }
-        if (s.file_avio) {
-            _ = extra.avio_closep(&s.oc.pb);
-        } else {
-            av.IOContext.free(s.avio);
-        }
+        av.IOContext.free(s.avio);
         av.avformat_free_context(s.oc);
         s.enc.free();
         s.dec.free();
@@ -346,7 +333,7 @@ const Session = struct {
     }
 
     fn failed(s: *Session) bool {
-        return if (s.sink) |sk| sk.failed else false;
+        return s.sink.failed;
     }
 
     fn writeHeader(s: *Session, movflags: ?[*:0]const u8, keep_absolute_ts: bool) !void {
@@ -405,7 +392,6 @@ const Session = struct {
                 if (pkt.pts != av.NOPTS_VALUE) {
                     const secs = @as(f64, @floatFromInt(pkt.pts)) * in_video.time_base.q2d();
                     if (end_time) |end| if (secs >= end) break;
-                    if (s.progress) |pr| if (secs > 0) pr.setCompletedItems(@intFromFloat(secs));
                 }
                 if (s.video_bsf) |b| {
                     try extra.bsfSend(b, pkt);
@@ -447,7 +433,7 @@ const Session = struct {
 /// the `--remux stream` fragmented-MP4 live stream (format "mp4").
 pub fn remuxWindow(gpa: std.mem.Allocator, path: []const u8, start_time: f64, end_time: ?f64, format: [*:0]const u8, w: *Io.Writer) !void {
     var sink: Sink = .{ .w = w };
-    var s = try Session.open(gpa, path, format, .{ .sink = &sink });
+    var s = try Session.open(gpa, path, format, &sink);
     defer s.deinit();
     const is_mp4 = std.mem.orderZ(u8, format, "mp4") == .eq;
     try s.writeHeader(if (is_mp4) fmp4_movflags else null, is_mp4);

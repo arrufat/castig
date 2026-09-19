@@ -27,8 +27,6 @@ const extra = @import("../av_extra.zig");
 const pipeline = @import("pipeline.zig");
 
 const io_buffer_len = 64 * 1024;
-const aac_bitrate = 192_000;
-const prefix_cap: u64 = 1 << 20; // safety bound on the captured head
 
 const VideoSample = struct { pts: i64, dts: i64, duration: i64, size: u32, pos: i64, key: bool };
 const AacSample = struct { pts: i64, dts: i64, duration: i64, buf_off: usize, size: u32 };
@@ -49,10 +47,10 @@ const Capture = struct {
     moov: std.ArrayList(u8) = .empty,
     pos: u64 = 0,
     size: u64 = 0,
-    /// True until after the first sample; captures everything into `prefix`.
-    capture_all: bool = true,
-    /// End of the head (= first sample's output offset), set after the 1st frame.
-    container_end: u64 = 0,
+    /// End of the head (= first sample's output offset). Starts at max so every
+    /// write before the first sample is captured into `prefix`; set to the real
+    /// value after the first frame, after which payload is discarded.
+    container_end: u64 = std.math.maxInt(u64),
     /// Where the moov begins, set at trailer time; max until then.
     mdat_end: u64 = std.math.maxInt(u64),
     failed: bool = false,
@@ -70,9 +68,9 @@ const Capture = struct {
             // Positional, not append: the muxer seeks back to patch the moov's
             // own size after writing its contents.
             try writeInto(c.gpa, &c.moov, off - c.mdat_end, bytes);
-        } else if (c.capture_all) {
-            try writeInto(c.gpa, &c.prefix, off, bytes);
         } else if (off < c.container_end) {
+            // Head bytes (ftyp + mdat header, then the whole first sample until
+            // container_end is known); the sample tail is truncated in phase B.
             const take = @min(@as(u64, bytes.len), c.container_end - off);
             try writeInto(c.gpa, &c.prefix, off, bytes[0..@intCast(take)]);
         } // else: bulk payload, discarded
@@ -178,7 +176,9 @@ pub const VMp4 = struct {
             } else if (o < vm.mdat_end) {
                 const e = vm.findEntry(o) orelse return error.MapGap;
                 const delta = o - e.out_start;
-                const take = @min(@min(want, e.len - delta), vm.mdat_end - o);
+                // Samples fill [container_end, mdat_end) contiguously, so the
+                // entry ends at or before mdat_end; no extra clamp needed.
+                const take = @min(want, e.len - delta);
                 if (e.is_audio) {
                     @memcpy(dest[done..][0..@intCast(take)], vm.aac[@intCast(e.src + delta)..][0..@intCast(take)]);
                 } else {
@@ -228,23 +228,12 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     var source = try Io.Dir.cwd().openFile(io, path, .{});
     errdefer source.close(io);
 
-    // --- audio decoder + AAC encoder (stereo), mirroring pipeline.Session ----
-    const dec_codec = try av.Codec.find_decoder(in_audio.codecpar.codec_id);
-    const dec = try av.Codec.Context.alloc(dec_codec);
-    defer dec.free();
-    try dec.parameters_to_context(in_audio.codecpar);
-    try dec.open(dec_codec, null);
-
-    const enc_codec = try av.Codec.find_encoder_by_name("aac");
-    const enc = try av.Codec.Context.alloc(enc_codec);
-    defer enc.free();
-    enc.sample_rate = dec.sample_rate;
-    extra.av_channel_layout_default(&enc.ch_layout, 2);
-    enc.sample_fmt = .FLTP;
-    enc.bit_rate = aac_bitrate;
-    enc.time_base = .{ .num = 1, .den = dec.sample_rate };
-    enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
-    try enc.open(enc_codec, null);
+    // Audio decoder + stereo AAC encoder (shared with pipeline.Session).
+    const at = try pipeline.openStereoAac(in_audio.codecpar);
+    defer at.dec.free();
+    defer at.enc.free();
+    const dec = at.dec;
+    const enc = at.enc;
     const enc_tb = enc.time_base;
 
     // --- output muxer over the capturing seekable AVIO -----------------------
@@ -278,6 +267,15 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     defer aac_samples.deinit(gpa);
     var aac_buf: std.ArrayList(u8) = .empty;
     errdefer aac_buf.deinit(gpa);
+
+    // Preallocate the AAC buffers from the duration to avoid repeated regrowth
+    // (best effort; the loops still append safely if the estimate is off).
+    if (ic.duration != av.NOPTS_VALUE and ic.duration > 0) {
+        const dur_s = @as(f64, @floatFromInt(ic.duration)) / 1_000_000.0;
+        const frame_size: f64 = if (enc.frame_size > 0) @floatFromInt(enc.frame_size) else 1024;
+        aac_buf.ensureTotalCapacity(gpa, @intFromFloat(dur_s * @as(f64, @floatFromInt(enc.bit_rate)) / 8.0)) catch {};
+        aac_samples.ensureTotalCapacity(gpa, @intFromFloat(dur_s * @as(f64, @floatFromInt(enc.sample_rate)) / frame_size)) catch {};
+    }
 
     var collector: AudioCollector = .{ .gpa = gpa, .aac = &aac_buf, .samples = &aac_samples };
     var ctx: pipeline.AudioCtx = .{
@@ -415,9 +413,11 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
 
         const out_start = cap.pos - @as(u64, @intCast(fp.size));
         if (first) {
+            // The head ends where the first sample begins; drop the sample
+            // bytes captured before container_end was known, then stop
+            // capturing bulk payload.
             cap.container_end = out_start;
-            cap.prefix.items.len = @intCast(out_start); // drop captured sample bytes
-            cap.capture_all = false;
+            cap.prefix.items.len = @intCast(out_start);
             first = false;
         }
         map.appendAssumeCapacity(.{ .out_start = out_start, .len = @intCast(fp.size), .is_audio = is_audio, .src = src });
