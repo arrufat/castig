@@ -9,7 +9,7 @@ const http = @import("http/server.zig");
 const subtitles = @import("media/subtitles.zig");
 const pipeline = @import("media/pipeline.zig");
 const hls = @import("media/hls.zig");
-const cleanup = @import("cleanup.zig");
+const vmp4 = @import("media/vmp4.zig");
 
 /// Shared by every command that opens a channel.
 pub const Options = struct {
@@ -93,6 +93,17 @@ fn streamHandle(context: *const anyopaque, s: *http.Server, request: *http.Reque
     try body.end();
 }
 
+fn vmp4ReadFn(ctx: *anyopaque, offset: u64, dest: []u8) anyerror!void {
+    const vm: *vmp4.VMp4 = @ptrCast(@alignCast(ctx));
+    try vm.readInto(offset, dest);
+}
+
+fn vmp4Handle(context: *const anyopaque, s: *http.Server, request: *http.Request) anyerror!void {
+    _ = s;
+    const vm: *vmp4.VMp4 = @constCast(@ptrCast(@alignCast(context)));
+    try http.respondVirtual(request, "video/mp4", vm.totalSize(), vm, vmp4ReadFn);
+}
+
 /// One embedded subtitle stream, converted to WebVTT the first time the
 /// receiver asks for it (scanning the source), then cached.
 const EmbSubCtx = struct {
@@ -130,9 +141,6 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     // Also true for an HLS URL the receiver fetches directly, so it gets the
     // MPEG-TS segment hint too.
     var is_hls = std.ascii.findIgnoreCase(media_content_type, "mpegurl") != null;
-    // A `--remux mp4` temp file to delete when done.
-    var temp_file: ?[]const u8 = null;
-    defer if (temp_file) |f| Io.Dir.cwd().deleteFile(io, f) catch {};
 
     if (!isUrl(opts.source)) {
         Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
@@ -185,34 +193,31 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
                 });
             },
             .mp4 => {
-                // Pre-transcode to a seekable MP4, then serve with Range. Write
-                // it next to the source (that filesystem has room for a movie);
-                // /tmp is often a small tmpfs and overflows on a 4K remux.
-                const src_dir = std.fs.path.dirname(opts.source) orelse ".";
-                const tmp = try std.fmt.allocPrint(arena, "{s}/.castig-{d}.mp4", .{ src_dir, std.os.linux.getpid() });
-                const tmp_z = try arena.dupeSentinel(u8, tmp, 0);
-                // Record it now so the top-level defer deletes it even if the
-                // remux fails partway and leaves an incomplete file. `defer`
-                // does not run on Ctrl-C, so also unlink it on SIGINT/SIGTERM.
-                temp_file = tmp;
-                cleanup.deleteOnSignal(tmp_z);
-                std.debug.print("remuxing {s} audio to aac (mp4); preparing {s} ...\n", .{ p.audio_codec, tmp });
+                // Seekable MP4 assembled on the fly: video copied from the
+                // source, audio re-encoded to AAC held in memory, and the moov
+                // precomputed so the receiver seeks by byte range. No temp file.
+                std.debug.print("preparing seekable mp4 (audio to aac, in memory) for {s} ...\n", .{p.audio_codec});
                 try out.flush();
-                const root = std.Progress.start(io, .{});
-                defer root.end();
-                const node = root.start("remux to mp4 (seconds)", if (p.duration) |d| @intFromFloat(d) else 0);
-                defer node.end();
-                pipeline.remuxToFile(arena, opts.source, tmp_z, node) catch |err| {
-                    std.debug.print("mp4 remux failed: {s}\n", .{@errorName(err)});
-                    return err;
-                };
                 media_path = "/media.mp4";
                 media_content_type = "video/mp4";
-                try routes.append(arena, .{
-                    .path = "/media.mp4",
-                    .content_type = "video/mp4",
-                    .body = .{ .file = tmp },
-                });
+                if (try vmp4.build(arena, io, opts.source, options.debug)) |vm| {
+                    try routes.append(arena, .{
+                        .path = "/media.mp4",
+                        .content_type = "video/mp4",
+                        .body = .{ .dynamic = .{ .context = vm, .handle = vmp4Handle } },
+                    });
+                } else {
+                    // Byte-exact seeking is not possible for this file; serve the
+                    // temp-free fragmented-MP4 stream instead (plays, no seek).
+                    std.debug.print("note: this file cannot be made seekable without a copy; serving without seek. Use --remux hls for a seekable option.\n", .{});
+                    const c = try arena.create(StreamCtx);
+                    c.* = .{ .gpa = arena, .path = opts.source };
+                    try routes.append(arena, .{
+                        .path = "/media.mp4",
+                        .content_type = "video/mp4",
+                        .body = .{ .dynamic = .{ .context = c, .handle = streamHandle } },
+                    });
+                }
             },
         }
     }

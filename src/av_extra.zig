@@ -61,7 +61,18 @@ pub extern fn avformat_alloc_output_context2(ctx: *?*av.FormatContext, oformat: 
 pub extern fn avformat_new_stream(s: *av.FormatContext, c: ?*const av.Codec) ?*av.Stream;
 pub extern fn avformat_write_header(s: *av.FormatContext, options: ?*av.Dictionary.Mutable) c_int;
 pub extern fn av_interleaved_write_frame(s: *av.FormatContext, pkt: ?*av.Packet) c_int;
+// Non-interleaved: writes the packet's payload to the AVIO immediately, in the
+// order given. The virtual-MP4 assembler needs this (plus avio_flush) so each
+// packet's output bytes are bounded and attributable.
+pub extern fn av_write_frame(s: *av.FormatContext, pkt: ?*av.Packet) c_int;
+pub extern fn avio_flush(s: *av.IOContext) void;
 pub extern fn av_write_trailer(s: *av.FormatContext) c_int;
+
+/// av_write_frame, returning av.Error. A return of 1 (flushed, no more data) is
+/// success too.
+pub fn writeFrameDirect(oc: *av.FormatContext, pkt: ?*av.Packet) av.Error!void {
+    _ = try av.wrap(av_write_frame(oc, pkt));
+}
 pub extern fn avcodec_parameters_copy(dst: *av.Codec.Parameters, src: *const av.Codec.Parameters) c_int;
 
 // --- encoding (libavcodec) -------------------------------------------------

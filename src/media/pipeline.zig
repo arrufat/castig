@@ -456,25 +456,9 @@ pub fn remuxWindow(gpa: std.mem.Allocator, path: []const u8, start_time: f64, en
     try extra.writeTrailer(s.oc);
 }
 
-/// Transcodes the whole file to a seekable MP4 on disk (video copied, audio to
-/// AAC; the moov lands at the end, fetched by the receiver with a Range
-/// request). Served afterwards with Range for native seeking. Used by
-/// `--remux mp4`, for content the receiver's HLS path refuses (e.g. 1080p).
-pub fn remuxToFile(gpa: std.mem.Allocator, path: []const u8, out_path: [*:0]const u8, progress: ?std.Progress.Node) !void {
-    var s = try Session.open(gpa, path, "mp4", .{ .file = out_path });
-    defer s.deinit();
-    s.progress = progress;
-    // No faststart: its second pass rewrites the whole file and fails on very
-    // large inputs. The moov lands at the end; the receiver fetches it with a
-    // Range request, so playback and seeking still work.
-    try s.writeHeader(null, false);
-    try s.runWindow(0, null);
-    try extra.writeTrailer(s.oc);
-}
-
 // --- audio transcode helpers ------------------------------------------------
 
-const AudioCtx = struct {
+pub const AudioCtx = struct {
     gpa: std.mem.Allocator,
     dec: *av.Codec.Context,
     enc: *av.Codec.Context,
@@ -488,9 +472,13 @@ const AudioCtx = struct {
     pts_set: bool,
     in_time_base: av.Rational,
     sink: ?*Sink,
+    /// When set, encoded packets go here (in encoder time_base) instead of being
+    /// muxed. Used by the virtual-MP4 assembler to capture AAC packets.
+    collect: ?*const fn (*anyopaque, *av.Packet) anyerror!void = null,
+    collect_ctx: ?*anyopaque = null,
 };
 
-fn drainDecoder(ctx: *AudioCtx, frame: *av.Frame) !void {
+pub fn drainDecoder(ctx: *AudioCtx, frame: *av.Frame) !void {
     while (true) {
         ctx.dec.receive_frame(frame) catch |err| switch (err) {
             error.WouldBlock, error.EndOfFile => return,
@@ -510,7 +498,7 @@ fn drainDecoder(ctx: *AudioCtx, frame: *av.Frame) !void {
     }
 }
 
-fn pushToFifo(ctx: *AudioCtx, frame: *av.Frame) !void {
+pub fn pushToFifo(ctx: *AudioCtx, frame: *av.Frame) !void {
     const out_samples = frame.nb_samples + 32;
     var converted: [8]?[*]u8 = @splat(null);
     _ = try av.wrap(av.av_samples_alloc(&converted, null, ctx.enc.ch_layout.nb_channels, out_samples, ctx.enc.sample_fmt, 0));
@@ -526,7 +514,7 @@ fn pushToFifo(ctx: *AudioCtx, frame: *av.Frame) !void {
     }
 }
 
-fn encodeFifo(ctx: *AudioCtx, final: bool) !void {
+pub fn encodeFifo(ctx: *AudioCtx, final: bool) !void {
     const frame_size = ctx.enc.frame_size;
     while (extra.av_audio_fifo_size(ctx.fifo) >= frame_size or (final and extra.av_audio_fifo_size(ctx.fifo) > 0)) {
         const have = extra.av_audio_fifo_size(ctx.fifo);
@@ -549,7 +537,7 @@ fn encodeFifo(ctx: *AudioCtx, final: bool) !void {
     }
 }
 
-fn encodeFrame(ctx: *AudioCtx, frame: ?*av.Frame) !void {
+pub fn encodeFrame(ctx: *AudioCtx, frame: ?*av.Frame) !void {
     try extra.sendFrame(ctx.enc, frame);
     while (true) {
         extra.receivePacket(ctx.enc, ctx.out_packet) catch |err| switch (err) {
@@ -557,6 +545,11 @@ fn encodeFrame(ctx: *AudioCtx, frame: ?*av.Frame) !void {
             else => return err,
         };
         defer ctx.out_packet.unref();
+        if (ctx.collect) |collect| {
+            // Hand the encoder-time_base packet to the assembler; do not mux.
+            try collect(ctx.collect_ctx.?, ctx.out_packet);
+            continue;
+        }
         ctx.out_packet.stream_index = ctx.out_index;
         extra.av_packet_rescale_ts(ctx.out_packet, ctx.enc.time_base, ctx.oc.streams[@intCast(ctx.out_index)].time_base);
         try extra.writeFrame(ctx.oc, ctx.out_packet);

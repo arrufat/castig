@@ -18,8 +18,8 @@ const usage =
     \\                        embedded text subtitles are offered too, pick one
     \\                        from the receiver's subtitle menu. When audio must
     \\                        be remuxed, --remux picks how: hls (default,
-    \\                        seekable, up to ~720p), mp4 (seekable, transcodes
-    \\                        first), or stream (instant, no seek)
+    \\                        seekable, up to ~720p), mp4 (seekable, no temp
+    \\                        file, brief startup), or stream (instant, no seek)
     \\  pause <device>        pause the current item
     \\  play <device>         resume the current item
     \\  seek <device> <pos>   jump to <pos>: seconds, m:ss, h:mm:ss, or +N / -N relative
@@ -145,5 +145,5 @@ test {
     _ = @import("http/server.zig");
     _ = @import("media/pipeline.zig");
     _ = @import("media/hls.zig");
-    _ = @import("cleanup.zig");
+    _ = @import("media/vmp4.zig");
 }
