@@ -449,9 +449,9 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     errdefer map.deinit(gpa);
     try map.ensureTotalCapacity(gpa, video.items.len + aac_samples.items.len);
 
-    // Shift so the smallest DTS is non-negative (B-frame video starts negative);
-    // both streams shift together, keeping A/V sync and a valid MP4 timeline.
-    oc.avoid_negative_ts = 1; // AVFMT_AVOID_NEG_TS_MAKE_NON_NEGATIVE
+    // Let the mov muxer shift negative (B-frame) DTS and write an edit list so
+    // presentation still starts at zero.
+    oc.avoid_negative_ts = 0; // AVFMT_AVOID_NEG_TS_AUTO
     try extra.writeHeader(oc, null);
     // The mov muxer may change the track timescales in write_header, so read
     // them back and rescale each packet from its source time base; otherwise the
