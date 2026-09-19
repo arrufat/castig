@@ -296,7 +296,7 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     var app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
     try ch.connectTransport(app.transport_id);
 
-    var media = ch.load(arena, app.transport_id, .{
+    var media = try ch.load(arena, app.transport_id, .{
         .url = media_path,
         .content_type = media_content_type,
         .title = title,
@@ -304,65 +304,76 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         .active_track_ids = active_tracks.items,
         .duration = duration,
         .hls = is_hls,
-    }) catch |err| fallback: {
-        // Auto mode: if the receiver refuses the HLS load, build a seekable mp4
-        // and retry. The mp4 build can take a while, so close the channel first
-        // (an idle one gets dropped) and reconnect after.
-        if (opts.remux != .auto or !is_hls or isUrl(opts.source) or err != error.RequestFailed) return err;
-        std.debug.print("receiver refused HLS; falling back to seekable mp4 ...\n", .{});
-        try out.flush();
-        ch.deinit();
-        try addMp4Route(arena, io, &routes, opts.source, options.debug);
-        if (server) |s| s.setRoutes(routes.items);
-        media_content_type = "video/mp4";
-        is_hls = false;
-        media_path = try std.mem.concat(arena, u8, &.{ base, "/media.mp4" });
+    });
 
-        ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
-        st = try ch.getStatus(arena);
-        app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
-        try ch.connectTransport(app.transport_id);
-        break :fallback try ch.load(arena, app.transport_id, .{
-            .url = media_path,
-            .content_type = media_content_type,
-            .title = title,
-            .text_tracks = text_tracks.items,
-            .active_track_ids = active_tracks.items,
-            .duration = duration,
-            .hls = false,
-        });
-    };
-    try out.print("loaded on {f} as {s}\n", .{ address, media_content_type });
-    try printMedia(out, media);
-    try out.flush();
-
-    // Follow unsolicited MEDIA_STATUS updates until the item finishes.
-    while (!media.isFinished()) {
-        const msg = ch.receive() catch |err| switch (err) {
-            // The receiver hanging up (a TCP FIN rather than a CLOSE message)
-            // is the normal end of a session, not a failure.
-            error.ConnectionClosed => {
-                try out.writeAll("receiver closed the session\n");
-                return;
-            },
-            else => return err,
-        };
-        if (std.mem.eql(u8, msg.namespace, channel.ns_connection)) {
-            if (std.mem.indexOf(u8, msg.payload.utf8, "\"CLOSE\"") != null) {
-                try out.writeAll("receiver closed the session\n");
-                return;
-            }
-            continue;
-        }
-        if (!std.mem.eql(u8, msg.namespace, channel.ns_media)) continue;
-        const json = try Channel.parsePayload(arena, msg);
-        media = Channel.mediaStatusFrom(json) orelse continue;
+    session: while (true) {
+        try out.print("loaded on {f} as {s}\n", .{ address, media_content_type });
         try printMedia(out, media);
         try out.flush();
+
+        // Follow MEDIA_STATUS until the item finishes, noting if it ever played.
+        var played = false;
+        while (!media.isFinished()) {
+            const msg = ch.receive() catch |err| switch (err) {
+                // The receiver hanging up (a TCP FIN rather than a CLOSE message)
+                // is the normal end of a session, not a failure.
+                error.ConnectionClosed => {
+                    try out.writeAll("receiver closed the session\n");
+                    return;
+                },
+                else => return err,
+            };
+            if (std.mem.eql(u8, msg.namespace, channel.ns_connection)) {
+                if (std.mem.indexOf(u8, msg.payload.utf8, "\"CLOSE\"") != null) {
+                    try out.writeAll("receiver closed the session\n");
+                    return;
+                }
+                continue;
+            }
+            if (!std.mem.eql(u8, msg.namespace, channel.ns_media)) continue;
+            const json = try Channel.parsePayload(arena, msg);
+            media = Channel.mediaStatusFrom(json) orelse continue;
+            if (std.mem.eql(u8, media.player_state, "PLAYING")) played = true;
+            try printMedia(out, media);
+            try out.flush();
+        }
+
+        // Auto mode: the receiver accepts the HLS load, then fails it
+        // asynchronously (LOAD_FAILED / idleReason ERROR) before playback ever
+        // starts. If it never played, build a seekable mp4 and load that. The
+        // mp4 build can take a while, so close the idle channel and reconnect.
+        const errored = std.mem.eql(u8, media.idle_reason orelse "", "ERROR");
+        if (!played and errored and opts.remux == .auto and is_hls and !isUrl(opts.source)) {
+            std.debug.print("receiver refused HLS; falling back to seekable mp4 ...\n", .{});
+            try out.flush();
+            ch.deinit();
+            try addMp4Route(arena, io, &routes, opts.source, options.debug);
+            if (server) |s| s.setRoutes(routes.items);
+            media_content_type = "video/mp4";
+            is_hls = false;
+            media_path = try std.mem.concat(arena, u8, &.{ base, "/media.mp4" });
+
+            ch = try Channel.connect(io, arena, address, .{ .debug = options.debug });
+            st = try ch.getStatus(arena);
+            app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
+            try ch.connectTransport(app.transport_id);
+            media = try ch.load(arena, app.transport_id, .{
+                .url = media_path,
+                .content_type = media_content_type,
+                .title = title,
+                .text_tracks = text_tracks.items,
+                .active_track_ids = active_tracks.items,
+                .duration = duration,
+                .hls = false,
+            });
+            continue :session;
+        }
+
+        try out.print("finished: {s}\n", .{media.idle_reason orelse "?"});
+        // Leave the receiver as we found it instead of parked on the idle screen.
+        ch.stopApp(arena, app.session_id) catch {};
+        return;
     }
-    try out.print("finished: {s}\n", .{media.idle_reason orelse "?"});
-    // Leave the receiver as we found it instead of parked on the idle screen.
-    ch.stopApp(arena, app.session_id) catch {};
 }
 
 fn printMedia(out: *Io.Writer, m: Channel.MediaStatus) !void {
