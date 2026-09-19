@@ -11,14 +11,15 @@
 //!      interleaved) plus `avio_flush` bound each packet's bytes so they are
 //!      attributable.
 //!   2. Serving: a byte range is answered from the head buffer, the `moov`
-//!      buffer, the source file (video, via positional read), or an in-RAM AAC
-//!      buffer (audio). Nothing hits disk.
+//!      buffer, the video (see below), or an in-RAM AAC buffer (audio). Nothing
+//!      hits disk.
 //!
-//! Correctness gate (verify-and-degrade): video is copied, so each sample's
-//! output bytes must equal `pkt.size` bytes we can reproduce later. For
-//! ISO-BMFF sources `pkt.pos` is a reliable file offset; for other containers
-//! (Matroska lacing / compression) we verify `pread == pkt.data`. On any
-//! violation `build` returns null and the caller falls back to a stream.
+//! Video is copied, so each sample's output bytes must be reproducible at serve
+//! time. ISO-BMFF sources read the sample straight from the file by byte offset
+//! (`pkt.pos`). Other containers (Matroska, where `pkt.pos` points at the block,
+//! not the frame) re-demux the source and locate the sample by PTS. If neither
+//! works (no video, `pkt.pos < 0` in BMFF), `build` returns null and the caller
+//! falls back to a stream.
 
 const std = @import("std");
 const Io = std.Io;
@@ -121,10 +122,94 @@ const AudioCollector = struct {
     }
 };
 
+/// How video sample bytes are fetched at serve time.
+const VideoSrc = enum {
+    /// ISO-BMFF: read the sample straight from the source file by byte offset.
+    pread,
+    /// Other containers (Matroska): the file offset is unreliable, so re-demux
+    /// the source to the sample (matched by decode timestamp) and copy its data.
+    redemux,
+};
+
+/// Serve-time video demuxer for `redemux` mode. Holds one sample at a time and
+/// locates the requested one by PTS (unique per frame, unlike DTS which may be
+/// unset for the leading B-frames). A forward read is one packet; a jump seeks.
+/// Serialized by a mutex since the HTTP server may open parallel connections.
+const VideoReader = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    ic: *av.FormatContext,
+    stream_index: c_int,
+    pkt: *av.Packet,
+    have: bool = false,
+    cur_pts: i64 = 0,
+    mutex: std.Io.Mutex = .init,
+
+    fn open(gpa: std.mem.Allocator, io: Io, path_z: [*:0]const u8, stream_index: usize) !*VideoReader {
+        const self = try gpa.create(VideoReader);
+        errdefer gpa.destroy(self);
+        const ic = try av.FormatContext.open_input(path_z, null, null, null);
+        errdefer ic.close_input();
+        try ic.find_stream_info(null);
+        const pkt = try av.Packet.alloc();
+        self.* = .{ .gpa = gpa, .io = io, .ic = ic, .stream_index = @intCast(stream_index), .pkt = pkt };
+        return self;
+    }
+
+    fn deinit(self: *VideoReader) void {
+        self.pkt.free();
+        self.ic.close_input();
+        self.gpa.destroy(self);
+    }
+
+    /// Copies `dest.len` bytes at `off` within the video sample whose PTS is
+    /// `pts` (its size must be `expect_size`) into `dest`.
+    fn read(self: *VideoReader, pts: i64, expect_size: u32, off: usize, dest: []u8) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.locate(pts);
+        if (@as(u32, @intCast(self.pkt.size)) != expect_size) return error.SampleSizeChanged;
+        @memcpy(dest, self.pkt.data[off..][0..dest.len]);
+    }
+
+    fn locate(self: *VideoReader, pts: i64) !void {
+        if (self.have and self.cur_pts == pts) return; // same sample, another slice
+        try self.advance(); // sequential fast path: the next packet is usually it
+        if (self.cur_pts == pts) return;
+        // A jump: seek to the keyframe at/before this PTS and scan forward.
+        try self.ic.seek_frame(self.stream_index, pts, 1); // AVSEEK_FLAG_BACKWARD
+        self.have = false;
+        var guard: usize = 0;
+        while (true) : (guard += 1) {
+            if (guard > 1_000_000) return error.SampleNotFound;
+            try self.advance();
+            if (self.cur_pts == pts) return;
+        }
+    }
+
+    fn advance(self: *VideoReader) !void {
+        while (true) {
+            self.pkt.unref();
+            self.ic.read_frame(self.pkt) catch |err| switch (err) {
+                error.EndOfFile => return error.SampleNotFound,
+                else => return err,
+            };
+            if (self.pkt.stream_index != self.stream_index) continue;
+            self.cur_pts = if (self.pkt.pts == av.NOPTS_VALUE) self.pkt.dts else self.pkt.pts;
+            self.have = true;
+            return;
+        }
+    }
+};
+
 pub const VMp4 = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    source: Io.File,
+    video_src: VideoSrc,
+    /// `pread` mode: the source file, read positionally for video.
+    source: ?Io.File,
+    /// `redemux` mode: re-demuxes the source for video sample bytes.
+    vreader: ?*VideoReader,
     prefix: []u8,
     moov: []u8,
     aac: []u8,
@@ -138,7 +223,8 @@ pub const VMp4 = struct {
     }
 
     pub fn deinit(vm: *VMp4) void {
-        vm.source.close(vm.io);
+        if (vm.source) |s| s.close(vm.io);
+        if (vm.vreader) |r| r.deinit();
         vm.gpa.free(vm.prefix);
         vm.gpa.free(vm.moov);
         vm.gpa.free(vm.aac);
@@ -179,11 +265,15 @@ pub const VMp4 = struct {
                 // Samples fill [container_end, mdat_end) contiguously, so the
                 // entry ends at or before mdat_end; no extra clamp needed.
                 const take = @min(want, e.len - delta);
+                const slice = dest[done..][0..@intCast(take)];
                 if (e.is_audio) {
-                    @memcpy(dest[done..][0..@intCast(take)], vm.aac[@intCast(e.src + delta)..][0..@intCast(take)]);
-                } else {
-                    const got = try vm.source.readPositionalAll(vm.io, dest[done..][0..@intCast(take)], e.src + delta);
-                    if (got < @as(usize, @intCast(take))) return error.ShortRead;
+                    @memcpy(slice, vm.aac[@intCast(e.src + delta)..][0..@intCast(take)]);
+                } else switch (vm.video_src) {
+                    .pread => {
+                        const got = try vm.source.?.readPositionalAll(vm.io, slice, e.src + delta);
+                        if (got < slice.len) return error.ShortRead;
+                    },
+                    .redemux => try vm.vreader.?.read(@bitCast(e.src), e.len, @intCast(delta), slice),
                 }
                 done += @intCast(take);
             } else {
@@ -194,6 +284,30 @@ pub const VMp4 = struct {
         }
     }
 };
+
+/// Fills any NOPTS video DTS in place so the muxer gets monotonic timestamps:
+/// extrapolate the leading unset ones backward from the first real DTS.
+fn fillVideoDts(samples: []VideoSample) void {
+    const j = for (samples, 0..) |v, i| {
+        if (v.dts != av.NOPTS_VALUE) break i;
+    } else {
+        // No DTS anywhere: use PTS.
+        for (samples) |*v| v.dts = v.pts;
+        return;
+    };
+    const step: i64 = if (j + 1 < samples.len and samples[j + 1].dts != av.NOPTS_VALUE)
+        samples[j + 1].dts - samples[j].dts
+    else if (samples[j].duration > 0) samples[j].duration else 1;
+    var i = j;
+    while (i > 0) : (i -= 1) samples[i - 1].dts = samples[i].dts - step;
+    var k = j + 1;
+    while (k < samples.len) : (k += 1) {
+        if (samples[k].dts == av.NOPTS_VALUE) {
+            const st = if (samples[k].duration > 0) samples[k].duration else step;
+            samples[k].dts = samples[k - 1].dts + st;
+        }
+    }
+}
 
 /// Builds the virtual MP4 for `path`, or returns null if the source is
 /// unsuitable (video needs transcode, no video, unreliable byte positions) and
@@ -223,10 +337,9 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     const is_bmff = std.mem.indexOf(u8, fmt_name, "mp4") != null or
         std.mem.indexOf(u8, fmt_name, "mov") != null or
         std.mem.indexOf(u8, fmt_name, "m4a") != null;
-
-    // A separate handle for positional reads (verification and serving).
-    var source = try Io.Dir.cwd().openFile(io, path, .{});
-    errdefer source.close(io);
+    // ISO-BMFF video reads straight from the file by byte offset; other
+    // containers (Matroska) re-demux at serve time, since pkt.pos is unreliable.
+    const video_src: VideoSrc = if (is_bmff) .pread else .redemux;
 
     // Audio decoder + stereo AAC encoder (shared with pipeline.Session).
     const at = try pipeline.openStereoAac(in_audio.codecpar);
@@ -284,8 +397,6 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     const pkt = try av.Packet.alloc();
     defer pkt.free();
 
-    var verify_buf: std.ArrayList(u8) = .empty;
-    defer verify_buf.deinit(gpa);
     var max_size: u32 = 0;
 
     while (true) {
@@ -295,23 +406,16 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
         };
         defer pkt.unref();
         if (pkt.stream_index == @as(c_int, @intCast(video_index))) {
-            if (pkt.pos < 0 or pkt.size <= 0) {
-                if (debug) std.debug.print("vmp4: video packet has no byte position; falling back\n", .{});
+            // pread mode needs a real file offset; redemux serves by DTS.
+            if (pkt.size <= 0 or (video_src == .pread and pkt.pos < 0)) {
+                if (debug) std.debug.print("vmp4: video packet not addressable; falling back\n", .{});
                 return null;
             }
             const size: u32 = @intCast(pkt.size);
-            if (!is_bmff) {
-                try verify_buf.resize(gpa, size);
-                const got = source.readPositionalAll(io, verify_buf.items, @intCast(pkt.pos)) catch 0;
-                if (got < size or !std.mem.eql(u8, verify_buf.items, pkt.data[0..size])) {
-                    if (debug) std.debug.print("vmp4: video bytes not reproducible from file position ({s}); falling back\n", .{fmt_name});
-                    return null;
-                }
-            }
             if (size > max_size) max_size = size;
             try video.append(gpa, .{
                 .pts = pkt.pts,
-                .dts = if (pkt.dts == av.NOPTS_VALUE) pkt.pts else pkt.dts,
+                .dts = pkt.dts, // may be NOPTS for leading B-frames; filled below
                 .duration = pkt.duration,
                 .size = size,
                 .pos = pkt.pos,
@@ -331,6 +435,11 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
         return null;
     }
 
+    // Fill missing (NOPTS) video DTS so the muxer gets monotonic timestamps.
+    // A B-frame stream leaves the leading packets' DTS unset; the correct values
+    // extrapolate backward from the first real DTS by the frame step.
+    fillVideoDts(video.items);
+
     // --- phase B: measurement mux, merging by DTS ----------------------------
     const zero = try gpa.alloc(u8, max_size);
     defer gpa.free(zero);
@@ -340,6 +449,9 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     errdefer map.deinit(gpa);
     try map.ensureTotalCapacity(gpa, video.items.len + aac_samples.items.len);
 
+    // Shift so the smallest DTS is non-negative (B-frame video starts negative);
+    // both streams shift together, keeping A/V sync and a valid MP4 timeline.
+    oc.avoid_negative_ts = 1; // AVFMT_AVOID_NEG_TS_MAKE_NON_NEGATIVE
     try extra.writeHeader(oc, null);
 
     const fp = try av.Packet.alloc();
@@ -368,7 +480,8 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
             fp.flags = if (s.key) 1 else 0;
             fp.size = @intCast(s.size);
             is_audio = false;
-            src = @intCast(s.pos);
+            // pread mode locates the sample by file offset; redemux by its PTS.
+            src = if (video_src == .pread) @as(u64, @intCast(s.pos)) else @bitCast(s.pts);
         } else {
             const s = aac_samples.items[ai];
             ai += 1;
@@ -408,12 +521,20 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
     try extra.writeTrailer(oc);
     if (cap.failed) return error.WriteFailed;
 
+    // --- the video source used at serve time --------------------------------
+    const source: ?Io.File = if (video_src == .pread) try Io.Dir.cwd().openFile(io, path, .{}) else null;
+    errdefer if (source) |s| s.close(io);
+    const vreader: ?*VideoReader = if (video_src == .redemux) try VideoReader.open(gpa, io, path_z, video_index) else null;
+    errdefer if (vreader) |r| r.deinit();
+
     // --- own the captured buffers ------------------------------------------
     const vm = try gpa.create(VMp4);
     vm.* = .{
         .gpa = gpa,
         .io = io,
+        .video_src = video_src,
         .source = source,
+        .vreader = vreader,
         .prefix = try cap.prefix.toOwnedSlice(gpa),
         .moov = try cap.moov.toOwnedSlice(gpa),
         .aac = try aac_buf.toOwnedSlice(gpa),
