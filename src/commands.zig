@@ -153,6 +153,8 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     // Also true for an HLS URL the receiver fetches directly, so it gets the
     // MPEG-TS segment hint too.
     var is_hls = std.ascii.findIgnoreCase(media_content_type, "mpegurl") != null;
+    // Embedded text subtitle streams, discovered by plan() for a local source.
+    var embedded_subs: []const pipeline.SubtitleStream = &.{};
 
     if (!isUrl(opts.source)) {
         Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
@@ -161,6 +163,7 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         };
         const p = try pipeline.plan(arena, opts.source);
         duration = p.duration;
+        embedded_subs = p.subtitles;
         if (p.video_unsupported) {
             std.debug.print("warning: {s} video is not castable and video transcoding is not implemented; trying direct\n", .{p.video_codec});
         }
@@ -242,33 +245,27 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         try text_tracks.append(arena, .{ .id = id, .url = url, .name = "Subtitles" });
         try active_tracks.append(arena, id);
     }
-    if (!isUrl(opts.source)) {
-        if (pipeline.listSubtitles(arena, opts.source)) |embedded| {
-            for (embedded) |e| {
-                const id = next_track_id;
-                next_track_id += 1;
-                const path = try std.fmt.allocPrint(arena, "/embsub{d}.vtt", .{e.index});
-                const ctx = try arena.create(EmbSubCtx);
-                ctx.* = .{ .gpa = arena, .path = opts.source, .stream_index = e.index };
-                try routes.append(arena, .{
-                    .path = path,
-                    .content_type = "text/vtt",
-                    .body = .{ .dynamic = .{ .context = ctx, .handle = embSubHandle } },
-                });
-                const name = if (e.title.len > 0)
-                    e.title
-                else if (!std.mem.eql(u8, e.language, "und"))
-                    subtitles.languageName(e.language)
-                else
-                    "Subtitles";
-                try text_tracks.append(arena, .{ .id = id, .url = path, .language = e.language, .name = name });
-            }
-            if (embedded.len > 0) {
-                std.debug.print("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu\n", .{embedded.len});
-            }
-        } else |err| {
-            std.debug.print("could not read embedded subtitles: {s}\n", .{@errorName(err)});
-        }
+    for (embedded_subs) |e| {
+        const id = next_track_id;
+        next_track_id += 1;
+        const path = try std.fmt.allocPrint(arena, "/embsub{d}.vtt", .{e.index});
+        const ctx = try arena.create(EmbSubCtx);
+        ctx.* = .{ .gpa = arena, .path = opts.source, .stream_index = e.index };
+        try routes.append(arena, .{
+            .path = path,
+            .content_type = "text/vtt",
+            .body = .{ .dynamic = .{ .context = ctx, .handle = embSubHandle } },
+        });
+        const name = if (e.title.len > 0)
+            e.title
+        else if (!std.mem.eql(u8, e.language, "und"))
+            subtitles.languageName(e.language)
+        else
+            "Subtitles";
+        try text_tracks.append(arena, .{ .id = id, .url = path, .language = e.language, .name = name });
+    }
+    if (embedded_subs.len > 0) {
+        std.debug.print("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu\n", .{embedded_subs.len});
     }
 
     // Connect only now: a `--remux mp4` transcode above can take minutes, and

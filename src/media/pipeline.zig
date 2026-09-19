@@ -26,6 +26,14 @@ const aac_bitrate = 192_000;
 /// fMP4: init is ftyp+moov, each fragment is moof+mdat, timestamps kept absolute.
 const fmp4_movflags = "frag_keyframe+empty_moov+default_base_moof";
 
+/// A text subtitle stream embedded in the source that we can side-load as a
+/// WebVTT track. `language`/`title` are duped into the `plan` allocator.
+pub const SubtitleStream = struct {
+    index: usize,
+    language: []const u8,
+    title: []const u8,
+};
+
 pub const Plan = struct {
     direct: bool,
     video_unsupported: bool,
@@ -33,8 +41,17 @@ pub const Plan = struct {
     video_codec: []const u8,
     audio_codec: []const u8,
     video_height: c_int,
+    /// Text subtitle streams we can offer as WebVTT tracks (bitmap subs skipped).
+    subtitles: []const SubtitleStream,
 };
 
+fn dictGet(dict: av.Dictionary.Mutable, key: [*:0]const u8) ?[]const u8 {
+    const entry = dict.get(key, null, .{}) orelse return null;
+    return std.mem.span(entry.value);
+}
+
+/// Inspects `path` once: how to deliver it, and which text subtitle streams it
+/// carries. `gpa` owns the returned subtitle strings.
 pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
@@ -51,8 +68,10 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     var have_video = false;
     var have_audio = false;
     var video_height: c_int = 0;
+    var subs: std.ArrayList(SubtitleStream) = .empty;
+    errdefer subs.deinit(gpa);
 
-    for (ic.streams[0..ic.nb_streams]) |st| {
+    for (ic.streams[0..ic.nb_streams], 0..) |st, i| {
         const par = st.codecpar;
         const name = extra.codecName(extra.codecId(par));
         switch (par.codec_type) {
@@ -66,6 +85,13 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
                 have_audio = true;
                 audio_codec = name;
                 audio_ok = probe.audioSupport(name) == .direct;
+            },
+            .SUBTITLE => if (subtitles.textIsSupported(name)) {
+                try subs.append(gpa, .{
+                    .index = i,
+                    .language = try gpa.dupe(u8, dictGet(st.metadata, "language") orelse "und"),
+                    .title = try gpa.dupe(u8, dictGet(st.metadata, "title") orelse ""),
+                });
             },
             else => {},
         }
@@ -83,50 +109,8 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
         .video_codec = video_codec,
         .audio_codec = audio_codec,
         .video_height = video_height,
+        .subtitles = try subs.toOwnedSlice(gpa),
     };
-}
-
-// --- embedded subtitles -----------------------------------------------------
-
-/// A text subtitle stream embedded in the source that we can side-load as a
-/// WebVTT track. `codec`, `language` and `title` point into caller memory.
-pub const SubtitleStream = struct {
-    index: usize,
-    codec: []const u8,
-    language: []const u8,
-    title: []const u8,
-};
-
-fn dictGet(dict: av.Dictionary.Mutable, key: [*:0]const u8) ?[]const u8 {
-    const entry = dict.get(key, null, .{}) orelse return null;
-    return std.mem.span(entry.value);
-}
-
-/// Lists the text subtitle streams embedded in `path`. Bitmap subtitles are
-/// skipped (they cannot become WebVTT). Strings are duped into `gpa`.
-pub fn listSubtitles(gpa: std.mem.Allocator, path: []const u8) ![]SubtitleStream {
-    const path_z = try gpa.dupeSentinel(u8, path, 0);
-    defer gpa.free(path_z);
-
-    av.LOG.set_level(.ERROR);
-    const ic = try av.FormatContext.open_input(path_z, null, null, null);
-    defer ic.close_input();
-    try ic.find_stream_info(null);
-
-    var list: std.ArrayList(SubtitleStream) = .empty;
-    errdefer list.deinit(gpa);
-    for (ic.streams[0..ic.nb_streams], 0..) |st, i| {
-        if (st.codecpar.codec_type != .SUBTITLE) continue;
-        const codec = extra.codecName(extra.codecId(st.codecpar));
-        if (!subtitles.textIsSupported(codec)) continue;
-        try list.append(gpa, .{
-            .index = i,
-            .codec = try gpa.dupe(u8, codec),
-            .language = try gpa.dupe(u8, dictGet(st.metadata, "language") orelse "und"),
-            .title = try gpa.dupe(u8, dictGet(st.metadata, "title") orelse ""),
-        });
-    }
-    return list.toOwnedSlice(gpa);
 }
 
 /// Demuxes subtitle stream `stream_index` from `path` and returns it as WebVTT.
