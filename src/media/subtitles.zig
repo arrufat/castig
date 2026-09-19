@@ -45,27 +45,29 @@ pub fn srtToVtt(gpa: std.mem.Allocator, srt: []const u8) ![]u8 {
 /// WebVTT from its packets alone. Bitmap subtitles (PGS, DVB, VOBSUB, DVD)
 /// are images and cannot become text tracks.
 pub fn textIsSupported(codec: []const u8) bool {
-    const names = [_][]const u8{ "subrip", "srt", "text", "ass", "ssa", "mov_text", "webvtt" };
-    for (names) |n| if (std.mem.eql(u8, codec, n)) return true;
-    return false;
+    return text_codecs.has(codec);
 }
+
+const text_codecs = std.StaticStringMap(void).initComptime(.{
+    .{"subrip"}, .{"srt"}, .{"text"}, .{"ass"}, .{"ssa"}, .{"mov_text"}, .{"webvtt"},
+});
 
 /// A human-readable name for an ISO 639 language code (as ffmpeg reports it,
 /// usually 639-2/B), falling back to the code itself for anything unlisted.
 pub fn languageName(code: []const u8) []const u8 {
     const table = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "eng", "English" },   .{ "ger", "German" },     .{ "deu", "German" },
-        .{ "fre", "French" },    .{ "fra", "French" },      .{ "spa", "Spanish" },
-        .{ "ita", "Italian" },   .{ "dut", "Dutch" },       .{ "nld", "Dutch" },
-        .{ "por", "Portuguese" },.{ "rus", "Russian" },     .{ "pol", "Polish" },
-        .{ "vie", "Vietnamese" },.{ "jpn", "Japanese" },    .{ "chi", "Chinese" },
-        .{ "zho", "Chinese" },   .{ "kor", "Korean" },      .{ "ara", "Arabic" },
-        .{ "hin", "Hindi" },     .{ "swe", "Swedish" },     .{ "nor", "Norwegian" },
-        .{ "dan", "Danish" },    .{ "fin", "Finnish" },     .{ "tur", "Turkish" },
-        .{ "gre", "Greek" },     .{ "ell", "Greek" },       .{ "heb", "Hebrew" },
-        .{ "tha", "Thai" },      .{ "cze", "Czech" },       .{ "ces", "Czech" },
-        .{ "hun", "Hungarian" }, .{ "rum", "Romanian" },    .{ "ron", "Romanian" },
-        .{ "ukr", "Ukrainian" }, .{ "cat", "Catalan" },     .{ "ind", "Indonesian" },
+        .{ "eng", "English" },    .{ "ger", "German" },   .{ "deu", "German" },
+        .{ "fre", "French" },     .{ "fra", "French" },   .{ "spa", "Spanish" },
+        .{ "ita", "Italian" },    .{ "dut", "Dutch" },    .{ "nld", "Dutch" },
+        .{ "por", "Portuguese" }, .{ "rus", "Russian" },  .{ "pol", "Polish" },
+        .{ "vie", "Vietnamese" }, .{ "jpn", "Japanese" }, .{ "chi", "Chinese" },
+        .{ "zho", "Chinese" },    .{ "kor", "Korean" },   .{ "ara", "Arabic" },
+        .{ "hin", "Hindi" },      .{ "swe", "Swedish" },  .{ "nor", "Norwegian" },
+        .{ "dan", "Danish" },     .{ "fin", "Finnish" },  .{ "tur", "Turkish" },
+        .{ "gre", "Greek" },      .{ "ell", "Greek" },    .{ "heb", "Hebrew" },
+        .{ "tha", "Thai" },       .{ "cze", "Czech" },    .{ "ces", "Czech" },
+        .{ "hun", "Hungarian" },  .{ "rum", "Romanian" }, .{ "ron", "Romanian" },
+        .{ "ukr", "Ukrainian" },  .{ "cat", "Catalan" },  .{ "ind", "Indonesian" },
     });
     return table.get(code) orelse code;
 }
@@ -79,17 +81,21 @@ pub fn writeVttHeader(gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
 /// payload, `codec` its libav name, times in milliseconds. Empty cues (a
 /// clear event) are skipped.
 pub fn writeVttCue(gpa: std.mem.Allocator, out: *std.ArrayList(u8), start_ms: i64, end_ms: i64, codec: []const u8, data: []const u8) !void {
-    var tmp: std.ArrayList(u8) = .empty;
-    defer tmp.deinit(gpa);
-    try appendCleanText(gpa, &tmp, cueText(codec, data));
-    const text = std.mem.trim(u8, tmp.items, " \t\r\n");
-    if (text.len == 0) return;
-
+    // Clean the text in place after the timing line; roll back an empty cue.
+    const cue_start = out.items.len;
     try appendTime(gpa, out, start_ms);
     try out.appendSlice(gpa, " --> ");
     try appendTime(gpa, out, end_ms);
     try out.append(gpa, '\n');
-    try out.appendSlice(gpa, text);
+    const text_start = out.items.len;
+    try appendCleanText(gpa, out, cueText(codec, data));
+    const text = std.mem.trim(u8, out.items[text_start..], " \t\r\n");
+    if (text.len == 0) {
+        out.items.len = cue_start;
+        return;
+    }
+    std.mem.copyForwards(u8, out.items[text_start..], text);
+    out.items.len = text_start + text.len;
     try out.appendSlice(gpa, "\n\n");
 }
 
@@ -108,8 +114,8 @@ fn cueText(codec: []const u8, data: []const u8) []const u8 {
     if (std.mem.eql(u8, codec, "mov_text")) {
         // MP4 tx3g: a 16-bit big-endian length then that many UTF-8 bytes.
         if (data.len < 2) return "";
-        const n = (@as(usize, data[0]) << 8) | data[1];
-        return data[2..@min(2 + n, data.len)];
+        const n = std.mem.readInt(u16, data[0..2], .big);
+        return data[2..@min(2 + @as(usize, n), data.len)];
     }
     return data; // subrip / srt / text / webvtt: raw text
 }
@@ -125,7 +131,7 @@ fn appendCleanText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []cons
             continue;
         }
         if (c == '{') {
-            if (std.mem.indexOfScalarPos(u8, text, i, '}')) |close| {
+            if (std.mem.findScalarPos(u8, text, i, '}')) |close| {
                 i = close + 1;
                 continue;
             }
@@ -153,7 +159,7 @@ fn appendCleanText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []cons
 fn appendTime(gpa: std.mem.Allocator, out: *std.ArrayList(u8), ms_in: i64) !void {
     const ms: u64 = if (ms_in < 0) 0 else @intCast(ms_in);
     var buf: [16]u8 = undefined;
-    const t = try std.fmt.bufPrint(&buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+    const t = try std.mem.print(&buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
         ms / 3_600_000,
         (ms / 60_000) % 60,
         (ms / 1000) % 60,
@@ -168,18 +174,20 @@ fn isNumber(line: []const u8) bool {
 }
 
 fn isTiming(line: []const u8) bool {
-    return std.mem.indexOf(u8, line, "-->") != null;
+    return std.mem.find(u8, line, "-->") != null;
 }
 
 fn appendTiming(gpa: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8) !void {
-    for (line) |c| try out.append(gpa, if (c == ',') '.' else c);
+    const start = out.items.len;
+    try out.appendSlice(gpa, line);
+    std.mem.replaceScalar(u8, out.items[start..], ',', '.');
 }
 
 fn appendText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8) !void {
     var i: usize = 0;
     while (i < line.len) {
         if (line[i] == '{' and i + 1 < line.len and line[i + 1] == '\\') {
-            if (std.mem.indexOfScalarPos(u8, line, i, '}')) |close| {
+            if (std.mem.findScalarPos(u8, line, i, '}')) |close| {
                 i = close + 1;
                 continue;
             }
@@ -225,7 +233,7 @@ test "vtt cue from ass packet" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try writeVttHeader(gpa, &out);
-    // ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+    // Fields: ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text.
     try writeVttCue(gpa, &out, 1000, 2500, "ass", "0,0,Default,,0,0,0,,{\\an8}Hello\\NWorld");
     try std.testing.expectEqualStrings(
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nHello\nWorld\n\n",
@@ -237,7 +245,7 @@ test "vtt cue from mov_text packet" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    // 16-bit length (5) then "Hello"
+    // A 16-bit length (5) then "Hello".
     try writeVttCue(gpa, &out, 0, 1000, "mov_text", "\x00\x05Hello");
     try std.testing.expectEqualStrings("00:00:00.000 --> 00:00:01.000\nHello\n\n", out.items);
 }

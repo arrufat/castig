@@ -45,6 +45,7 @@ fn tag(field: u32, wire: Wire) u32 {
     return (field << 3) | @backingInt(wire);
 }
 
+/// A protobuf varint is an unsigned LEB128.
 pub fn varintLen(value: u64) usize {
     var n: usize = 1;
     var v = value;
@@ -52,19 +53,13 @@ pub fn varintLen(value: u64) usize {
     return n;
 }
 
-fn writeVarint(w: *Io.Writer, value: u64) Io.Writer.Error!void {
-    var v = value;
-    while (v >= 0x80) : (v >>= 7) try w.writeByte(@intCast((v & 0x7F) | 0x80));
-    try w.writeByte(@intCast(v));
-}
-
 fn lenFieldLen(field: u32, bytes: []const u8) usize {
     return varintLen(tag(field, .len)) + varintLen(bytes.len) + bytes.len;
 }
 
 fn writeLenField(w: *Io.Writer, field: u32, bytes: []const u8) Io.Writer.Error!void {
-    try writeVarint(w, tag(field, .len));
-    try writeVarint(w, bytes.len);
+    try w.writeUleb128(tag(field, .len));
+    try w.writeUleb128(bytes.len);
     try w.writeAll(bytes);
 }
 
@@ -88,26 +83,24 @@ fn payloadField(msg: Message) struct { u32, []const u8 } {
 
 /// Writes the length prefix and the body. The caller flushes.
 pub fn encode(msg: Message, w: *Io.Writer) Io.Writer.Error!void {
-    var prefix: [4]u8 = undefined;
-    std.mem.writeInt(u32, &prefix, @intCast(bodyLen(msg)), .big);
-    try w.writeAll(&prefix);
+    try w.writeInt(u32, @intCast(bodyLen(msg)), .big);
 
-    try writeVarint(w, tag(Field.protocol_version, .varint));
-    try writeVarint(w, 0);
+    try w.writeUleb128(tag(Field.protocol_version, .varint));
+    try w.writeUleb128(@as(u8, 0));
     try writeLenField(w, Field.source_id, msg.source_id);
     try writeLenField(w, Field.destination_id, msg.destination_id);
     try writeLenField(w, Field.namespace, msg.namespace);
-    try writeVarint(w, tag(Field.payload_type, .varint));
+    try w.writeUleb128(tag(Field.payload_type, .varint));
     const payload_field, const payload = payloadField(msg);
-    try writeVarint(w, if (payload_field == Field.payload_binary) 1 else 0);
+    try w.writeUleb128(@as(u8, if (payload_field == Field.payload_binary) 1 else 0));
     try writeLenField(w, payload_field, payload);
 }
 
-pub const DecodeError = error{ Truncated, VarintTooLong, UnsupportedWireType, MissingField };
+pub const DecodeError = Io.Reader.TakeLeb128Error || error{ UnsupportedWireType, MissingField };
 
 /// Decodes one body (without the length prefix). Slices point into `body`.
 pub fn decode(body: []const u8) DecodeError!Message {
-    var pos: usize = 0;
+    var r: Io.Reader = .fixed(body);
     var source_id: ?[]const u8 = null;
     var destination_id: ?[]const u8 = null;
     var namespace: ?[]const u8 = null;
@@ -115,19 +108,17 @@ pub fn decode(body: []const u8) DecodeError!Message {
     var utf8: ?[]const u8 = null;
     var binary: ?[]const u8 = null;
 
-    while (pos < body.len) {
-        const key = try readVarint(body, &pos);
+    while (r.bufferedLen() > 0) {
+        const key = try r.takeLeb128(u64);
         const field: u32 = @intCast(key >> 3);
         switch (@as(u3, @intCast(key & 7))) {
             0 => {
-                const v = try readVarint(body, &pos);
+                const v = try r.takeLeb128(u64);
                 if (field == Field.payload_type) payload_type = v;
             },
             2 => {
-                const n: usize = @intCast(try readVarint(body, &pos));
-                if (pos + n > body.len) return error.Truncated;
-                const bytes = body[pos..][0..n];
-                pos += n;
+                const n: usize = @intCast(try r.takeLeb128(u64));
+                const bytes = try r.take(n);
                 switch (field) {
                     Field.source_id => source_id = bytes,
                     Field.destination_id => destination_id = bytes,
@@ -137,11 +128,10 @@ pub fn decode(body: []const u8) DecodeError!Message {
                     else => {},
                 }
             },
-            1 => pos += 8,
-            5 => pos += 4,
+            1 => _ = try r.take(8),
+            5 => _ = try r.take(4),
             else => return error.UnsupportedWireType,
         }
-        if (pos > body.len) return error.Truncated;
     }
 
     return .{
@@ -153,20 +143,6 @@ pub fn decode(body: []const u8) DecodeError!Message {
         else
             .{ .utf8 = utf8 orelse "" },
     };
-}
-
-fn readVarint(body: []const u8, pos: *usize) DecodeError!u64 {
-    var result: u64 = 0;
-    var shift: u6 = 0;
-    while (true) {
-        if (pos.* >= body.len) return error.Truncated;
-        const byte = body[pos.*];
-        pos.* += 1;
-        result |= @as(u64, byte & 0x7F) << shift;
-        if (byte & 0x80 == 0) return result;
-        if (shift >= 63) return error.VarintTooLong;
-        shift += 7;
-    }
 }
 
 test "encode matches hand-computed bytes" {
@@ -206,7 +182,8 @@ test "decode round trip" {
 }
 
 test "decode binary payload and unknown fields" {
-    // protocol_version, source, dest, namespace, unknown field 9 varint, payload_type=1, payload_binary
+    // Fields: protocol_version, source, dest, namespace, an unknown varint
+    // field 9, payload_type=1, payload_binary.
     const body = [_]u8{ 0x08, 0x00, 0x12, 0x01, 's', 0x1a, 0x01, 'd', 0x22, 0x01, 'n', 0x48, 0x2a, 0x28, 0x01, 0x3a, 0x02, 0xde, 0xad };
     const m = try decode(&body);
     try std.testing.expectEqualStrings("n", m.namespace);
@@ -215,6 +192,6 @@ test "decode binary payload and unknown fields" {
 
 test "decode rejects truncated input" {
     const body = [_]u8{ 0x12, 0x05, 'a', 'b' };
-    try std.testing.expectError(error.Truncated, decode(&body));
+    try std.testing.expectError(error.EndOfStream, decode(&body));
     try std.testing.expectError(error.MissingField, decode(&.{ 0x08, 0x00 }));
 }

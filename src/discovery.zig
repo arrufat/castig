@@ -12,6 +12,7 @@ const dns = @import("dns.zig");
 
 pub const service = "_googlecast._tcp.local";
 pub const default_port: u16 = 8009;
+pub const default_timeout_ms: u32 = 2000;
 
 const mdns_group: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 224, 0, 0, 251 }, .port = 5353 } };
 /// RFC 6762 §17: mDNS messages fit in 9000 bytes.
@@ -24,13 +25,20 @@ pub const Device = struct {
     friendly_name: []const u8,
     /// Model ("md"), e.g. "Pixel Tablet".
     model: []const u8,
-    /// Service instance name, e.g. "Pixel-Tablet-30dab5...".
-    instance: []const u8,
     address: net.Ip4Address,
+
+    /// Case-insensitive fragment of the friendly name or model, or a prefix
+    /// of the id.
+    pub fn matches(d: Device, spec: []const u8) bool {
+        return std.ascii.findIgnoreCase(d.friendly_name, spec) != null or
+            std.ascii.findIgnoreCase(d.model, spec) != null or
+            std.mem.startsWith(u8, d.id, spec);
+    }
 };
 
-/// Sends one query and collects answers until `timeout_ms` elapses.
-pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32) ![]Device {
+/// Sends one query and collects answers until `timeout_ms` elapses, or, when
+/// `wanted` is given, until a device matches it.
+pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32, wanted: ?[]const u8) ![]Device {
     const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
     const sock = try bind_addr.bind(io, .{ .mode = .dgram });
     defer sock.close(io);
@@ -55,18 +63,20 @@ pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32) ![]Device {
             .ip4 => |a| a,
             .ip6 => null,
         };
-        parseResponse(gpa, msg.data, from, &devices) catch |err| switch (err) {
+        const added = parseResponse(gpa, msg.data, from, &devices) catch |err| switch (err) {
             error.OutOfMemory => return err,
             // A malformed packet from one device must not abort discovery.
             else => continue,
         };
+        if (added) if (wanted) |spec| if (devices.items[devices.items.len - 1].matches(spec)) break;
     }
     return devices.toOwnedSlice(gpa);
 }
 
-fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Address, devices: *std.ArrayList(Device)) !void {
+/// Appends the device announced by `packet`, if any and not seen yet.
+fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Address, devices: *std.ArrayList(Device)) !bool {
     var parser = try dns.Parser.init(packet);
-    if (!parser.isResponse()) return;
+    if (!parser.isResponse()) return false;
 
     var name_buf: [dns.max_name_len]u8 = undefined;
     var target_buf: [dns.max_name_len]u8 = undefined;
@@ -107,53 +117,47 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
     }
 
     // Not a cast announcement (or an answer to somebody else's question).
-    if (id == null and port == null) return;
+    if (id == null and port == null) return false;
 
-    const bytes = ip orelse (from orelse return).bytes;
+    const bytes = ip orelse (from orelse return false).bytes;
     const dev: Device = .{
         .id = id orelse "",
         .friendly_name = friendly orelse instance orelse "?",
         .model = model orelse "",
-        .instance = instance orelse "",
         .address = .{ .bytes = bytes, .port = port orelse default_port },
     };
 
     for (devices.items) |d| {
         const same_id = dev.id.len > 0 and std.mem.eql(u8, d.id, dev.id);
-        const same_addr = std.mem.eql(u8, &d.address.bytes, &dev.address.bytes) and d.address.port == dev.address.port;
-        if (same_id or same_addr) return;
+        if (same_id or d.address.eql(dev.address)) return false;
     }
     try devices.append(gpa, dev);
+    return true;
 }
 
 /// Turns a device argument into an address: "192.168.1.39", "192.168.1.39:8009",
 /// or a case-insensitive fragment of the friendly name, model or id, which
-/// triggers a discovery round.
+/// triggers a discovery round that ends at the first match.
 pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address {
     if (spec.len > 0 and std.ascii.isDigit(spec[0])) {
-        if (std.mem.indexOfScalar(u8, spec, ':')) |colon| {
-            const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return error.InvalidAddress;
-            return net.Ip4Address.parse(spec[0..colon], port) catch error.InvalidAddress;
-        }
-        return net.Ip4Address.parse(spec, default_port) catch error.InvalidAddress;
+        const literal = net.IpAddress.parseLiteral(spec) catch return error.InvalidAddress;
+        var address = switch (literal) {
+            .ip4 => |a| a,
+            .ip6 => return error.InvalidAddress,
+        };
+        if (address.port == 0) address.port = default_port;
+        return address;
     }
 
-    const devices = try discover(io, gpa, 2000);
+    const devices = try discover(io, gpa, default_timeout_ms, spec);
     defer gpa.free(devices);
-    for (devices) |d| {
-        if (std.ascii.findIgnoreCase(d.friendly_name, spec) != null or
-            std.ascii.findIgnoreCase(d.model, spec) != null or
-            std.mem.startsWith(u8, d.id, spec))
-        {
-            return d.address;
-        }
-    }
+    for (devices) |d| if (d.matches(spec)) return d.address;
     std.debug.print("no cast device matches \"{s}\"; try `castig ls`\n", .{spec});
     return error.DeviceNotFound;
 }
 
 pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, timeout_ms: u32) !void {
-    const devices = try discover(io, gpa, timeout_ms);
+    const devices = try discover(io, gpa, timeout_ms, null);
     if (devices.len == 0) {
         try out.print("no cast devices answered within {d} ms\n", .{timeout_ms});
         try out.writeAll("(check with `avahi-browse -rt _googlecast._tcp`; if devices show there, they ignore unicast-response queries)\n");

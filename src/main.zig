@@ -32,10 +32,26 @@ const usage =
     \\
 ;
 
+/// Debug logs (every cast message, every HTTP request) are printed only with
+/// CASTIG_DEBUG set; the level is decided at runtime in `logFn`.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = logFn,
+};
+
+var debug_enabled = false;
+
+fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    if (level == .debug and !debug_enabled) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
+const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, help };
+
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
         // Already explained on stderr by the command.
-        error.InvalidRate, error.InvalidSeek, error.NoMedia, error.RequestFailed, error.DeviceNotFound => return 1,
+        error.InvalidRate, error.InvalidSeek, error.NoMedia, error.RequestFailed, error.DeviceNotFound, error.SourceUnreadable => return 1,
         error.ConnectionClosed => {
             std.debug.print("the receiver closed the connection\n", .{});
             return 1;
@@ -58,74 +74,65 @@ fn run(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     if (args.len < 2) fail(usage);
-    const cmd = args[1];
-    const options: commands.Options = .{
-        .debug = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false,
-    };
+    debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
 
-    if (std.mem.eql(u8, cmd, "ls")) {
-        var timeout_ms: u32 = 2000;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+    const cmd = if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))
+        Command.help
+    else
+        std.meta.stringToEnum(Command, args[1]) orelse fail(usage);
+
+    switch (cmd) {
+        .ls => {
+            var timeout_ms: u32 = discovery.default_timeout_ms;
+            var i: usize = 2;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+                    i += 1;
+                    timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch fail("--timeout expects a number of milliseconds\n");
+                } else fail(usage);
+            }
+            try discovery.run(io, arena, out, timeout_ms);
+        },
+        .probe => {
+            if (args.len != 3) fail(usage);
+            try probe.run(arena, out, args[2]);
+        },
+        .status, .stop, .pause, .play => {
+            if (args.len != 3) fail(usage);
+            switch (cmd) {
+                inline .status, .stop, .pause, .play => |c| try @field(commands, @tagName(c))(io, arena, out, args[2]),
+                else => unreachable,
+            }
+        },
+        .seek => {
+            if (args.len != 4) fail(usage);
+            try commands.seek(io, arena, out, args[2], args[3]);
+        },
+        .rate => {
+            if (args.len != 4) fail(usage);
+            try commands.rate(io, arena, out, args[2], args[3]);
+        },
+        .cast => {
+            if (args.len < 4) fail(usage);
+            var opts: commands.CastOptions = .{ .source = args[3] };
+            var i: usize = 4;
+            while (i < args.len) : (i += 1) {
+                const flag = args[i];
+                if (i + 1 >= args.len) fail(usage);
                 i += 1;
-                timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch fail("--timeout expects a number of milliseconds\n");
-            } else fail(usage);
-        }
-        try discovery.run(io, arena, out, timeout_ms);
-    } else if (std.mem.eql(u8, cmd, "probe")) {
-        if (args.len != 3) fail(usage);
-        try probe.run(arena, out, args[2]);
-    } else if (std.mem.eql(u8, cmd, "status")) {
-        if (args.len != 3) fail(usage);
-        try commands.status(io, arena, out, args[2], options);
-    } else if (std.mem.eql(u8, cmd, "stop")) {
-        if (args.len != 3) fail(usage);
-        try commands.stop(io, arena, out, args[2], options);
-    } else if (std.mem.eql(u8, cmd, "pause")) {
-        if (args.len != 3) fail(usage);
-        try commands.pause(io, arena, out, args[2], options);
-    } else if (std.mem.eql(u8, cmd, "play")) {
-        if (args.len != 3) fail(usage);
-        try commands.play(io, arena, out, args[2], options);
-    } else if (std.mem.eql(u8, cmd, "seek")) {
-        if (args.len != 4) fail(usage);
-        try commands.seek(io, arena, out, args[2], args[3], options);
-    } else if (std.mem.eql(u8, cmd, "rate")) {
-        if (args.len != 4) fail(usage);
-        try commands.rate(io, arena, out, args[2], args[3], options);
-    } else if (std.mem.eql(u8, cmd, "cast")) {
-        if (args.len < 4) fail(usage);
-        var opts: commands.CastOptions = .{ .source = args[3] };
-        var i: usize = 4;
-        while (i < args.len) : (i += 1) {
-            const flag = args[i];
-            if (i + 1 >= args.len) fail(usage);
-            i += 1;
-            if (std.mem.eql(u8, flag, "--title")) {
-                opts.title = args[i];
-            } else if (std.mem.eql(u8, flag, "--type")) {
-                opts.content_type = args[i];
-            } else if (std.mem.eql(u8, flag, "--subs")) {
-                opts.subtitles = args[i];
-            } else if (std.mem.eql(u8, flag, "--remux")) {
-                opts.remux = if (std.mem.eql(u8, args[i], "auto"))
-                    .auto
-                else if (std.mem.eql(u8, args[i], "hls"))
-                    .hls
-                else if (std.mem.eql(u8, args[i], "mp4"))
-                    .mp4
-                else if (std.mem.eql(u8, args[i], "stream"))
-                    .stream
-                else
-                    fail("--remux expects auto, hls, mp4, or stream\n");
-            } else fail(usage);
-        }
-        try commands.cast(io, arena, out, args[2], opts, options);
-    } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
-        try out.writeAll(usage);
-    } else {
-        fail(usage);
+                if (std.mem.eql(u8, flag, "--title")) {
+                    opts.title = args[i];
+                } else if (std.mem.eql(u8, flag, "--type")) {
+                    opts.content_type = args[i];
+                } else if (std.mem.eql(u8, flag, "--subs")) {
+                    opts.subtitles = args[i];
+                } else if (std.mem.eql(u8, flag, "--remux")) {
+                    opts.remux = std.meta.stringToEnum(commands.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
+                } else fail(usage);
+            }
+            try commands.cast(io, arena, out, args[2], opts);
+        },
+        .help => try out.writeAll(usage),
     }
 
     try out.flush();

@@ -207,8 +207,8 @@ pub const TxtIterator = struct {
             const s = it.rdata[it.pos..end];
             it.pos = end;
             if (s.len == 0) continue;
-            if (std.mem.indexOfScalar(u8, s, '=')) |eq| return .{ .key = s[0..eq], .value = s[eq + 1 ..] };
-            return .{ .key = s, .value = "" };
+            const key, const value = std.mem.cutScalar(u8, s, '=') orelse .{ s, "" };
+            return .{ .key = key, .value = value };
         }
         return null;
     }
@@ -221,11 +221,6 @@ pub fn txtIterator(rec: Record) TxtIterator {
 pub fn aRecord(rec: Record) Error![4]u8 {
     if (rec.rdata.len != 4) return error.Truncated;
     return rec.rdata[0..4].*;
-}
-
-pub fn aaaaRecord(rec: Record) Error![16]u8 {
-    if (rec.rdata.len != 16) return error.Truncated;
-    return rec.rdata[0..16].*;
 }
 
 // --- tests -----------------------------------------------------------------
@@ -283,7 +278,7 @@ const Builder = struct {
 
 test "parse a cast-style response with compression" {
     var b: Builder = .{};
-    // header: id 0, flags response+authoritative, qd 0, an 1, ns 0, ar 3
+    // Header: id 0, flags response+authoritative, qd 0, an 1, ns 0, ar 3.
     b.u16be(0);
     b.u16be(0x8400);
     b.u16be(0);
@@ -291,7 +286,7 @@ test "parse a cast-style response with compression" {
     b.u16be(0);
     b.u16be(3);
 
-    // PTR _x._tcp.local -> inst._x._tcp.local
+    // PTR _x._tcp.local -> inst._x._tcp.local.
     const service_at = b.name("_x._tcp.local");
     b.u16be(Type.PTR);
     b.u16be(class_in);
@@ -300,7 +295,7 @@ test "parse a cast-style response with compression" {
     const inst_at = b.bytes("\x04inst");
     b.pointer(service_at);
 
-    // SRV inst._x._tcp.local -> port 8009, target host.local
+    // SRV inst._x._tcp.local -> port 8009, target host.local.
     b.pointer(inst_at);
     b.u16be(Type.SRV);
     b.u16be(class_in | cache_flush_flag);
@@ -311,7 +306,7 @@ test "parse a cast-style response with compression" {
     b.u16be(8009);
     const host_at = b.name("host.local");
 
-    // TXT inst._x._tcp.local
+    // TXT inst._x._tcp.local.
     b.pointer(inst_at);
     b.u16be(Type.TXT);
     b.u16be(class_in | cache_flush_flag);
@@ -320,7 +315,7 @@ test "parse a cast-style response with compression" {
     b.u16be(txt.len);
     _ = b.bytes(txt);
 
-    // A host.local -> 192.168.1.39
+    // A host.local -> 192.168.1.39.
     b.pointer(host_at);
     b.u16be(Type.A);
     b.u16be(class_in | cache_flush_flag);
@@ -372,11 +367,11 @@ test "malformed packets are rejected" {
     var name_buf: [max_name_len]u8 = undefined;
     try std.testing.expectError(error.Truncated, Parser.init("short"));
 
-    // forward pointer
+    // A forward pointer.
     const fwd = [_]u8{ 0xC0, 0x05, 0, 0, 0, 0 };
     try std.testing.expectError(error.InvalidPointer, readName(&fwd, 0, &name_buf));
 
-    // label running past the end
+    // A label running past the end.
     const trunc = [_]u8{ 0x05, 'a', 'b' };
     try std.testing.expectError(error.Truncated, readName(&trunc, 0, &name_buf));
 }

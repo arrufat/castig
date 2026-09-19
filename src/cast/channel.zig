@@ -21,13 +21,15 @@ const net = Io.net;
 const tls = std.crypto.tls;
 const proto = @import("proto.zig");
 
+/// Every message exchanged with the receiver, at debug level.
+const log = std.log.scoped(.cast);
+
 pub const ns_connection = "urn:x-cast:com.google.cast.tp.connection";
 pub const ns_heartbeat = "urn:x-cast:com.google.cast.tp.heartbeat";
 pub const ns_receiver = "urn:x-cast:com.google.cast.receiver";
 pub const ns_media = "urn:x-cast:com.google.cast.media";
 
 pub const default_media_receiver = "CC1AD845";
-pub const default_port: u16 = 8009;
 
 const sender_id = "sender-0";
 const receiver_id = "receiver-0";
@@ -57,17 +59,12 @@ pub const Channel = struct {
     /// Body of the last received frame; a `proto.Message` from `receive`
     /// points into it and is valid until the next call.
     frame: std.ArrayList(u8) = .empty,
-    /// Dump every message on stderr.
-    debug: bool = false,
+    /// Scratch for the JSON text of each outgoing message.
+    json: Io.Writer.Allocating,
 
     /// Opens the TLS connection and sends CONNECT to the receiver.
     /// The channel lives on the heap because the TLS client keeps pointers into it.
-    pub const Options = struct {
-        /// Print every message exchanged on stderr.
-        debug: bool = false,
-    };
-
-    pub fn connect(io: Io, gpa: std.mem.Allocator, address: net.Ip4Address, options: Options) !*Channel {
+    pub fn connect(io: Io, gpa: std.mem.Allocator, address: net.Ip4Address) !*Channel {
         const ch = try gpa.create(Channel);
         errdefer gpa.destroy(ch);
         const buffers = try gpa.create([4][buffer_len]u8);
@@ -85,7 +82,7 @@ pub const Channel = struct {
             .stream_writer = stream.writer(io, &buffers[1]),
             .client = undefined,
             .buffers = buffers,
-            .debug = options.debug,
+            .json = .init(gpa),
         };
 
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
@@ -109,22 +106,20 @@ pub const Channel = struct {
         ch.stream_writer.interface.flush() catch {};
         ch.stream.close(ch.io);
         ch.frame.deinit(ch.gpa);
+        ch.json.deinit();
         ch.gpa.destroy(ch.buffers);
         ch.gpa.destroy(ch);
     }
 
-    /// Our own address on the interface that reaches the receiver, for URLs
-    /// the receiver must fetch from us.
-    pub fn localIp4(ch: *const Channel) ![4]u8 {
-        var addr: std.os.linux.sockaddr.in = undefined;
-        var len: std.os.linux.socklen_t = @sizeOf(@TypeOf(addr));
-        const rc = std.os.linux.getsockname(ch.stream.socket.handle, @ptrCast(&addr), &len);
-        if (std.os.linux.errno(rc) != .SUCCESS) return error.Unexpected;
-        return @bitCast(addr.addr);
+    /// Our own address on the interface that reaches the receiver (the
+    /// connected socket's local address), for URLs the receiver must fetch
+    /// from us. The port is the socket's, not one to serve on.
+    pub fn localAddress(ch: *const Channel) net.Ip4Address {
+        return ch.stream.socket.address.ip4;
     }
 
     pub fn send(ch: *Channel, destination: []const u8, namespace: []const u8, payload_utf8: []const u8) !void {
-        if (ch.debug) std.debug.print("-> {s} {s}\n   {s}\n", .{ destination, namespace, payload_utf8 });
+        log.debug("-> {s} {s}\n   {s}", .{ destination, namespace, payload_utf8 });
         try proto.encode(.{
             .source_id = sender_id,
             .destination_id = destination,
@@ -136,15 +131,15 @@ pub const Channel = struct {
     }
 
     pub fn sendJson(ch: *Channel, destination: []const u8, namespace: []const u8, value: anytype) !void {
-        const text = try std.json.Stringify.valueAlloc(ch.gpa, value, .{ .emit_null_optional_fields = false });
-        defer ch.gpa.free(text);
-        try ch.send(destination, namespace, text);
+        ch.json.clearRetainingCapacity();
+        try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, &ch.json.writer);
+        try ch.send(destination, namespace, ch.json.written());
     }
 
     /// Blocks for the next message, answering heartbeat PINGs itself.
-    /// A closed connection (the receiver hanging up, or a TCP FIN) surfaces as
-    /// `error.EndOfStream` from the reader; it is the normal end of a session,
-    /// so it is mapped to `error.ConnectionClosed` for callers to handle.
+    /// The receiver ending the session, either with a CLOSE message or by
+    /// hanging up (a TCP FIN, `error.EndOfStream` from the reader), is the
+    /// normal end of a session and surfaces as `error.ConnectionClosed`.
     pub fn receive(ch: *Channel) !proto.Message {
         while (true) {
             const r = &ch.client.reader;
@@ -161,13 +156,16 @@ pub const Channel = struct {
             };
 
             const msg = try proto.decode(ch.frame.items);
-            if (ch.debug and !std.mem.eql(u8, msg.namespace, ns_heartbeat)) {
-                std.debug.print("<- {s} {s}\n   {s}\n", .{ msg.source_id, msg.namespace, if (msg.payload == .utf8) msg.payload.utf8 else "<binary>" });
-            }
+            const text = if (msg.payload == .utf8) msg.payload.utf8 else "<binary>";
             if (std.mem.eql(u8, msg.namespace, ns_heartbeat)) {
-                if (msg.payload == .utf8 and std.mem.indexOf(u8, msg.payload.utf8, "\"PING\"") != null) {
+                if (std.mem.find(u8, text, "\"PING\"") != null) {
                     try ch.sendJson(msg.source_id, ns_heartbeat, Pong{});
                 }
+                continue;
+            }
+            log.debug("<- {s} {s}\n   {s}", .{ msg.source_id, msg.namespace, text });
+            if (std.mem.eql(u8, msg.namespace, ns_connection)) {
+                if (std.mem.find(u8, text, "\"CLOSE\"") != null) return error.ConnectionClosed;
                 continue;
             }
             return msg;
@@ -190,10 +188,6 @@ pub const Channel = struct {
 
         while (true) {
             const msg = try ch.receive();
-            if (std.mem.eql(u8, msg.namespace, ns_connection)) {
-                if (std.mem.indexOf(u8, msg.payload.utf8, "\"CLOSE\"") != null) return error.ConnectionClosed;
-                continue;
-            }
             const json = try parsePayload(arena, msg);
             // Progress of our LAUNCH: the device may ask its user first.
             if (getInt(json, "launchRequestId") == ch.request_id) {
@@ -301,27 +295,28 @@ pub const Channel = struct {
 
     // --- media namespace ----------------------------------------------------
 
+    /// `playerState` of a MEDIA_STATUS; tags are the protocol's own words.
+    pub const PlayerState = enum { IDLE, PLAYING, PAUSED, BUFFERING, UNKNOWN };
+
+    /// `idleReason` of a MEDIA_STATUS; INTERRUPTED (which a seek-reload
+    /// produces) is not terminal.
+    pub const IdleReason = enum { FINISHED, CANCELLED, INTERRUPTED, ERROR, UNKNOWN };
+
     pub const MediaStatus = struct {
         media_session_id: i64,
-        player_state: []const u8,
+        player_state: PlayerState,
         current_time: f64,
         duration: ?f64,
-        idle_reason: ?[]const u8,
+        idle_reason: ?IdleReason,
         playback_rate: f64,
-        /// The media URL the receiver is playing, when reported.
-        content_id: ?[]const u8 = null,
-        title: ?[]const u8 = null,
-        /// Content id of the first text track, when reported.
-        subtitle_url: ?[]const u8 = null,
 
-        /// True only for terminal states; INTERRUPTED (which a seek-reload
-        /// produces) is not terminal.
+        /// True only for terminal states.
         pub fn isFinished(m: MediaStatus) bool {
-            if (!std.mem.eql(u8, m.player_state, "IDLE")) return false;
-            const reason = m.idle_reason orelse return false;
-            return std.mem.eql(u8, reason, "FINISHED") or
-                std.mem.eql(u8, reason, "CANCELLED") or
-                std.mem.eql(u8, reason, "ERROR");
+            if (m.player_state != .IDLE) return false;
+            return switch (m.idle_reason orelse return false) {
+                .FINISHED, .CANCELLED, .ERROR => true,
+                .INTERRUPTED, .UNKNOWN => false,
+            };
         }
     };
 
@@ -373,9 +368,8 @@ pub const Channel = struct {
         if (tracks.len > 0) {
             req.media.tracks = tracks;
             req.media.textTrackStyle = .{};
-            // activeTrackIds in the LOAD selects the enabled tracks; a
-            // follow-up EDIT_TRACKS_INFO only raced the not-yet-ready session
-            // and drew INVALID_MEDIA_SESSION_ID.
+            // activeTrackIds goes on the LOAD itself: a later EDIT_TRACKS_INFO
+            // races the session and fails with INVALID_MEDIA_SESSION_ID.
             req.activeTrackIds = opts.active_track_ids;
         }
         const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
@@ -387,30 +381,13 @@ pub const Channel = struct {
         const list = getArr(json, "status") orelse return null;
         if (list.len == 0) return null;
         const s = list[0];
-        const media = getObj(s, "media");
-        var content_id: ?[]const u8 = null;
-        var title: ?[]const u8 = null;
-        var subtitle_url: ?[]const u8 = null;
-        if (media) |m| {
-            content_id = getStr(m, "contentId");
-            if (getObj(m, "metadata")) |meta| title = getStr(meta, "title");
-            if (getArr(m, "tracks")) |tracks| for (tracks) |t| {
-                if (getStr(t, "type")) |ty| if (std.mem.eql(u8, ty, "TEXT")) {
-                    subtitle_url = getStr(t, "trackContentId");
-                    break;
-                };
-            };
-        }
         return .{
             .media_session_id = getInt(s, "mediaSessionId") orelse 0,
-            .player_state = getStr(s, "playerState") orelse "UNKNOWN",
+            .player_state = getEnum(PlayerState, s, "playerState") orelse .UNKNOWN,
             .current_time = getNum(s, "currentTime") orelse 0,
-            .duration = if (media) |m| getNum(m, "duration") else null,
-            .idle_reason = getStr(s, "idleReason"),
+            .duration = if (getObj(s, "media")) |m| getNum(m, "duration") else null,
+            .idle_reason = getEnum(IdleReason, s, "idleReason"),
             .playback_rate = getNum(s, "playbackRate") orelse 1,
-            .content_id = content_id,
-            .title = title,
-            .subtitle_url = subtitle_url,
         };
     }
 
@@ -453,14 +430,6 @@ const MediaCommand = struct { type: []const u8, requestId: u32 = 0, mediaSession
 const Seek = struct { type: []const u8 = "SEEK", requestId: u32 = 0, mediaSessionId: i64, currentTime: f64 };
 const SetPlaybackRate = struct { type: []const u8 = "SET_PLAYBACK_RATE", requestId: u32 = 0, mediaSessionId: i64, playbackRate: f64 };
 
-const EditTracks = struct {
-    type: []const u8 = "EDIT_TRACKS_INFO",
-    requestId: u32 = 0,
-    mediaSessionId: i64,
-    activeTrackIds: []const u32,
-    textTrackStyle: TextTrackStyle = .{},
-};
-
 /// Readable defaults; without a style some receivers render nothing.
 const TextTrackStyle = struct {
     backgroundColor: []const u8 = "#00000080",
@@ -495,40 +464,41 @@ const Load = struct {
     };
     const Metadata = struct { metadataType: u32 = 0, title: []const u8 };
     const Track = struct {
-        trackId: u32 = 1,
+        trackId: u32,
         type: []const u8 = "TEXT",
         subtype: []const u8 = "SUBTITLES",
         trackContentId: []const u8,
         trackContentType: []const u8 = "text/vtt",
-        language: []const u8 = "en",
-        name: []const u8 = "Subtitles",
+        language: []const u8,
+        name: []const u8,
     };
 };
 
 // --- json.Value helpers ------------------------------------------------------
 
-pub fn getObj(v: Json, key: []const u8) ?Json {
+/// `v[key]` when `v` is an object that has it.
+fn child(v: Json, key: []const u8) ?Json {
     if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    return if (child == .object) child else null;
+    return v.object.get(key);
+}
+
+pub fn getObj(v: Json, key: []const u8) ?Json {
+    const c = child(v, key) orelse return null;
+    return if (c == .object) c else null;
 }
 
 pub fn getArr(v: Json, key: []const u8) ?[]Json {
-    if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    return if (child == .array) child.array.items else null;
+    const c = child(v, key) orelse return null;
+    return if (c == .array) c.array.items else null;
 }
 
 pub fn getStr(v: Json, key: []const u8) ?[]const u8 {
-    if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    return if (child == .string) child.string else null;
+    const c = child(v, key) orelse return null;
+    return if (c == .string) c.string else null;
 }
 
 pub fn getInt(v: Json, key: []const u8) ?i64 {
-    if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    return switch (child) {
+    return switch (child(v, key) orelse return null) {
         .integer => |i| i,
         .float => |f| @intFromFloat(f),
         else => null,
@@ -536,9 +506,7 @@ pub fn getInt(v: Json, key: []const u8) ?i64 {
 }
 
 pub fn getNum(v: Json, key: []const u8) ?f64 {
-    if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    return switch (child) {
+    return switch (child(v, key) orelse return null) {
         .integer => |i| @floatFromInt(i),
         .float => |f| f,
         else => null,
@@ -546,9 +514,15 @@ pub fn getNum(v: Json, key: []const u8) ?f64 {
 }
 
 pub fn getBool(v: Json, key: []const u8) ?bool {
-    if (v != .object) return null;
-    const child = v.object.get(key) orelse return null;
-    return if (child == .bool) child.bool else null;
+    const c = child(v, key) orelse return null;
+    return if (c == .bool) c.bool else null;
+}
+
+/// A string field as an enum whose tag names are the protocol's words;
+/// `E.UNKNOWN` for a word we do not know.
+pub fn getEnum(comptime E: type, v: Json, key: []const u8) ?E {
+    const s = getStr(v, key) orelse return null;
+    return std.meta.stringToEnum(E, s) orelse .UNKNOWN;
 }
 
 test "wire structs serialise to the expected JSON" {
@@ -571,7 +545,7 @@ test "media status parsing" {
     defer parsed.deinit();
     const s = Channel.mediaStatusFrom(parsed.value).?;
     try std.testing.expectEqual(@as(i64, 1), s.media_session_id);
-    try std.testing.expectEqualStrings("PLAYING", s.player_state);
+    try std.testing.expectEqual(Channel.PlayerState.PLAYING, s.player_state);
     try std.testing.expectEqual(@as(f64, 12.5), s.current_time);
     try std.testing.expectEqual(@as(?f64, 600), s.duration);
     try std.testing.expect(!s.isFinished());

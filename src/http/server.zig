@@ -13,6 +13,9 @@ const Io = std.Io;
 const net = Io.net;
 const http = std.http;
 
+/// Every request and its headers, at debug level.
+const log = std.log.scoped(.http);
+
 /// Convenience alias for dynamic handlers.
 pub const Request = http.Server.Request;
 
@@ -20,21 +23,25 @@ pub const Route = struct {
     /// Request target to match. A trailing '/' matches by prefix (for dynamic
     /// handlers), otherwise the match is exact. Query strings are ignored.
     path: []const u8,
-    content_type: []const u8,
     body: Body,
 
     pub const Body = union(enum) {
         /// Path on disk, streamed with `sendFile`.
-        file: []const u8,
+        file: Static([]const u8),
         /// Fixed content kept in memory.
-        bytes: []const u8,
+        bytes: Static([]const u8),
         /// A handler that writes the whole response itself.
         dynamic: Dynamic,
     };
 
+    pub fn Static(comptime T: type) type {
+        return struct { content_type: []const u8, data: T };
+    }
+
     pub const Dynamic = struct {
         context: *const anyopaque,
-        handle: *const fn (context: *const anyopaque, s: *Server, request: *Request) anyerror!void,
+        /// `path` is the request target without its query string.
+        handle: *const fn (context: *const anyopaque, request: *Request, path: []const u8) anyerror!void,
     };
 };
 
@@ -45,10 +52,8 @@ pub const Server = struct {
     routes: []const Route,
     group: Io.Group = .init,
     port: u16,
-    /// Log every request on stderr.
-    debug: bool = false,
 
-    pub fn start(io: Io, gpa: std.mem.Allocator, routes: []const Route, debug: bool) !*Server {
+    pub fn start(io: Io, gpa: std.mem.Allocator, routes: []const Route) !*Server {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         const any: net.IpAddress = .{ .ip4 = .unspecified(0) };
@@ -59,7 +64,6 @@ pub const Server = struct {
             .listener = listener,
             .routes = routes,
             .port = listener.socket.address.getPort(),
-            .debug = debug,
         };
         try s.group.concurrent(io, acceptLoop, .{s});
         return s;
@@ -74,7 +78,8 @@ pub const Server = struct {
 
     pub fn stop(s: *Server) void {
         // Wake the blocked accept, then cancel the connection tasks.
-        _ = std.os.linux.shutdown(s.listener.socket.handle, std.os.linux.SHUT.RDWR);
+        const listening: net.Stream = .{ .socket = s.listener.socket };
+        listening.shutdown(s.io, .both) catch {};
         s.group.cancel(s.io);
         s.listener.socket.close(s.io);
         s.gpa.destroy(s);
@@ -108,30 +113,24 @@ pub const Server = struct {
         }
     }
 
-    const cors_headers = cors_array;
-
-    fn serve(s: *Server, request: *http.Server.Request) !void {
+    fn serve(s: *Server, request: *Request) !void {
         const target = request.head.target;
         const method = request.head.method;
 
-        var range_header: ?[]const u8 = null;
-        var requested_headers: ?[]const u8 = null;
+        log.debug("{s} {s}", .{ @tagName(method), target });
         var it = request.iterateHeaders();
-        if (s.debug) std.debug.print("http {s} {s}\n", .{ @tagName(method), target });
-        while (it.next()) |h| {
-            if (s.debug) std.debug.print("     {s}: {s}\n", .{ h.name, h.value });
-            if (std.ascii.eqlIgnoreCase(h.name, "range")) range_header = h.value;
-            if (std.ascii.eqlIgnoreCase(h.name, "access-control-request-headers")) requested_headers = h.value;
-        }
+        while (it.next()) |h| log.debug("     {s}: {s}", .{ h.name, h.value });
 
         if (method == .OPTIONS) {
             // Allow exactly what the preflight asks for, on top of the fixed list.
-            var preflight = cors_headers;
-            if (requested_headers) |rh| preflight[2] = .{ .name = "access-control-allow-headers", .value = rh };
+            var preflight = cors_array;
+            if (header(request, "access-control-request-headers")) |rh| {
+                preflight[2] = .{ .name = "access-control-allow-headers", .value = rh };
+            }
             return request.respond("", .{ .status = .no_content, .extra_headers = &preflight });
         }
 
-        const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
+        const path = requestPath(request);
         const route = for (s.routes) |r| {
             const matched = if (std.mem.endsWith(u8, r.path, "/"))
                 std.mem.startsWith(u8, path, r.path)
@@ -139,89 +138,38 @@ pub const Server = struct {
                 std.mem.eql(u8, r.path, path);
             if (matched) break r;
         } else {
-            if (s.debug) std.debug.print("http {s} {s} -> 404\n", .{ @tagName(method), target });
-            return request.respond("not found\n", .{ .status = .not_found, .extra_headers = &cors_headers });
+            log.debug("{s} {s} -> 404", .{ @tagName(method), target });
+            return respondNotFound(request);
         };
 
         if (method != .GET and method != .HEAD) {
-            return request.respond("", .{ .status = .method_not_allowed, .extra_headers = &cors_headers });
+            return request.respond("", .{ .status = .method_not_allowed, .extra_headers = cors });
         }
 
-        if (route.body == .dynamic) return route.body.dynamic.handle(route.body.dynamic.context, s, request);
-
-        var file_reader_buf: [64 * 1024]u8 = undefined;
-        var file: ?Io.File = null;
-        defer if (file) |f| f.close(s.io);
-        var file_reader: Io.File.Reader = undefined;
-
-        const total: u64 = switch (route.body) {
-            .bytes => |b| b.len,
-            .file => |p| blk: {
-                const f = try Io.Dir.cwd().openFile(s.io, p, .{});
-                file = f;
-                file_reader = f.reader(s.io, &file_reader_buf);
-                break :blk try file_reader.getSize();
-            },
-            .dynamic => unreachable, // handled before this point
-        };
-
-        const range = parseRange(range_header, total) catch {
-            var buf: [64]u8 = undefined;
-            const content_range = try std.fmt.bufPrint(&buf, "bytes */{d}", .{total});
-            return request.respond("", .{
-                .status = .range_not_satisfiable,
-                .extra_headers = &(cors_headers ++ [_]http.Header{.{ .name = "content-range", .value = content_range }}),
-            });
-        };
-
-        var content_range_buf: [96]u8 = undefined;
-        var headers: [cors_headers.len + 4]http.Header = undefined;
-        var n: usize = cors_headers.len;
-        @memcpy(headers[0..n], &cors_headers);
-        headers[n] = .{ .name = "content-type", .value = route.content_type };
-        n += 1;
-        headers[n] = .{ .name = "accept-ranges", .value = "bytes" };
-        n += 1;
-        headers[n] = .{ .name = "cache-control", .value = "no-store" };
-        n += 1;
-        if (range) |r| {
-            headers[n] = .{
-                .name = "content-range",
-                .value = try std.fmt.bufPrint(&content_range_buf, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }),
-            };
-            n += 1;
-        }
-
-        const offset: u64 = if (range) |r| r.start else 0;
-        const len: u64 = if (range) |r| r.end - r.start + 1 else total;
-
-        var send_buf: [64 * 1024]u8 = undefined;
-        var body = try request.respondStreaming(&send_buf, .{
-            .content_length = len,
-            .respond_options = .{
-                .status = if (range != null) .partial_content else .ok,
-                .extra_headers = headers[0..n],
-            },
-        });
-        if (method == .HEAD) {
-            // Headers only. The eliding writer would still insist on seeing
-            // every byte pass through, so finish the response by hand.
-            try body.writer.flush();
-            body.state = .end;
-            try body.http_protocol_output.flush();
-            return;
-        }
         switch (route.body) {
-            .bytes => |b| try body.writer.writeAll(b[@intCast(offset)..][0..@intCast(len)]),
-            .file => {
-                try file_reader.seekTo(offset);
-                _ = try body.writer.sendFileAll(&file_reader, .limited(@intCast(len)));
+            .dynamic => |d| try d.handle(d.context, request, path),
+            .bytes => |b| try respondBuffer(request, b.content_type, b.data),
+            .file => |f| {
+                const file = try Io.Dir.cwd().openFile(s.io, f.data, .{});
+                defer file.close(s.io);
+                var buf: [64 * 1024]u8 = undefined;
+                var reader = file.reader(s.io, &buf);
+                try respondRanged(request, f.content_type, try reader.getSize(), .{ .file = &reader });
             },
-            .dynamic => unreachable, // handled before this point
         }
-        try body.end();
     }
 };
+
+/// The request target without its query string.
+pub fn requestPath(request: *const Request) []const u8 {
+    return std.mem.sliceTo(request.head.target, '?');
+}
+
+fn header(request: *Request, name: []const u8) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    return null;
+}
 
 /// CORS sent with every response, including preflight for the Range header.
 /// `cors` is the pointer form dynamic handlers pass as `extra_headers`.
@@ -234,12 +182,15 @@ const cors_array = [_]http.Header{
 };
 pub const cors: []const http.Header = &cors_array;
 
+pub fn respondNotFound(request: *Request) !void {
+    try request.respond("not found\n", .{ .status = .not_found, .extra_headers = cors });
+}
+
 fn streamHeaders(content_type: []const u8) [cors_array.len + 2]http.Header {
-    var headers: [cors_array.len + 2]http.Header = undefined;
-    @memcpy(headers[0..cors_array.len], &cors_array);
-    headers[cors_array.len] = .{ .name = "content-type", .value = content_type };
-    headers[cors_array.len + 1] = .{ .name = "cache-control", .value = "no-store" };
-    return headers;
+    return cors_array ++ [_]http.Header{
+        .{ .name = "content-type", .value = content_type },
+        .{ .name = "cache-control", .value = "no-store" },
+    };
 }
 
 /// For a dynamic handler's HEAD: headers only, no body.
@@ -258,61 +209,53 @@ pub fn beginStream(request: *Request, buffer: []u8, content_type: []const u8) !h
     });
 }
 
+pub const ReadFn = *const fn (ctx: *anyopaque, offset: u64, dest: []u8) anyerror!void;
+
+/// Where the bytes of a ranged response come from.
+pub const Source = union(enum) {
+    bytes: []const u8,
+    /// Streamed with `sendFile`.
+    file: *Io.File.Reader,
+    /// `read(ctx, offset, dest)` fills `dest` with the bytes at `offset`.
+    virtual: struct { ctx: *anyopaque, read: ReadFn },
+};
+
 /// Serves an in-memory body with a Content-Length and single-range support
 /// (206), handling HEAD. Used by dynamic handlers that produce the whole body
 /// first (the Cast receiver's HLS loader needs a Content-Length on segments).
 pub fn respondBuffer(request: *Request, content_type: []const u8, bytes: []const u8) !void {
-    const Ctx = struct {
-        data: []const u8,
-        fn read(ctx: *anyopaque, offset: u64, dest: []u8) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            @memcpy(dest, self.data[@intCast(offset)..][0..dest.len]);
-        }
-    };
-    var ctx: Ctx = .{ .data = bytes };
-    return respondVirtual(request, content_type, bytes.len, &ctx, Ctx.read);
+    return respondRanged(request, content_type, bytes.len, .{ .bytes = bytes });
 }
 
-/// Serves a body of `total` bytes with Content-Length, single-range (206) and
-/// HEAD support. `readFn(ctx, offset, dest)` fills `dest` with the bytes at
-/// `offset`; the body may live anywhere (the on-the-fly MP4 assembler, or an
-/// in-memory slice via `respondBuffer`).
-pub fn respondVirtual(
-    request: *Request,
-    content_type: []const u8,
-    total: u64,
-    ctx: *anyopaque,
-    readFn: *const fn (ctx: *anyopaque, offset: u64, dest: []u8) anyerror!void,
-) !void {
-    var range_header: ?[]const u8 = null;
-    var it = request.iterateHeaders();
-    while (it.next()) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "range")) range_header = h.value;
-    }
+/// Serves a body of `total` bytes that lives anywhere (the on-the-fly MP4
+/// assembler) with Content-Length, single-range (206) and HEAD support.
+pub fn respondVirtual(request: *Request, content_type: []const u8, total: u64, ctx: *anyopaque, readFn: ReadFn) !void {
+    return respondRanged(request, content_type, total, .{ .virtual = .{ .ctx = ctx, .read = readFn } });
+}
 
-    const range = parseRange(range_header, total) catch {
+/// Serves `total` bytes from `source` with Content-Length, single-range (206)
+/// and HEAD support.
+pub fn respondRanged(request: *Request, content_type: []const u8, total: u64, source: Source) !void {
+    const range = parseRange(header(request, "range"), total) catch {
         var buf: [64]u8 = undefined;
-        const cr = try std.fmt.bufPrint(&buf, "bytes */{d}", .{total});
+        const content_range = try std.mem.print(&buf, "bytes */{d}", .{total});
         return request.respond("", .{
             .status = .range_not_satisfiable,
-            .extra_headers = &(cors_array ++ [_]http.Header{.{ .name = "content-range", .value = cr }}),
+            .extra_headers = &(cors_array ++ [_]http.Header{.{ .name = "content-range", .value = content_range }}),
         });
     };
 
     var content_range_buf: [96]u8 = undefined;
-    var headers: [cors_array.len + 4]http.Header = undefined;
-    var n: usize = cors_array.len;
-    @memcpy(headers[0..n], &cors_array);
-    headers[n] = .{ .name = "content-type", .value = content_type };
-    n += 1;
-    headers[n] = .{ .name = "accept-ranges", .value = "bytes" };
-    n += 1;
-    headers[n] = .{ .name = "cache-control", .value = "no-store" };
-    n += 1;
-    if (range) |r| {
-        headers[n] = .{ .name = "content-range", .value = try std.fmt.bufPrint(&content_range_buf, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }) };
-        n += 1;
-    }
+    var headers_buf: [cors_array.len + 4]http.Header = undefined;
+    var headers: std.ArrayList(http.Header) = .initBuffer(&headers_buf);
+    headers.appendSliceAssumeCapacity(&cors_array);
+    headers.appendAssumeCapacity(.{ .name = "content-type", .value = content_type });
+    headers.appendAssumeCapacity(.{ .name = "accept-ranges", .value = "bytes" });
+    headers.appendAssumeCapacity(.{ .name = "cache-control", .value = "no-store" });
+    if (range) |r| headers.appendAssumeCapacity(.{
+        .name = "content-range",
+        .value = try std.mem.print(&content_range_buf, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }),
+    });
 
     var offset: u64 = if (range) |r| r.start else 0;
     var remaining: u64 = if (range) |r| r.end - r.start + 1 else total;
@@ -322,24 +265,32 @@ pub fn respondVirtual(
         .content_length = remaining,
         .respond_options = .{
             .status = if (range != null) .partial_content else .ok,
-            .extra_headers = headers[0..n],
+            .extra_headers = headers.items,
         },
     });
     if (request.head.method == .HEAD) {
+        // The eliding writer insists on seeing every byte, so HEAD ends by hand.
         try body.writer.flush();
         body.state = .end;
         try body.http_protocol_output.flush();
         return;
     }
 
-    // Fill the streaming writer's own buffer directly (no intermediate copy).
-    while (remaining > 0) {
-        const dst = try body.writer.writableSliceGreedy(1);
-        const take: usize = @intCast(@min(@as(u64, dst.len), remaining));
-        try readFn(ctx, offset, dst[0..take]);
-        body.writer.advance(take);
-        offset += take;
-        remaining -= take;
+    switch (source) {
+        .bytes => |b| try body.writer.writeAll(b[@intCast(offset)..][0..@intCast(remaining)]),
+        .file => |reader| {
+            try reader.seekTo(offset);
+            _ = try body.writer.sendFileAll(reader, .limited(@intCast(remaining)));
+        },
+        .virtual => |v| while (remaining > 0) {
+            // Fill the writer's buffer directly to avoid an intermediate copy.
+            const dst = try body.writer.writableSliceGreedy(1);
+            const take: usize = @intCast(@min(@as(u64, dst.len), remaining));
+            try v.read(v.ctx, offset, dst[0..take]);
+            body.writer.advance(take);
+            offset += take;
+            remaining -= take;
+        },
     }
     try body.end();
 }
@@ -348,18 +299,18 @@ pub const Range = struct { start: u64, end: u64 };
 
 /// Parses a single `bytes=` range against `total`. Null when there is no
 /// header; error when the range cannot be satisfied.
-pub fn parseRange(header: ?[]const u8, total: u64) error{Unsatisfiable}!?Range {
-    const h = header orelse return null;
+pub fn parseRange(header_value: ?[]const u8, total: u64) error{Unsatisfiable}!?Range {
+    const h = header_value orelse return null;
     if (!std.mem.startsWith(u8, h, "bytes=")) return null;
     const spec = h["bytes=".len..];
-    if (std.mem.indexOfScalar(u8, spec, ',') != null) return null; // multipart ranges: serve everything
-    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.Unsatisfiable;
-    const first = std.mem.trim(u8, spec[0..dash], " ");
-    const last = std.mem.trim(u8, spec[dash + 1 ..], " ");
+    if (std.mem.findScalar(u8, spec, ',') != null) return null; // multipart ranges: serve everything
+    const first_last = std.mem.cutScalar(u8, spec, '-') orelse return error.Unsatisfiable;
+    const first = std.mem.trim(u8, first_last[0], " ");
+    const last = std.mem.trim(u8, first_last[1], " ");
     if (total == 0) return error.Unsatisfiable;
 
     if (first.len == 0) {
-        // suffix: last N bytes
+        // A suffix range: the last N bytes.
         const n = std.fmt.parseInt(u64, last, 10) catch return error.Unsatisfiable;
         if (n == 0) return error.Unsatisfiable;
         const start = if (n >= total) 0 else total - n;

@@ -9,22 +9,52 @@
 //! are identified by name (`avcodec_get_name`, `avcodec_find_encoder_by_name`)
 //! and ids are read as raw integers.
 //!
-//! Planned additions, in the order the pipeline will need them:
-//!
-//! Muxing (libavformat):
-//!   avformat_alloc_output_context2, avformat_new_stream,
-//!   avformat_write_header, av_interleaved_write_frame, av_write_trailer,
-//!   avformat_free_context, avcodec_parameters_copy
-//!
-//! Encoding (libavcodec):
-//!   avcodec_find_encoder_by_name, avcodec_send_frame, avcodec_receive_packet,
-//!   av_packet_rescale_ts
-//!
-//! Each addition should come with a small wrapper returning `av.Error`
-//! through `av.wrap`, mirroring the style of the upstream bindings.
+//! Each extern comes with a small wrapper returning `av.Error` through
+//! `av.wrap`, mirroring the style of the upstream bindings.
 
 const std = @import("std");
 const av = @import("av");
+
+/// AV_TIME_BASE: container-level timestamps (`FormatContext.duration`,
+/// `seek_frame` with stream -1) are in microseconds.
+pub const TIME_BASE: f64 = 1_000_000;
+
+/// Opens `path` for demuxing and reads its stream info. libav's own
+/// diagnostics are kept off stderr; failures surface as errors.
+pub fn openInput(gpa: std.mem.Allocator, path: []const u8) !*av.FormatContext {
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
+    defer gpa.free(path_z);
+    av.LOG.set_level(.ERROR);
+    const ic = try av.FormatContext.open_input(path_z, null, null, null);
+    errdefer ic.close_input();
+    try ic.find_stream_info(null);
+    return ic;
+}
+
+/// Container duration in seconds, or null when the demuxer does not know it.
+pub fn durationSeconds(ic: *const av.FormatContext) ?f64 {
+    if (ic.duration == av.NOPTS_VALUE) return null;
+    return @as(f64, @floatFromInt(ic.duration)) / TIME_BASE;
+}
+
+/// A timestamp in `tb` units as seconds, for display and window bounds.
+pub fn toSeconds(ts: i64, tb: av.Rational) f64 {
+    return @as(f64, @floatFromInt(ts)) * tb.q2d();
+}
+
+/// Tells the demuxer to skip every stream but `keep`, so `read_frame` never
+/// materialises their packets (the mov demuxer skips the bytes entirely).
+pub fn discardOthers(ic: *av.FormatContext, keep: []const usize) void {
+    for (ic.streams[0..ic.nb_streams], 0..) |st, i| {
+        st.discard = if (std.mem.findScalar(usize, keep, i) != null) .DEFAULT else .ALL;
+    }
+}
+
+/// A metadata value ("language", "title", ...), or null when unset.
+pub fn dictGet(dict: av.Dictionary.Mutable, key: [*:0]const u8) ?[]const u8 {
+    const entry = dict.get(key, null, .{}) orelse return null;
+    return std.mem.span(entry.value);
+}
 
 /// Raw `AVCodecID`, see the rule above.
 pub const CodecId = c_uint;
@@ -61,12 +91,32 @@ pub extern fn avformat_alloc_output_context2(ctx: *?*av.FormatContext, oformat: 
 pub extern fn avformat_new_stream(s: *av.FormatContext, c: ?*const av.Codec) ?*av.Stream;
 pub extern fn avformat_write_header(s: *av.FormatContext, options: ?*av.Dictionary.Mutable) c_int;
 pub extern fn av_interleaved_write_frame(s: *av.FormatContext, pkt: ?*av.Packet) c_int;
-// Non-interleaved: writes the packet's payload to the AVIO immediately, in the
-// order given. The virtual-MP4 assembler needs this (plus avio_flush) so each
-// packet's output bytes are bounded and attributable.
+// Non-interleaved: the packet's bytes reach the AVIO at once, so the
+// virtual-MP4 assembler can attribute output offsets to samples.
 pub extern fn av_write_frame(s: *av.FormatContext, pkt: ?*av.Packet) c_int;
-pub extern fn avio_flush(s: *av.IOContext) void;
+pub extern fn avio_seek(s: *av.IOContext, offset: i64, whence: c_int) i64;
 pub extern fn av_write_trailer(s: *av.FormatContext) c_int;
+
+/// The logical write position (bytes handed to the muxer so far, flushed
+/// or not); ffmpeg's `avio_tell` is this inline.
+pub fn avioTell(s: *av.IOContext) u64 {
+    return @intCast(avio_seek(s, 0, std.posix.SEEK.CUR));
+}
+
+/// `AVFormatContext.avoid_negative_ts`.
+pub const AVFMT_AVOID_NEG_TS_AUTO: c_int = -1;
+pub const AVFMT_AVOID_NEG_TS_DISABLED: c_int = 0;
+
+/// `seek_frame` flags.
+pub const AVSEEK_FLAG_BACKWARD: c_int = 1;
+
+/// Whether `name` is one of the comma-separated `names` (how libav lists a
+/// demuxer's names, e.g. "mov,mp4,m4a,3gp,3g2,mj2").
+pub extern fn av_match_name(name: [*:0]const u8, names: [*:0]const u8) c_int;
+
+pub fn matchName(name: [*:0]const u8, names: [*:0]const u8) bool {
+    return av_match_name(name, names) != 0;
+}
 
 /// av_write_frame, returning av.Error. A return of 1 (flushed, no more data) is
 /// success too.
@@ -81,6 +131,21 @@ pub extern fn avcodec_parameters_from_context(par: *av.Codec.Parameters, codec: 
 pub extern fn avcodec_send_frame(avctx: *av.Codec.Context, frame: ?*const av.Frame) c_int;
 pub extern fn avcodec_receive_packet(avctx: *av.Codec.Context, avpkt: *av.Packet) c_int;
 pub extern fn av_packet_rescale_ts(pkt: *av.Packet, tb_src: av.Rational, tb_dst: av.Rational) void;
+
+// --- timestamps (libavutil) ------------------------------------------------
+
+/// Exact, overflow-safe rescale of `a` from `bq` to `cq` (rounds to nearest).
+pub extern fn av_rescale_q(a: i64, bq: av.Rational, cq: av.Rational) i64;
+/// Exact comparison of two timestamps in different time bases: -1, 0 or 1.
+pub extern fn av_compare_ts(ts_a: i64, tb_a: av.Rational, ts_b: i64, tb_b: av.Rational) c_int;
+
+pub const millis: av.Rational = .{ .num = 1, .den = 1000 };
+pub const seconds: av.Rational = .{ .num = 1, .den = 1 };
+
+// --- resampling (libswresample) --------------------------------------------
+
+/// Upper bound on the output samples `swr_convert` produces for `in_samples`.
+pub extern fn swr_get_out_samples(s: *av.swr.Context, in_samples: c_int) c_int;
 
 // --- util ------------------------------------------------------------------
 
@@ -110,6 +175,51 @@ pub fn allocOutputContext(format_name: [*:0]const u8) av.Error!*av.FormatContext
 
 pub fn newStream(oc: *av.FormatContext) error{OutOfMemory}!*av.Stream {
     return avformat_new_stream(oc, null) orelse error.OutOfMemory;
+}
+
+/// Adds an output stream that copies `par` (a demuxed stream's parameters,
+/// or a bitstream filter's `par_out`) with the given time base. The codec
+/// tag is cleared so the muxer picks its own.
+pub fn addCopiedStream(oc: *av.FormatContext, par: *const av.Codec.Parameters, time_base: av.Rational) !*av.Stream {
+    const st = try newStream(oc);
+    try copyParameters(st.codecpar, par);
+    st.codecpar.codec_tag = 0;
+    st.time_base = time_base;
+    return st;
+}
+
+/// Adds an output stream fed by encoder `enc`.
+pub fn addEncodedStream(oc: *av.FormatContext, enc: *const av.Codec.Context) !*av.Stream {
+    const st = try newStream(oc);
+    try parametersFromContext(st.codecpar, enc);
+    st.time_base = enc.time_base;
+    return st;
+}
+
+// --- custom AVIO ------------------------------------------------------------
+
+pub const avio_buffer_len = 64 * 1024;
+
+/// A write-only (or seekable, with `seek`) AVIO whose callbacks get `*T`.
+/// `onWrite` returns an error to abort the mux; the failure is recorded in
+/// `t.failed` and reported to libav as -1.
+pub fn WriteAvio(comptime T: type, comptime onWrite: fn (*T, []const u8) anyerror!void) type {
+    return struct {
+        fn writeCb(userdata: ?*anyopaque, buf: [*:0]u8, size: c_int) callconv(.c) c_int {
+            const t: *T = @ptrCast(@alignCast(userdata.?));
+            const bytes: [*]const u8 = @ptrCast(buf);
+            onWrite(t, bytes[0..@intCast(size)]) catch {
+                t.failed = true;
+                return -1;
+            };
+            return size;
+        }
+
+        pub fn alloc(t: *T, seek: ?*const fn (?*anyopaque, i64, av.SEEK) callconv(.c) i64) !*av.IOContext {
+            const buffer = try av.malloc(avio_buffer_len);
+            return av.IOContext.alloc(buffer, .writable, t, null, writeCb, seek);
+        }
+    };
 }
 
 pub fn copyParameters(dst: *av.Codec.Parameters, src: *const av.Codec.Parameters) av.Error!void {

@@ -17,10 +17,11 @@ const extra = @import("../av_extra.zig");
 const pipeline = @import("pipeline.zig");
 const server = @import("../http/server.zig");
 
+const log = std.log.scoped(.hls);
+
 pub const url_prefix = "/hls/";
 pub const master_name = "master.m3u8";
 pub const playlist_name = "index.m3u8";
-pub const master_content_type = "application/vnd.apple.mpegurl";
 pub const playlist_content_type = "application/vnd.apple.mpegurl";
 pub const segment_content_type = "video/mp2t";
 /// Cast expects this content type on the LOAD for an HLS source.
@@ -43,13 +44,8 @@ pub const Segmenter = struct {
     bandwidth: u64,
 
     pub fn init(gpa: std.mem.Allocator, path: []const u8) !Segmenter {
-        const path_z = try gpa.dupeSentinel(u8, path, 0);
-        defer gpa.free(path_z);
-
-        av.LOG.set_level(.ERROR);
-        const ic = try av.FormatContext.open_input(path_z, null, null, null);
+        const ic = try extra.openInput(gpa, path);
         defer ic.close_input();
-        try ic.find_stream_info(null);
 
         const video_index: usize = if (ic.find_best_stream(.VIDEO, -1, -1)) |v|
             @intCast(v[0])
@@ -59,19 +55,16 @@ pub const Segmenter = struct {
         const tb = vstream.time_base;
         const vpar = vstream.codecpar;
 
-        const duration: f64 = if (ic.duration != av.NOPTS_VALUE)
-            @as(f64, @floatFromInt(ic.duration)) / 1_000_000
-        else
-            return error.UnknownDuration;
+        const duration = extra.durationSeconds(ic) orelse return error.UnknownDuration;
 
         // avc1 profile/compat/level come from the AVCDecoderConfigurationRecord
         // (extradata bytes 1..4); fall back to High@4.0 if unavailable.
         var avc1: [16]u8 = undefined;
         const avc1_str = if (vpar.extradata_size >= 4)
-            try std.fmt.bufPrint(&avc1, "avc1.{x:0>2}{x:0>2}{x:0>2}", .{ vpar.extradata[1], vpar.extradata[2], vpar.extradata[3] })
+            try std.mem.print(&avc1, "avc1.{x:0>2}{x:0>2}{x:0>2}", .{ vpar.extradata[1], vpar.extradata[2], vpar.extradata[3] })
         else
             "avc1.640028";
-        const codecs = try std.fmt.allocPrint(gpa, "{s},mp4a.40.2", .{avc1_str});
+        const codecs = try gpa.print("{s},mp4a.40.2", .{avc1_str});
         const bandwidth: u64 = if (vpar.bit_rate > 0) @as(u64, @intCast(vpar.bit_rate)) + 192_000 else 6_000_000;
 
         var keyframes: std.ArrayList(f64) = .empty;
@@ -84,12 +77,12 @@ pub const Segmenter = struct {
                 const entry = extra.avformat_index_get_entry(vstream, i) orelse continue;
                 if (!entry.isKeyframe()) continue;
                 if (entry.timestamp == av.NOPTS_VALUE) continue;
-                try keyframes.append(gpa, @as(f64, @floatFromInt(entry.timestamp)) * tb.q2d());
+                try keyframes.append(gpa, extra.toSeconds(entry.timestamp, tb));
             }
         }
         if (keyframes.items.len < 2) {
             keyframes.clearRetainingCapacity();
-            try scanKeyframes(gpa, ic, video_index, tb, &keyframes);
+            try scanKeyframes(gpa, ic, video_index, &keyframes);
         }
 
         const starts = try boundaries(gpa, keyframes.items, duration);
@@ -109,10 +102,6 @@ pub const Segmenter = struct {
         try w.writeAll("#EXTM3U\n#EXT-X-VERSION:3\n");
         try w.print("#EXT-X-STREAM-INF:BANDWIDTH={d},RESOLUTION={d}x{d},CODECS=\"{s}\"\n", .{ s.bandwidth, s.width, s.height, s.codecs });
         try w.print("{s}\n", .{playlist_name});
-    }
-
-    pub fn count(s: *const Segmenter) usize {
-        return s.starts.len;
     }
 
     fn segmentDuration(s: *const Segmenter, index: usize) f64 {
@@ -154,13 +143,9 @@ fn boundaries(gpa: std.mem.Allocator, keyframes: []const f64, duration: f64) ![]
 
 /// Fallback when the demuxer has no usable index: one pass reading only the
 /// video stream's keyframe packet timestamps.
-fn scanKeyframes(
-    gpa: std.mem.Allocator,
-    ic: *av.FormatContext,
-    video_index: usize,
-    tb: av.Rational,
-    out: *std.ArrayList(f64),
-) !void {
+fn scanKeyframes(gpa: std.mem.Allocator, ic: *av.FormatContext, video_index: usize, out: *std.ArrayList(f64)) !void {
+    extra.discardOthers(ic, &.{video_index});
+    const tb = ic.streams[video_index].time_base;
     const pkt = try av.Packet.alloc();
     defer pkt.free();
     while (true) {
@@ -172,62 +157,51 @@ fn scanKeyframes(
         if (pkt.stream_index != @as(c_int, @intCast(video_index))) continue;
         if (pkt.flags & extra.AV_PKT_FLAG_KEY == 0) continue;
         if (pkt.pts == av.NOPTS_VALUE) continue;
-        try out.append(gpa, @as(f64, @floatFromInt(pkt.pts)) * tb.q2d());
+        try out.append(gpa, extra.toSeconds(pkt.pts, tb));
     }
-    // Leave the demuxer rewound for the caller's next open (we opened our own).
 }
 
-/// Serves `/hls/index.m3u8` and `/hls/segN.ts`. Wired as a dynamic route whose
-/// context is a `*Segmenter`.
-pub fn handleRoute(context: *const anyopaque, s: *server.Server, request: *server.Request) anyerror!void {
+/// Serves `/hls/master.m3u8`, `/hls/index.m3u8` and `/hls/segN.ts`. Wired as
+/// a dynamic route whose context is a `*Segmenter`.
+pub fn handleRoute(context: *const anyopaque, request: *server.Request, path: []const u8) anyerror!void {
     const seg: *const Segmenter = @ptrCast(@alignCast(context));
-    const target = request.head.target;
-    const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
     const tail = path[url_prefix.len..];
 
-    if (std.mem.eql(u8, tail, master_name)) {
-        var aw: Io.Writer.Allocating = .init(seg.gpa);
-        defer aw.deinit();
-        try seg.writeMaster(&aw.writer);
-        return server.respondBuffer(request, master_content_type, aw.written());
-    }
-
-    if (std.mem.eql(u8, tail, playlist_name)) {
-        var aw: Io.Writer.Allocating = .init(seg.gpa);
-        defer aw.deinit();
-        try seg.writePlaylist(&aw.writer);
-        return server.respondBuffer(request, playlist_content_type, aw.written());
-    }
+    if (std.mem.eql(u8, tail, master_name)) return respondPlaylist(seg, request, Segmenter.writeMaster);
+    if (std.mem.eql(u8, tail, playlist_name)) return respondPlaylist(seg, request, Segmenter.writePlaylist);
 
     if (std.mem.startsWith(u8, tail, "seg") and std.mem.endsWith(u8, tail, ".ts")) {
         const digits = tail["seg".len .. tail.len - ".ts".len];
-        const index = std.fmt.parseInt(usize, digits, 10) catch return notFound(request);
-        if (index >= seg.starts.len) return notFound(request);
+        const index = std.fmt.parseInt(usize, digits, 10) catch return server.respondNotFound(request);
+        if (index >= seg.starts.len) return server.respondNotFound(request);
         if (request.head.method == .HEAD) return server.respondHead(request, segment_content_type);
-        // Stream the segment as it is muxed. Buffering the whole thing first
-        // delayed the first byte by seconds and the receiver timed the load out.
+        // Stream the segment as it is muxed; buffering it first made the
+        // receiver time the load out.
         const start = seg.starts[index];
         const end: ?f64 = if (index + 1 < seg.starts.len) seg.starts[index + 1] else null;
         var buffer: [64 * 1024]u8 = undefined;
         var body = try server.beginStream(request, &buffer, segment_content_type);
-        pipeline.remuxWindow(seg.gpa, seg.path, start, end, "mpegts", &body.writer) catch |err| {
-            if (s.debug) std.debug.print("segment {d} aborted: {s}\n", .{ index, @errorName(err) });
+        pipeline.remuxWindow(seg.gpa, seg.path, start, end, .mpegts, &body.writer) catch |err| {
+            log.debug("segment {d} aborted: {s}", .{ index, @errorName(err) });
             return; // connection torn down by the caller
         };
         try body.end();
         return;
     }
 
-    return notFound(request);
+    return server.respondNotFound(request);
 }
 
-fn notFound(request: *server.Request) !void {
-    try request.respond("not found\n", .{ .status = .not_found, .extra_headers = server.cors });
+fn respondPlaylist(seg: *const Segmenter, request: *server.Request, write: fn (*const Segmenter, *Io.Writer) anyerror!void) !void {
+    var aw: Io.Writer.Allocating = .init(seg.gpa);
+    defer aw.deinit();
+    try write(seg, &aw.writer);
+    return server.respondBuffer(request, playlist_content_type, aw.written());
 }
 
 test "boundaries group keyframes by target" {
     const gpa = std.testing.allocator;
-    // Keyframes every 2s; target 6s -> segments start at 0,6,12,...
+    // Keyframes every 2 s with a 6 s target give segments at 0, 6, 12, ...
     var kf: [30]f64 = undefined;
     for (0..30) |i| kf[i] = @floatFromInt(i * 2);
     const starts = try boundaries(gpa, &kf, 60);
@@ -247,9 +221,9 @@ test "master playlist declares codecs and resolution" {
     defer aw.deinit();
     try seg.writeMaster(&aw.writer);
     const text = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, text, "#EXT-X-STREAM-INF:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "RESOLUTION=1920x818") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "CODECS=\"avc1.640028,mp4a.40.2\"") != null);
+    try std.testing.expect(std.mem.find(u8, text, "#EXT-X-STREAM-INF:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "RESOLUTION=1920x818") != null);
+    try std.testing.expect(std.mem.find(u8, text, "CODECS=\"avc1.640028,mp4a.40.2\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "index.m3u8\n"));
 }
 
@@ -265,8 +239,8 @@ test "playlist renders a VOD list" {
     const text = aw.written();
 
     try std.testing.expect(std.mem.startsWith(u8, text, "#EXTM3U"));
-    try std.testing.expect(std.mem.indexOf(u8, text, "#EXT-X-PLAYLIST-TYPE:VOD") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "seg2.ts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "#EXTINF:3.000") != null); // last segment 15-12
+    try std.testing.expect(std.mem.find(u8, text, "#EXT-X-PLAYLIST-TYPE:VOD") != null);
+    try std.testing.expect(std.mem.find(u8, text, "seg2.ts") != null);
+    try std.testing.expect(std.mem.find(u8, text, "#EXTINF:3.000") != null); // last segment 15-12
     try std.testing.expect(std.mem.endsWith(u8, text, "#EXT-X-ENDLIST\n"));
 }
