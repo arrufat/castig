@@ -381,6 +381,7 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
             is_audio = true;
             src = s.buf_off;
         }
+        const before = cap.pos;
         try extra.writeFrameDirect(oc, fp);
         extra.avio_flush(oc.pb.?);
         if (cap.failed) return error.WriteFailed;
@@ -389,10 +390,16 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, debug: bool) !?*V
         if (first) {
             // The head ends where the first sample begins; drop the sample
             // bytes captured before container_end was known, then stop
-            // capturing bulk payload.
+            // capturing bulk payload. (The first write also carries the mdat
+            // box header, so it writes more than fp.size.)
             cap.container_end = out_start;
             cap.prefix.items.len = @intCast(out_start);
             first = false;
+        } else if (cap.pos - before != @as(u64, @intCast(fp.size))) {
+            // Every later frame must write exactly its sample bytes; otherwise
+            // the muxer interleaved something and out_start would be wrong.
+            if (debug) std.debug.print("vmp4: muxer wrote unexpected bytes for a sample; falling back\n", .{});
+            return null;
         }
         map.appendAssumeCapacity(.{ .out_start = out_start, .len = @intCast(fp.size), .is_audio = is_audio, .src = src });
     }
