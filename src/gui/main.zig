@@ -122,6 +122,14 @@ const App = struct {
     subtitle_path: ?[:0]const u8 = null,
     remux: castig.delivery.Remux = .auto,
 
+    /// The config's language order, read once, for the chooser's default.
+    settings: std.heap.ArenaAllocator,
+    languages: []const []const u8 = &.{"en"},
+    /// Which language to search in: null takes the config's order. The task
+    /// reads the override from here, so it outlives the frame.
+    language: ?usize = null,
+    override: [1][]const u8 = .{""},
+
     /// An OpenSubtitles search, open until the picker closes: the ranked
     /// candidates and the HTTP client live as long as the `Lookup` does.
     search: work.Task(anyerror!castig.subs.Lookup),
@@ -166,8 +174,13 @@ fn init(win: *dvui.Window) !void {
         .control = .init(process.gpa),
         .search = .init(process.gpa),
         .fetch = .init(process.gpa),
+        .settings = .init(process.gpa),
     };
     castig.av_extra.quietLibav();
+    // Only for what the chooser shows: a search loads the config itself.
+    if (castig.subs.config.load(app.settings.allocator(), app.io, app.environ)) |cfg| {
+        app.languages = cfg.languages;
+    } else |err| std.log.warn("cannot read the config: {s}", .{@errorName(err)});
     try startScan();
 }
 
@@ -179,6 +192,7 @@ fn deinit(_: *dvui.Window) void {
     app.fetch.deinit(app.io);
     closeSearch();
     app.search.deinit(app.io);
+    app.settings.deinit();
     if (app.path) |p| app.gpa.free(p);
     if (app.subtitle_path) |p| app.gpa.free(p);
 }
@@ -320,6 +334,23 @@ fn sourcePanel() !void {
         if (app.subtitles == .file) {
             const name = if (app.subtitle_path) |p| Io.Dir.path.basename(p) else "none chosen";
             dvui.label(@src(), "{s}", .{name}, .{ .gravity_y = 0.5 });
+        }
+
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer row.deinit();
+
+        dvui.label(@src(), "Language", .{}, .{ .gravity_y = 0.5 });
+        const arena = dvui.currentWindow().arena();
+        const entries = try arena.alloc([]const u8, castig.language.codes.len + 1);
+        entries[0] = try std.fmt.allocPrint(arena, "as configured ({s})", .{try std.mem.join(arena, ", ", app.languages)});
+        for (castig.language.codes, entries[1..]) |code, *entry| {
+            entry.* = try std.fmt.allocPrint(arena, "{s} ({s})", .{ castig.language.name(code), code });
+        }
+        var choice: usize = if (app.language) |i| i + 1 else 0;
+        if (dvui.dropdown(@src(), entries, .{ .choice = &choice }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
+            app.language = if (choice == 0) null else choice - 1;
         }
 
         const searching = app.search.busy() or app.picking;
@@ -484,8 +515,16 @@ fn startSearch() !void {
             .environ = app.environ,
         },
         @as([]const u8, path),
-        castig.subs.Options{ .fps = videoFps() },
+        castig.subs.Options{ .fps = videoFps(), .languages = languageOverride() },
     });
+}
+
+/// The one language to search in, or null to leave the config's order. The
+/// slice is the app's, because the call outlives this frame.
+fn languageOverride() ?[]const []const u8 {
+    const chosen = app.language orelse return null;
+    app.override[0] = castig.language.codes[chosen];
+    return app.override[0..1];
 }
 
 /// The frame rate of the probed video, when it has one.

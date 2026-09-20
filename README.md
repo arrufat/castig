@@ -97,7 +97,9 @@ controls and the speed. It is a separate binary, `castigui`, built with
 `Find ...` next to the subtitle choice is `castig subs` without the prompt:
 the ranked list of OpenSubtitles results, best first, one click to download
 it next to the video and side-load it on the next cast. It needs the same
-credentials, and spends the same daily allowance.
+credentials, and spends the same daily allowance. The language chooser next
+to it searches in one language instead of the configured order, the way
+`--lang` does.
 
 The window is [dvui](https://github.com/david-vanderson/dvui) over SDL3, both
 compiled in, so it stays a single file like the CLI. The library does the

@@ -19,6 +19,30 @@ pub fn trackName(code: ?[]const u8) []const u8 {
     return name(c);
 }
 
+/// The two-letter codes `name` knows, ordered by the name it gives them: a
+/// chooser needs the list and not only the lookup. OpenSubtitles speaks
+/// 639-1, so the three-letter half of the table is left out.
+pub const codes: []const []const u8 = blk: {
+    @setEvalBranchQuota(20000);
+    const Pair = struct { code: []const u8, display: []const u8 };
+    var pairs: [names.keys().len]Pair = undefined;
+    var n: usize = 0;
+    // The table's own pairs, so sorting needs no lookup back into it.
+    for (names.keys(), names.values()) |code, display| if (code.len == 2) {
+        pairs[n] = .{ .code = code, .display = display };
+        n += 1;
+    };
+    std.mem.sort(Pair, pairs[0..n], {}, struct {
+        fn lessThan(_: void, a: Pair, b: Pair) bool {
+            return std.mem.order(u8, a.display, b.display) == .lt;
+        }
+    }.lessThan);
+    var only_codes: [names.keys().len][]const u8 = undefined;
+    for (pairs[0..n], 0..) |p, i| only_codes[i] = p.code;
+    const sorted = only_codes[0..n].*;
+    break :blk &sorted;
+};
+
 const names = std.StaticStringMap([]const u8).initComptime(.{
     .{ "eng", "English" },    .{ "en", "English" },    .{ "ger", "German" },
     .{ "deu", "German" },     .{ "de", "German" },     .{ "fre", "French" },
@@ -43,6 +67,12 @@ const names = std.StaticStringMap([]const u8).initComptime(.{
     .{ "uk", "Ukrainian" },   .{ "cat", "Catalan" },   .{ "ca", "Catalan" },
     .{ "ind", "Indonesian" }, .{ "id", "Indonesian" },
 });
+
+test "the chooser's codes are two letters, by name" {
+    try std.testing.expectEqualStrings("ar", codes[0]);
+    try std.testing.expectEqualStrings("vi", codes[codes.len - 1]);
+    for (codes) |c| try std.testing.expectEqual(@as(usize, 2), c.len);
+}
 
 test "names from both code systems" {
     try std.testing.expectEqualStrings("English", name("eng"));
