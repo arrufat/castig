@@ -9,7 +9,6 @@ pub const Type = struct {
     pub const A: u16 = 1;
     pub const PTR: u16 = 12;
     pub const TXT: u16 = 16;
-    pub const AAAA: u16 = 28;
     pub const SRV: u16 = 33;
 };
 
@@ -107,7 +106,6 @@ pub const Record = struct {
     type: u16,
     /// Class with the mDNS cache-flush bit removed.
     class: u16,
-    ttl: u32,
     rdata: []const u8,
     /// Offset of `rdata` in the packet, needed to follow compression pointers inside it.
     rdata_pos: usize,
@@ -153,7 +151,7 @@ pub const Parser = struct {
         if (pos + 10 > p.packet.len) return error.Truncated;
         const rtype = std.mem.readInt(u16, p.packet[pos..][0..2], .big);
         const class = std.mem.readInt(u16, p.packet[pos + 2 ..][0..2], .big);
-        const ttl = std.mem.readInt(u32, p.packet[pos + 4 ..][0..4], .big);
+        // The 4-byte TTL at pos + 4 is skipped: nothing here caches records.
         const rdlen: usize = std.mem.readInt(u16, p.packet[pos + 8 ..][0..2], .big);
         pos += 10;
         if (pos + rdlen > p.packet.len) return error.Truncated;
@@ -162,7 +160,6 @@ pub const Parser = struct {
             .name = owner.name,
             .type = rtype,
             .class = class & ~cache_flush_flag,
-            .ttl = ttl,
             .rdata = p.packet[pos..][0..rdlen],
             .rdata_pos = pos,
         };

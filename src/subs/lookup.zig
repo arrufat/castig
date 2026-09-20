@@ -105,16 +105,16 @@ pub const Lookup = struct {
     /// feature the hash matches agree on, whose frame rate fits the video.
     /// A free account gets twenty downloads a day, so a guess is never taken.
     pub fn confident(l: Lookup) ?usize {
-        for (l.candidates, 0..) |c, i| if (c.hash == 2 and !c.fps_mismatch) return i;
+        for (l.candidates, 0..) |c, i| if (c.hash == .voted and !c.fps_mismatch) return i;
         return null;
     }
 
     /// Why `confident` found nothing, for a caller that has to explain itself.
     pub fn doubt(l: Lookup) []const u8 {
         return switch (l.candidates[0].hash) {
-            2 => "hash match has an fps mismatch",
-            1 => "hash match has a doubtful title",
-            else => "no hash match",
+            .voted => "hash match has an fps mismatch",
+            .match => "hash match has a doubtful title",
+            .none => "no hash match",
         };
     }
 

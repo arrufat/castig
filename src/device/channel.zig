@@ -45,18 +45,6 @@ pub const Json = std.json.Value;
 /// Receivers add fields freely, so unknown ones are ignored everywhere.
 const parse_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 
-pub const Error = error{
-    FrameTooLarge,
-    /// The receiver said no: a denied cast, or an error reply to our request.
-    ReceiverRefused,
-    /// The receiver answered something we cannot read.
-    BadReply,
-    LaunchFailed,
-    ConnectionClosed,
-    /// The app has no media loaded.
-    NoMedia,
-};
-
 /// A MEDIA_STATUS we could not read. Logged here so the failure is never
 /// silent, whatever the caller does with the error.
 fn badMediaStatus() error{BadReply} {
@@ -307,13 +295,8 @@ pub const Channel = struct {
         BUFFERING,
         UNKNOWN,
 
-        pub fn jsonParseFromValue(_: std.mem.Allocator, source: Json, _: std.json.ParseOptions) error{UnexpectedToken}!PlayerState {
-            return lenientEnum(PlayerState, source);
-        }
-
-        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !PlayerState {
-            return lenientEnum(PlayerState, try Json.jsonParse(allocator, source, options));
-        }
+        pub const jsonParseFromValue = LenientJson(@This()).jsonParseFromValue;
+        pub const jsonParse = LenientJson(@This()).jsonParse;
     };
 
     /// `idleReason` of a MEDIA_STATUS; INTERRUPTED (which a seek-reload
@@ -325,13 +308,8 @@ pub const Channel = struct {
         ERROR,
         UNKNOWN,
 
-        pub fn jsonParseFromValue(_: std.mem.Allocator, source: Json, _: std.json.ParseOptions) error{UnexpectedToken}!IdleReason {
-            return lenientEnum(IdleReason, source);
-        }
-
-        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !IdleReason {
-            return lenientEnum(IdleReason, try Json.jsonParse(allocator, source, options));
-        }
+        pub const jsonParseFromValue = LenientJson(@This()).jsonParseFromValue;
+        pub const jsonParse = LenientJson(@This()).jsonParse;
     };
 
     pub const MediaStatus = struct {
@@ -375,7 +353,6 @@ pub const Channel = struct {
         text_tracks: []const TextTrack = &.{},
         /// Which track ids start enabled; empty means subtitles off.
         active_track_ids: []const u32 = &.{},
-        start_time: f64 = 0,
         /// Total length in seconds, shown by the receiver's progress bar.
         duration: ?f64 = null,
         /// True when the URL is an HLS playlist with MPEG-TS segments; the
@@ -392,7 +369,7 @@ pub const Channel = struct {
             .name = t.name,
         };
         var req: Load = .{
-            .currentTime = opts.start_time,
+            .currentTime = 0,
             .media = .{
                 .contentId = opts.url,
                 .contentType = opts.content_type,
@@ -409,7 +386,11 @@ pub const Channel = struct {
             // races the session and fails with INVALID_MEDIA_SESSION_ID.
             req.activeTrackIds = opts.active_track_ids;
         }
-        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return ch.mediaRequest(arena, transport_id, &req);
+    }
+
+    fn mediaRequest(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, req: anytype) !MediaStatus {
+        const reply = try ch.request(arena, transport_id, ns_media, req, "MEDIA_STATUS");
         return mediaStatusFrom(arena, reply) orelse badMediaStatus();
     }
 
@@ -429,28 +410,33 @@ pub const Channel = struct {
     /// Rate between 0.5 and 2.0 on the Default Media Receiver.
     pub fn setPlaybackRate(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, rate: f64) !MediaStatus {
         var req: SetPlaybackRate = .{ .mediaSessionId = media_session_id, .playbackRate = rate };
-        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(arena, reply) orelse badMediaStatus();
+        return ch.mediaRequest(arena, transport_id, &req);
     }
 
     pub fn mediaCommand(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, kind: []const u8) !MediaStatus {
         var req: MediaCommand = .{ .type = kind, .mediaSessionId = media_session_id };
-        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(arena, reply) orelse badMediaStatus();
+        return ch.mediaRequest(arena, transport_id, &req);
     }
 
     pub fn seek(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, seconds: f64) !MediaStatus {
         var req: Seek = .{ .mediaSessionId = media_session_id, .currentTime = seconds };
-        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(arena, reply) orelse badMediaStatus();
+        return ch.mediaRequest(arena, transport_id, &req);
     }
 };
 
-/// A protocol word as an enum; `E.UNKNOWN` for a word we do not know, since
-/// receivers may add states.
-fn lenientEnum(comptime E: type, source: Json) error{UnexpectedToken}!E {
-    if (source != .string) return error.UnexpectedToken;
-    return std.meta.stringToEnum(E, source.string) orelse .UNKNOWN;
+/// The json.Parse hooks that read a protocol word as `E`, falling back to
+/// `E.UNKNOWN` for a word we do not know, since receivers may add states.
+fn LenientJson(comptime E: type) type {
+    return struct {
+        fn jsonParseFromValue(_: std.mem.Allocator, source: Json, _: std.json.ParseOptions) error{UnexpectedToken}!E {
+            if (source != .string) return error.UnexpectedToken;
+            return std.meta.stringToEnum(E, source.string) orelse .UNKNOWN;
+        }
+
+        fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !E {
+            return jsonParseFromValue(allocator, try Json.jsonParse(allocator, source, options), options);
+        }
+    };
 }
 
 // --- wire structs (field names are the JSON keys) ----------------------------

@@ -129,14 +129,12 @@ fn appendCleanText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []cons
 
 fn appendTime(gpa: std.mem.Allocator, out: *std.ArrayList(u8), ms_in: i64) !void {
     const ms: u64 = if (ms_in < 0) 0 else @intCast(ms_in);
-    var buf: [16]u8 = undefined;
-    const t = try std.mem.print(&buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
+    try out.print(gpa, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
         ms / 3_600_000,
         (ms / 60_000) % 60,
         (ms / 1000) % 60,
         ms % 1000,
     });
-    try out.appendSlice(gpa, t);
 }
 
 fn isNumber(line: []const u8) bool {

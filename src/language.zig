@@ -11,6 +11,14 @@ pub fn name(code: []const u8) []const u8 {
     return names.get(code) orelse code;
 }
 
+/// What to call a subtitle track in the receiver's menu. An unknown or
+/// missing language leaves it generic rather than showing "und".
+pub fn trackName(code: ?[]const u8) []const u8 {
+    const c = code orelse return "Subtitles";
+    if (std.mem.eql(u8, c, "und")) return "Subtitles";
+    return name(c);
+}
+
 const names = std.StaticStringMap([]const u8).initComptime(.{
     .{ "eng", "English" },    .{ "en", "English" },    .{ "ger", "German" },
     .{ "deu", "German" },     .{ "de", "German" },     .{ "fre", "French" },

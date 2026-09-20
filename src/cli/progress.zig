@@ -21,9 +21,9 @@ pub const Bar = struct {
         self.node = self.root.start(label, @intCast(total));
     }
 
-    fn step(context: *anyopaque, units: u64) void {
+    fn step(context: *anyopaque) void {
         const self: *Bar = @ptrCast(@alignCast(context));
-        for (0..units) |_| self.node.completeOne();
+        self.node.completeOne();
     }
 
     fn end(context: *anyopaque) void {

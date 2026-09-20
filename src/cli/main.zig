@@ -68,8 +68,7 @@ const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, s
 
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
-        // Already explained on stderr by the library.
-        // Already explained by whoever raised them.
+        // Already explained on stderr by whoever raised them.
         error.InvalidRate,
         error.InvalidSeek,
         error.NoMedia,
@@ -116,7 +115,6 @@ fn run(init: std.process.Init) !void {
     if (args.len < 2) fail(usage);
     castig.av_extra.quietLibav();
     debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
-    if (init.environ_map.get("CASTIG_AUDIO_JOBS")) |v| castig.vmp4.audio_jobs = std.fmt.parseInt(usize, v, 10) catch null;
 
     const cmd = if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))
         Command.help
@@ -156,12 +154,7 @@ fn run(init: std.process.Init) !void {
         },
         .pause, .play => {
             if (args.len != 3) fail(usage);
-            const m = switch (cmd) {
-                .pause => try castig.control.pause(env, args[2]),
-                .play => try castig.control.play(env, args[2]),
-                else => unreachable,
-            };
-            try render.media(out, m);
+            try render.media(out, try castig.control.command(env, args[2], if (cmd == .pause) "PAUSE" else "PLAY"));
         },
         .seek => {
             if (args.len != 4) fail(usage);

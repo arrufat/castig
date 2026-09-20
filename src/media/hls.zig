@@ -64,12 +64,10 @@ pub const Segmenter = struct {
 
         // avc1 profile/compat/level come from the AVCDecoderConfigurationRecord
         // (extradata bytes 1..4); fall back to High@4.0 if unavailable.
-        var avc1: [16]u8 = undefined;
-        const avc1_str = if (vpar.extradata_size >= 4)
-            try std.mem.print(&avc1, "avc1.{x:0>2}{x:0>2}{x:0>2}", .{ vpar.extradata[1], vpar.extradata[2], vpar.extradata[3] })
+        const codecs = if (vpar.extradata_size >= 4)
+            try gpa.print("avc1.{x:0>2}{x:0>2}{x:0>2},mp4a.40.2", .{ vpar.extradata[1], vpar.extradata[2], vpar.extradata[3] })
         else
-            "avc1.640028";
-        const codecs = try gpa.print("{s},mp4a.40.2", .{avc1_str});
+            try gpa.dupe(u8, "avc1.640028,mp4a.40.2");
         errdefer gpa.free(codecs);
         const bandwidth: u64 = if (vpar.bit_rate > 0) @as(u64, @intCast(vpar.bit_rate)) + 192_000 else 6_000_000;
 

@@ -25,6 +25,7 @@ const std = @import("std");
 const Io = std.Io;
 const av = @import("av");
 const extra = @import("av_extra.zig");
+const Env = @import("../env.zig").Env;
 const Reporter = @import("../reporter.zig").Reporter;
 const pipeline = @import("pipeline.zig");
 
@@ -122,7 +123,7 @@ const AudioCollector = struct {
         const sec = extra.av_rescale_q(pkt.pts, self.time_base, extra.seconds);
         if (sec > self.done_s) {
             self.done_s = sec;
-            if (self.progress) |p| p.step(1);
+            if (self.progress) |p| p.step();
         }
     }
 };
@@ -237,7 +238,7 @@ pub const VMp4 = struct {
     }
 
     /// The map is contiguous over [container_end, mdat_end); find the run holding `o`.
-    fn findEntry(vm: *const VMp4, o: u64) ?*const MapEntry {
+    fn findEntryIndex(vm: *const VMp4, o: u64) ?usize {
         const Cmp = struct {
             fn order(offset: u64, e: MapEntry) std.math.Order {
                 if (offset < e.out_start) return .lt;
@@ -245,13 +246,14 @@ pub const VMp4 = struct {
                 return .eq;
             }
         };
-        const i = std.sort.binarySearch(MapEntry, vm.map, o, Cmp.order) orelse return null;
-        return &vm.map[i];
+        return std.sort.binarySearch(MapEntry, vm.map, o, Cmp.order);
     }
 
     /// Fills `dest` with the virtual file's bytes starting at `offset`.
     pub fn readInto(vm: *VMp4, offset: u64, dest: []u8) !void {
         var done: usize = 0;
+        // The runs are consecutive: search once, then follow the map.
+        var next: ?usize = null;
         while (done < dest.len) {
             const o = offset + done;
             if (o >= vm.total) return error.OutOfRange;
@@ -261,7 +263,12 @@ pub const VMp4 = struct {
                 @memcpy(dest[done..][0..@intCast(take)], vm.prefix[@intCast(o)..][0..@intCast(take)]);
                 done += @intCast(take);
             } else if (o < vm.mdat_end) {
-                const e = vm.findEntry(o) orelse return error.MapGap;
+                const i = blk: {
+                    if (next) |i| if (i < vm.map.len and o >= vm.map[i].out_start and o < vm.map[i].out_start + vm.map[i].len) break :blk i;
+                    break :blk vm.findEntryIndex(o) orelse return error.MapGap;
+                };
+                next = i + 1;
+                const e = &vm.map[i];
                 const delta = o - e.out_start;
                 const take = @min(want, e.len - delta);
                 const slice = dest[done..][0..@intCast(take)];
@@ -337,10 +344,6 @@ fn fillVideoDts(samples: []VideoSample) void {
 // control state), which is inaudible; window decisions match, so the MDCT
 // overlap-add across the seam is valid.
 
-/// Env override for the audio chunk count (`CASTIG_AUDIO_JOBS`); null means
-/// one per core.
-pub var audio_jobs: ?usize = null;
-
 /// Chunks shorter than this are not worth a seam and another demuxer.
 const min_chunk_s: f64 = 30;
 
@@ -349,10 +352,13 @@ const min_chunk_s: f64 = 30;
 /// priming packet), the last ends open.
 const Chunk = struct { lo: i64, hi: i64 };
 
-fn audioJobs(duration_s: ?f64) usize {
+/// One chunk per core, capped by what the audio is long enough to split into.
+/// `CASTIG_AUDIO_JOBS` overrides the core count, for measuring.
+fn audioJobs(env: Env, duration_s: ?f64) usize {
     const dur = duration_s orelse return 1;
     const by_length: usize = @intFromFloat(@max(1.0, dur / min_chunk_s));
-    const want = audio_jobs orelse (std.Thread.getCpuCount() catch 1);
+    const override = if (env.environ.get("CASTIG_AUDIO_JOBS")) |v| std.fmt.parseInt(usize, v, 10) catch null else null;
+    const want = override orelse (std.Thread.getCpuCount() catch 1);
     return @max(1, @min(want, by_length));
 }
 
@@ -520,8 +526,11 @@ pub const UnsuitableError = error{
 
 /// Builds the virtual MP4 for `path`. An `UnsuitableError` means the source
 /// cannot be served this way (no video, unreliable byte positions, ...).
-/// The audio is encoded on `audio_jobs` cores at once.
-pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatContext, progress: ?Reporter) !*VMp4 {
+/// The audio is encoded on several cores at once.
+pub fn build(env: Env, path: []const u8, ic: *av.FormatContext) !*VMp4 {
+    const gpa = env.gpa;
+    const io = env.io;
+    const progress = env.progress;
     var ic_adopted = false; // by the VideoReader, which then owns it
     defer if (!ic_adopted) ic.close_input();
 
@@ -572,7 +581,7 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatCon
     if (progress) |p| p.begin("preparing seekable mp4 (seconds)", if (duration) |d| @intFromFloat(d) else 0);
     defer if (progress) |p| p.end();
 
-    const chunks = try planChunks(gpa, enc.sample_rate, enc.frame_size, audio_s orelse 0, audioJobs(audio_s));
+    const chunks = try planChunks(gpa, enc.sample_rate, enc.frame_size, audio_s orelse 0, audioJobs(env, audio_s));
     defer gpa.free(chunks);
     const results = try gpa.alloc(ChunkResult, chunks.len);
     defer gpa.free(results);

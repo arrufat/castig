@@ -30,14 +30,17 @@ pub const Candidate = struct {
     season: ?u32,
     episode: ?u32,
     downloads: u64,
-    /// 0 none, 1 hash match, 2 hash match whose feature won the vote.
-    hash: u2,
+    hash: Hash,
     hi: bool,
     ai: bool,
     fps: ?f64,
     /// Set by the caller who knows the video's frame rate.
     fps_mismatch: bool = false,
 };
+
+/// How well the file hash vouches for a candidate, declared worst to best:
+/// `lessThan` sorts on the ordinals.
+pub const Hash = enum { none, match, voted };
 
 pub const Download = struct {
     bytes: []const u8,
@@ -140,7 +143,7 @@ pub const Client = struct {
                 .season = if (fd) |f| f.season_number else null,
                 .episode = if (fd) |f| f.episode_number else null,
                 .downloads = @intCast(@max(a.download_count orelse 0, 0)),
-                .hash = if (a.moviehash_match == true) 1 else 0,
+                .hash = if (a.moviehash_match == true) .match else .none,
                 .hi = a.hearing_impaired == true,
                 .ai = a.ai_translated == true or a.machine_translated == true,
                 .fps = jsonFps(a.fps),
@@ -371,15 +374,15 @@ pub fn rank(cands: []Candidate, opts: RankOptions) void {
         }
     }
     if (top != null and !tied) {
-        for (cands) |*c| if (c.hash > 0 and c.feature_id == top) {
-            c.hash = 2;
+        for (cands) |*c| if (c.hash != .none and c.feature_id == top) {
+            c.hash = .voted;
         };
     }
     std.mem.sort(Candidate, cands, opts, lessThan);
 }
 
 fn voterFeature(c: Candidate, episode: ?release.Episode) ?u64 {
-    if (c.hash == 0) return null;
+    if (c.hash == .none) return null;
     const fid = c.feature_id orelse return null;
     if (episode) |ep| if (c.season != null and c.episode != null) {
         if (c.season.? != ep.season or c.episode.? != ep.episode) return null;
@@ -393,7 +396,7 @@ fn langPriority(languages: []const []const u8, lang: []const u8) usize {
 }
 
 fn lessThan(opts: RankOptions, a: Candidate, b: Candidate) bool {
-    if (a.hash != b.hash) return a.hash > b.hash;
+    if (a.hash != b.hash) return @intFromEnum(a.hash) > @intFromEnum(b.hash);
     const pa = langPriority(opts.languages, a.lang);
     const pb = langPriority(opts.languages, b.lang);
     if (pa != pb) return pa < pb;
@@ -431,7 +434,7 @@ test "session freshness" {
     try std.testing.expect(!sessionFresh(1000, 999));
 }
 
-fn cand(id: u64, lang: []const u8, hash: u2, fid: ?u64) Candidate {
+fn cand(id: u64, lang: []const u8, hash: Hash, fid: ?u64) Candidate {
     return .{
         .file_id = id,
         .file_name = "",
@@ -450,32 +453,32 @@ fn cand(id: u64, lang: []const u8, hash: u2, fid: ?u64) Candidate {
 }
 
 test "rank promotes the feature the hash matches agree on" {
-    var cands = [_]Candidate{ cand(1, "en", 1, 7), cand(2, "en", 1, 9), cand(3, "en", 1, 7), cand(4, "en", 0, 7) };
+    var cands = [_]Candidate{ cand(1, "en", .match, 7), cand(2, "en", .match, 9), cand(3, "en", .match, 7), cand(4, "en", .none, 7) };
     rank(&cands, .{ .languages = &.{"en"}, .prefer_hi = false, .episode = null });
-    try std.testing.expectEqual(@as(u2, 2), cands[0].hash);
-    try std.testing.expectEqual(@as(u2, 2), cands[1].hash);
-    try std.testing.expectEqual(@as(u2, 1), cands[2].hash);
+    try std.testing.expectEqual(Hash.voted, cands[0].hash);
+    try std.testing.expectEqual(Hash.voted, cands[1].hash);
+    try std.testing.expectEqual(Hash.match, cands[2].hash);
     try std.testing.expectEqual(@as(u64, 2), cands[2].file_id);
-    try std.testing.expectEqual(@as(u2, 0), cands[3].hash);
+    try std.testing.expectEqual(Hash.none, cands[3].hash);
 }
 
 test "rank: a tie promotes nobody, a contradicting episode does not vote" {
-    var tie = [_]Candidate{ cand(1, "en", 1, 7), cand(2, "en", 1, 9) };
+    var tie = [_]Candidate{ cand(1, "en", .match, 7), cand(2, "en", .match, 9) };
     rank(&tie, .{ .languages = &.{"en"}, .prefer_hi = false, .episode = null });
-    try std.testing.expectEqual(@as(u2, 1), tie[0].hash);
-    try std.testing.expectEqual(@as(u2, 1), tie[1].hash);
+    try std.testing.expectEqual(Hash.match, tie[0].hash);
+    try std.testing.expectEqual(Hash.match, tie[1].hash);
 
-    var c = [_]Candidate{ cand(1, "en", 1, 7), cand(2, "en", 1, 9) };
+    var c = [_]Candidate{ cand(1, "en", .match, 7), cand(2, "en", .match, 9) };
     c[0].season = 1;
     c[0].episode = 3;
     rank(&c, .{ .languages = &.{"en"}, .prefer_hi = false, .episode = .{ .season = 1, .episode = 2 } });
     try std.testing.expectEqual(@as(u64, 2), c[0].file_id);
-    try std.testing.expectEqual(@as(u2, 2), c[0].hash);
-    try std.testing.expectEqual(@as(u2, 1), c[1].hash);
+    try std.testing.expectEqual(Hash.voted, c[0].hash);
+    try std.testing.expectEqual(Hash.match, c[1].hash);
 }
 
 test "rank order: language, ai, fps, hi, downloads" {
-    var c = [_]Candidate{ cand(1, "en", 0, null), cand(2, "ko", 0, null), cand(3, "ko", 0, null), cand(4, "ko", 0, null), cand(5, "ko", 0, null), cand(6, "fr", 0, null) };
+    var c = [_]Candidate{ cand(1, "en", .none, null), cand(2, "ko", .none, null), cand(3, "ko", .none, null), cand(4, "ko", .none, null), cand(5, "ko", .none, null), cand(6, "fr", .none, null) };
     c[2].ai = true;
     c[3].fps_mismatch = true;
     c[1].downloads = 5;

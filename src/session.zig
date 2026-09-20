@@ -57,14 +57,6 @@ pub const Event = union(enum) {
     closed,
 };
 
-/// Everything a LOAD needs besides the target.
-const Extras = struct {
-    title: ?[]const u8,
-    text_tracks: []const Channel.TextTrack,
-    active_track_ids: []const u32,
-    duration: ?f64,
-};
-
 pub const Session = struct {
     env: Env,
     opts: Options,
@@ -75,7 +67,9 @@ pub const Session = struct {
     server: ?*http.Server = null,
     base: []const u8 = "",
     target: delivery.Target,
-    extras: Extras,
+    /// What the LOAD carries besides the target; the tracks come from `routes`.
+    title: ?[]const u8 = null,
+    duration: ?f64 = null,
     app: Channel.App,
     media: Channel.MediaStatus,
     /// Reset per message, so a long session's memory stays bounded.
@@ -111,13 +105,7 @@ pub const Session = struct {
             .address = undefined,
             .ch = undefined,
             .routes = .{ .env = env, .source = opts.source },
-            .target = .{
-                .path = opts.source,
-                .content_type = content_type,
-                // A remote HLS URL needs the MPEG-TS segment hint too.
-                .hls = std.ascii.findIgnoreCase(content_type, "mpegurl") != null,
-            },
-            .extras = undefined,
+            .target = .{ .path = opts.source, .content_type = content_type },
             .app = undefined,
             .media = undefined,
             .scratch = std.heap.ArenaAllocator.init(env.gpa),
@@ -191,12 +179,8 @@ pub const Session = struct {
             s.push(.{ .serving = s.base });
         }
 
-        s.extras = .{
-            .title = opts.title orelse (if (local) Io.Dir.path.basename(opts.source) else null),
-            .text_tracks = s.routes.tracks.items,
-            .active_track_ids = s.routes.active.items,
-            .duration = duration,
-        };
+        s.title = opts.title orelse (if (local) Io.Dir.path.basename(opts.source) else null);
+        s.duration = duration;
         try s.load();
         return s;
     }
@@ -249,11 +233,11 @@ pub const Session = struct {
         s.media = try s.ch.load(arena, s.app.transportId, .{
             .url = s.target.path,
             .content_type = s.target.content_type,
-            .title = s.extras.title,
-            .text_tracks = s.extras.text_tracks,
-            .active_track_ids = s.extras.active_track_ids,
-            .duration = s.extras.duration,
-            .hls = s.target.hls,
+            .title = s.title,
+            .text_tracks = s.routes.tracks.items,
+            .active_track_ids = s.routes.active.items,
+            .duration = s.duration,
+            .hls = s.target.isHls(),
         });
         s.push(.{ .loaded = .{ .address = s.address, .content_type = s.target.content_type } });
         s.push(.{ .state = s.media });
@@ -264,7 +248,7 @@ pub const Session = struct {
     /// takes a while, so the idle channel is reopened afterwards.
     fn fallBack(s: *Session) !bool {
         if (s.played or s.media.idleReason != .ERROR) return false;
-        if (s.opts.remux != .auto or !s.target.hls or !s.local) return false;
+        if (s.opts.remux != .auto or !s.target.isHls() or !s.local) return false;
 
         s.push(.falling_back);
         s.ch.deinit();
@@ -277,16 +261,18 @@ pub const Session = struct {
     }
 
     fn push(s: *Session, e: Event) void {
-        std.debug.assert(s.queued < s.queue.len);
-        s.queue[(s.head + s.queued) % s.queue.len] = e;
+        std.debug.assert(s.head + s.queued < s.queue.len);
+        s.queue[s.head + s.queued] = e;
         s.queued += 1;
     }
 
     fn pop(s: *Session) ?Event {
         if (s.queued == 0) return null;
         const e = s.queue[s.head];
-        s.head = (s.head + 1) % s.queue.len;
+        s.head += 1;
         s.queued -= 1;
+        // Empty: start the next fill at the front, so `head` never wraps.
+        if (s.queued == 0) s.head = 0;
         return e;
     }
 };

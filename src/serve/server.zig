@@ -27,16 +27,14 @@ pub const Route = struct {
 
     pub const Body = union(enum) {
         /// Path on disk, streamed with `sendFile`.
-        file: Static([]const u8),
+        file: Static,
         /// Fixed content kept in memory.
-        bytes: Static([]const u8),
+        bytes: Static,
         /// A handler that writes the whole response itself.
         dynamic: Dynamic,
     };
 
-    pub fn Static(comptime T: type) type {
-        return struct { content_type: []const u8, data: T };
-    }
+    pub const Static = struct { content_type: []const u8, data: []const u8 };
 
     pub const Dynamic = struct {
         context: *const anyopaque,
@@ -225,12 +223,6 @@ pub const Source = union(enum) {
 /// first (the Cast receiver's HLS loader needs a Content-Length on segments).
 pub fn respondBuffer(request: *Request, content_type: []const u8, bytes: []const u8) !void {
     return respondRanged(request, content_type, bytes.len, .{ .bytes = bytes });
-}
-
-/// Serves a body of `total` bytes that lives anywhere (the on-the-fly MP4
-/// assembler) with Content-Length, single-range (206) and HEAD support.
-pub fn respondVirtual(request: *Request, content_type: []const u8, total: u64, ctx: *anyopaque, readFn: ReadFn) !void {
-    return respondRanged(request, content_type, total, .{ .virtual = .{ .ctx = ctx, .read = readFn } });
 }
 
 /// Serves `total` bytes from `source` with Content-Length, single-range (206)

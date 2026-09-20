@@ -40,8 +40,12 @@ pub const Remux = enum {
 pub const Target = struct {
     path: []const u8,
     content_type: []const u8,
-    /// HLS with MPEG-TS segments, which the receiver must be told about.
-    hls: bool = false,
+
+    /// Whether the receiver must be told to expect MPEG-TS segments. Both
+    /// spellings of the playlist type carry "mpegurl".
+    pub fn isHls(t: Target) bool {
+        return std.ascii.findIgnoreCase(t.content_type, "mpegurl") != null;
+    }
 };
 
 pub fn isUrl(s: []const u8) bool {
@@ -73,7 +77,7 @@ fn vmp4ReadFn(ctx: *anyopaque, offset: u64, dest: []u8) anyerror!void {
 
 fn vmp4Handle(context: *const anyopaque, request: *http.Request, _: []const u8) anyerror!void {
     const vm: *vmp4.VMp4 = @ptrCast(@alignCast(@constCast(context)));
-    try http.respondVirtual(request, mp4_type, vm.total, vm, vmp4ReadFn);
+    try http.respondRanged(request, mp4_type, vm.total, .{ .virtual = .{ .ctx = vm, .read = vmp4ReadFn } });
 }
 
 /// The text subtitle streams embedded in the source, all converted to WebVTT
@@ -160,7 +164,7 @@ pub const Routes = struct {
     /// The on-the-fly seekable mp4, or the no-seek stream if the file cannot
     /// be made seekable byte-exactly. Takes ownership of `ic`.
     pub fn addMp4(s: *Routes, ic: *av.FormatContext) !Target {
-        const vm = vmp4.build(s.env.gpa, s.env.io, s.source, ic, s.env.progress) catch |err| switch (err) {
+        const vm = vmp4.build(s.env, s.source, ic) catch |err| switch (err) {
             error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved, error.SeamMismatch => {
                 log.warn("this file cannot be made seekable without a copy ({s}); serving without seek", .{@errorName(err)});
                 return s.addStream();
@@ -181,7 +185,7 @@ pub const Routes = struct {
         errdefer seg.deinit();
         try s.addRoute(hls.url_prefix, seg, hls.handleRoute);
         s.segmenter = seg;
-        return .{ .path = hls.url_prefix ++ hls.master_name, .content_type = hls.cast_content_type, .hls = true };
+        return .{ .path = hls.url_prefix ++ hls.master_name, .content_type = hls.cast_content_type };
     }
 
     /// The `--subs` / sidecar / downloaded track, enabled from the start.
@@ -205,7 +209,7 @@ pub const Routes = struct {
             .id = id,
             .url = url,
             .language = lang orelse "und",
-            .name = if (lang) |l| language.name(l) else "Subtitles",
+            .name = language.trackName(lang),
         });
         try s.active.append(arena, id);
     }
@@ -225,12 +229,7 @@ pub const Routes = struct {
             const route = try arena.create(EmbeddedSubtitleRoute);
             route.* = .{ .subs = embedded, .slot = slot };
             try s.addRoute(path, route, embSubHandle);
-            const name = if (e.title.len > 0)
-                e.title
-            else if (!std.mem.eql(u8, e.language, "und"))
-                language.name(e.language)
-            else
-                "Subtitles";
+            const name = if (e.title.len > 0) e.title else language.trackName(e.language);
             try s.tracks.append(arena, .{ .id = @intCast(s.tracks.items.len + 1), .url = path, .language = e.language, .name = name });
         }
         log.info("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu", .{streams.len});

@@ -87,8 +87,11 @@ pub fn event(out: *Io.Writer, e: castig.session.Event) !void {
 /// One subtitle row: tags, download count, frame rate when it disagrees with
 /// the video, and the release (with the feature when results span several).
 pub fn candidate(out: *Io.Writer, c: castig.subs.Candidate, multi_feature: bool) !void {
-    if (c.hash == 2) try out.writeAll("[HASH] ");
-    if (c.hash == 1) try out.writeAll("[HASH?] ");
+    switch (c.hash) {
+        .voted => try out.writeAll("[HASH] "),
+        .match => try out.writeAll("[HASH?] "),
+        .none => {},
+    }
     try out.print("[{s}]", .{c.lang});
     if (c.hi) try out.writeAll(" [HI]");
     if (c.ai) try out.writeAll(" [AI]");
@@ -123,7 +126,7 @@ test "subtitle rows" {
         .season = null,
         .episode = null,
         .downloads = 1200,
-        .hash = 2,
+        .hash = .voted,
         .hi = true,
         .ai = false,
         .fps = null,
@@ -142,7 +145,7 @@ test "subtitle rows" {
         .season = null,
         .episode = null,
         .downloads = 0,
-        .hash = 1,
+        .hash = .match,
         .hi = false,
         .ai = true,
         .fps = 25,

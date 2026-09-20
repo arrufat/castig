@@ -78,16 +78,11 @@ fn open(env: Env, device: []const u8) !Playing {
     return .{ .ch = ch, .transport_id = app.transportId, .media = media };
 }
 
-pub fn pause(env: Env, device: []const u8) !Channel.MediaStatus {
+/// One media namespace verb ("PAUSE", "PLAY") for whatever is playing.
+pub fn command(env: Env, device: []const u8, kind: []const u8) !Channel.MediaStatus {
     const p = try open(env, device);
     defer p.ch.deinit();
-    return p.withMedia(try p.ch.mediaCommand(env.arena, p.transport_id, p.media.mediaSessionId, "PAUSE"));
-}
-
-pub fn play(env: Env, device: []const u8) !Channel.MediaStatus {
-    const p = try open(env, device);
-    defer p.ch.deinit();
-    return p.withMedia(try p.ch.mediaCommand(env.arena, p.transport_id, p.media.mediaSessionId, "PLAY"));
+    return p.withMedia(try p.ch.mediaCommand(env.arena, p.transport_id, p.media.mediaSessionId, kind));
 }
 
 /// `spec` is absolute ("90", "1:30", "1:02:03") or relative ("+30", "-10"),
