@@ -31,7 +31,7 @@ pub fn load(arena: std.mem.Allocator, io: Io, environ: *const std.process.Enviro
     const text = Io.Dir.cwd().readFileAlloc(io, cfg.path, arena, .limited(64 * 1024)) catch |err| switch (err) {
         error.FileNotFound => "",
         else => {
-            std.debug.print("cannot read {s}: {s}\n", .{ cfg.path, @errorName(err) });
+            log.warn("cannot read {s}: {s}", .{ cfg.path, @errorName(err) });
             return err;
         },
     };

@@ -83,3 +83,75 @@ pub fn event(out: *Io.Writer, e: castig.session.Event) !void {
     }
     try out.flush();
 }
+
+/// One subtitle row: tags, download count, frame rate when it disagrees with
+/// the video, and the release (with the feature when results span several).
+pub fn candidate(out: *Io.Writer, c: castig.subs.Candidate, multi_feature: bool) !void {
+    if (c.hash == 2) try out.writeAll("[HASH] ");
+    if (c.hash == 1) try out.writeAll("[HASH?] ");
+    try out.print("[{s}]", .{c.lang});
+    if (c.hi) try out.writeAll(" [HI]");
+    if (c.ai) try out.writeAll(" [AI]");
+    try out.print(" {d} dl", .{c.downloads});
+    if (c.fps_mismatch) if (c.fps) |f| {
+        try out.writeAll(", ");
+        try fps(out, f);
+        try out.writeAll(" fps");
+    };
+    try out.writeAll(" \u{b7} ");
+    if (multi_feature) if (c.feature) |f| try out.print("{s} \u{b7} ", .{f});
+    try out.writeAll(c.release);
+}
+
+/// Two decimals with the trailing zeros dropped: 23.98, 24.
+pub fn fps(out: *Io.Writer, value: f64) !void {
+    var buf: [32]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{d:.2}", .{value});
+    try out.writeAll(std.mem.trimEnd(u8, std.mem.trimEnd(u8, s, "0"), "."));
+}
+
+test "subtitle rows" {
+    var buf: [128]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var c: castig.subs.Candidate = .{
+        .file_id = 1,
+        .file_name = "",
+        .lang = "en",
+        .release = "rel",
+        .feature_id = 7,
+        .feature = null,
+        .season = null,
+        .episode = null,
+        .downloads = 1200,
+        .hash = 2,
+        .hi = true,
+        .ai = false,
+        .fps = null,
+    };
+    try candidate(&w, c, false);
+    try std.testing.expectEqualStrings("[HASH] [en] [HI] 1200 dl \u{b7} rel", w.buffered());
+
+    w = .fixed(&buf);
+    c = .{
+        .file_id = 2,
+        .file_name = "",
+        .lang = "ko",
+        .release = "rel",
+        .feature_id = 9,
+        .feature = "Show S01E02",
+        .season = null,
+        .episode = null,
+        .downloads = 0,
+        .hash = 1,
+        .hi = false,
+        .ai = true,
+        .fps = 25,
+        .fps_mismatch = true,
+    };
+    try candidate(&w, c, true);
+    try std.testing.expectEqualStrings("[HASH?] [ko] [AI] 0 dl, 25 fps \u{b7} Show S01E02 \u{b7} rel", w.buffered());
+
+    w = .fixed(&buf);
+    try fps(&w, 23.976);
+    try std.testing.expectEqualStrings("23.98", w.buffered());
+}

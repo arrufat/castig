@@ -12,6 +12,8 @@ const channel = @import("device/channel.zig");
 const Channel = channel.Channel;
 const discovery = @import("device/discovery.zig");
 
+const log = std.log.scoped(.cast);
+
 pub const Status = struct {
     address: net.Ip4Address,
     receiver: Channel.Status,
@@ -62,13 +64,13 @@ fn open(env: Env, device: []const u8) !Playing {
 
     const st = try ch.getStatus(env.arena);
     const app = st.mediaApp() orelse {
-        std.debug.print("nothing is playing on {f}\n", .{address});
+        log.warn("nothing is playing on {f}", .{address});
         return error.NoMedia;
     };
     try ch.connectTransport(app.transportId);
     const media = ch.getMediaStatus(env.arena, app.transportId) catch |err| switch (err) {
         error.NoMedia => {
-            std.debug.print("{s} has no media loaded\n", .{app.displayName});
+            log.warn("{s} has no media loaded", .{app.displayName});
             return err;
         },
         else => return err,
@@ -95,7 +97,7 @@ pub fn seek(env: Env, device: []const u8, spec: []const u8) !Channel.MediaStatus
     defer p.ch.deinit();
 
     var target = parseSeek(spec, p.media.currentTime) catch {
-        std.debug.print("cannot parse position {s}\n", .{spec});
+        log.warn("cannot parse position {s}", .{spec});
         return error.InvalidSeek;
     };
     target = std.math.clamp(target, 0, p.media.duration() orelse std.math.inf(f64));
@@ -108,7 +110,7 @@ pub const rate_max = 2.0;
 /// The Default Media Receiver accepts 0.5 to 2.0 and ignores anything else.
 pub fn rate(env: Env, device: []const u8, value: f64) !Channel.MediaStatus {
     if (value < rate_min or value > rate_max) {
-        std.debug.print("rate must be between {d} and {d}\n", .{ rate_min, rate_max });
+        log.warn("rate must be between {d:.1} and {d:.1}", .{ rate_min, rate_max });
         return error.InvalidRate;
     }
     const p = try open(env, device);

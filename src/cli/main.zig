@@ -3,6 +3,8 @@ const Io = std.Io;
 
 const castig = @import("castig");
 const render = @import("render.zig");
+const prompt = @import("prompt.zig");
+const progress = @import("progress.zig");
 
 const usage =
     \\usage: castig <command> [args]
@@ -49,8 +51,17 @@ pub const std_options: std.Options = .{
 var debug_enabled = false;
 
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
-    if (level == .debug and !debug_enabled) return;
-    std.log.defaultLog(level, scope, format, args);
+    if (level == .debug) {
+        if (!debug_enabled) return;
+        return std.log.defaultLog(level, scope, format, args);
+    }
+    const prefix = switch (level) {
+        .err => "error: ",
+        .warn => "warning: ",
+        .info => "",
+        .debug => unreachable,
+    };
+    std.debug.print(prefix ++ format ++ "\n", args);
 }
 
 const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, subs, help };
@@ -79,9 +90,18 @@ fn run(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
-    const env: castig.Env = .{ .io = io, .arena = arena, .gpa = init.gpa, .out = out, .environ = init.environ_map };
+    var bar: progress.Bar = .{ .io = io };
+    const env: castig.Env = .{
+        .io = io,
+        .arena = arena,
+        .gpa = init.gpa,
+        .out = out,
+        .environ = init.environ_map,
+        .progress = bar.reporter(),
+    };
 
     if (args.len < 2) fail(usage);
+    castig.av_extra.quietLibav();
     debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
     if (init.environ_map.get("CASTIG_AUDIO_JOBS")) |v| castig.vmp4.audio_jobs = std.fmt.parseInt(usize, v, 10) catch null;
 
@@ -167,16 +187,32 @@ fn run(init: std.process.Init) !void {
         .subs => {
             if (args.len < 3) fail(usage);
             var opts: castig.subs.Options = .{};
+            var auto = false;
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--auto")) {
-                    opts.auto = true;
+                    auto = true;
                 } else if (std.mem.eql(u8, args[i], "--lang") and i + 1 < args.len) {
                     i += 1;
                     opts.languages = try castig.subs.config.splitLanguages(arena, args[i]);
                 } else fail(usage);
             }
-            _ = try castig.subs.fetch(env, args[2], opts);
+            if (!auto and !prompt.interactive(io)) {
+                std.debug.print("stdin is not a terminal, picking automatically\n", .{});
+                auto = true;
+            }
+
+            var lookup = try castig.subs.Lookup.open(env, args[2], opts);
+            defer lookup.deinit();
+            const index = if (auto) lookup.confident() orelse {
+                std.debug.print("{s}; {d} result(s) to pick from\n", .{ lookup.doubt(), lookup.candidates.len });
+                return error.NoSubtitles;
+            } else (try prompt.pick(io, out, lookup)) orelse return;
+
+            const saved = try lookup.take(index);
+            try out.print("saved {s}", .{saved.path});
+            if (saved.remaining) |n| try out.print(" ({d} downloads left today)", .{n});
+            try out.writeAll("\n");
         },
         .help => try out.writeAll(usage),
     }
@@ -187,4 +223,10 @@ fn run(init: std.process.Init) !void {
 fn fail(msg: []const u8) noreturn {
     std.debug.print("{s}", .{msg});
     std.process.exit(1);
+}
+
+test {
+    _ = @import("render.zig");
+    _ = @import("prompt.zig");
+    _ = @import("progress.zig");
 }

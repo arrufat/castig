@@ -19,12 +19,18 @@ const av = @import("av");
 /// `seek_frame` with stream -1) are in microseconds.
 pub const TIME_BASE: f64 = 1_000_000;
 
-/// Opens `path` for demuxing and reads its stream info. libav's own
-/// diagnostics are kept off stderr; failures surface as errors.
+/// Silences libav's own logging, which otherwise writes to stderr from
+/// anywhere. Process-global, so it is the program's call, not a library's.
+pub fn quietLibav() void {
+    av.LOG.set_level(.ERROR);
+}
+
+/// Opens `path` for demuxing and reads its stream info. Failures surface as
+/// errors; libav's own chatter is silenced by `quietLibav`, which a program
+/// calls once if it wants that.
 pub fn openInput(gpa: std.mem.Allocator, path: []const u8) !*av.FormatContext {
     const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
-    av.LOG.set_level(.ERROR);
     const ic = try av.FormatContext.open_input(path_z, null, null, null);
     errdefer ic.close_input();
     try ic.find_stream_info(null);

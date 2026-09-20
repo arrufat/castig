@@ -160,9 +160,9 @@ pub const Routes = struct {
     /// The on-the-fly seekable mp4, or the no-seek stream if the file cannot
     /// be made seekable byte-exactly. Takes ownership of `ic`.
     pub fn addMp4(s: *Routes, ic: *av.FormatContext) !Target {
-        const vm = vmp4.build(s.env.gpa, s.env.io, s.source, ic) catch |err| switch (err) {
+        const vm = vmp4.build(s.env.gpa, s.env.io, s.source, ic, s.env.progress) catch |err| switch (err) {
             error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved, error.SeamMismatch => {
-                std.debug.print("note: this file cannot be made seekable without a copy ({s}); serving without seek.\n", .{@errorName(err)});
+                log.warn("this file cannot be made seekable without a copy ({s}); serving without seek", .{@errorName(err)});
                 return s.addStream();
             },
             else => return err,
@@ -189,7 +189,7 @@ pub const Routes = struct {
         const arena = s.env.arena;
         const url = if (isUrl(sub)) sub else blk: {
             const srt = Io.Dir.cwd().readFileAlloc(s.env.io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
-                std.debug.print("cannot read {s}: {s}\n", .{ sub, @errorName(err) });
+                log.warn("cannot read {s}: {s}", .{ sub, @errorName(err) });
                 return error.SourceUnreadable;
             };
             try s.list.append(arena, .{
@@ -226,7 +226,7 @@ pub const Routes = struct {
                 "Subtitles";
             try s.tracks.append(arena, .{ .id = @intCast(s.tracks.items.len + 1), .url = path, .language = e.language, .name = name });
         }
-        std.debug.print("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu\n", .{streams.len});
+        log.info("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu", .{streams.len});
     }
 
     /// Route paths are relative until the server is listening and its address

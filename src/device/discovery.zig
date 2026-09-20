@@ -10,6 +10,8 @@ const Io = std.Io;
 const net = Io.net;
 const dns = @import("dns.zig");
 
+const log = std.log.scoped(.cast);
+
 pub const service = "_googlecast._tcp.local";
 pub const default_port: u16 = 8009;
 pub const default_timeout_ms: u32 = 2000;
@@ -174,7 +176,7 @@ pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address
     defer gpa.free(devices);
     defer freeDevices(gpa, devices);
     for (devices) |d| if (d.matches(spec)) return d.address;
-    std.debug.print("no cast device matches \"{s}\"; try `castig ls`\n", .{spec});
+    log.warn("no cast device matches \"{s}\"; try `castig ls`", .{spec});
     return error.DeviceNotFound;
 }
 

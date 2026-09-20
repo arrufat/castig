@@ -3,6 +3,8 @@
 
 /// What every operation runs with: the Io, the allocators, the environment.
 pub const Env = @import("env.zig").Env;
+/// Where the library reports the progress of a long operation.
+pub const Reporter = @import("reporter.zig").Reporter;
 /// ISO 639 code to a display name, for naming a subtitle track.
 pub const language = @import("language.zig");
 
@@ -45,6 +47,7 @@ pub const control = @import("control.zig");
 
 test {
     _ = Env;
+    _ = Reporter;
     _ = language;
     _ = channel;
     _ = proto;

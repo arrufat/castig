@@ -210,18 +210,16 @@ pub const Channel = struct {
             if (reply.launchRequestId == ch.request_id) {
                 const status = if (reply.status == .string) reply.status.string else "";
                 if (std.mem.eql(u8, status, "USER_PENDING_AUTHORIZATION")) {
-                    std.debug.print("waiting for the cast to be allowed on the device...\n", .{});
+                    log.info("waiting for the cast to be allowed on the device...", .{});
                 } else if (std.mem.eql(u8, status, "USER_NOT_ALLOWED")) {
-                    std.debug.print("the cast was denied on the device\n", .{});
+                    log.warn("the cast was denied on the device", .{});
                     return error.RequestFailed;
                 }
                 continue;
             }
             if (reply.requestId != ch.request_id) continue;
             if (std.mem.eql(u8, reply.type, expected_type)) return reply;
-            std.debug.print("receiver answered {s}", .{reply.type});
-            if (reply.reason) |reason| std.debug.print(": {s}", .{reason});
-            std.debug.print("\n", .{});
+            log.warn("receiver answered {s}{s}{s}", .{ reply.type, if (reply.reason != null) ": " else "", reply.reason orelse "" });
             return error.RequestFailed;
         }
     }
@@ -262,7 +260,7 @@ pub const Channel = struct {
 
     fn parseStatus(arena: std.mem.Allocator, reply: Reply) !Status {
         return std.json.parseFromValueLeaky(Status, arena, reply.status, parse_options) catch |err| {
-            std.debug.print("unexpected RECEIVER_STATUS shape: {s}\n", .{@errorName(err)});
+            log.warn("unexpected RECEIVER_STATUS shape: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };
     }

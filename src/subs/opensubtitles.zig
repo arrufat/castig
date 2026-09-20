@@ -94,12 +94,12 @@ const Reply = struct { status: std.http.Status, body: []u8 };
 pub const Client = struct {
     io: Io,
     arena: std.mem.Allocator,
-    cfg: *const config.Config,
+    cfg: config.Config,
     http: std.http.Client,
     base: []const u8 = api_default,
     token: ?[]const u8 = null,
 
-    pub fn init(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: *const config.Config) Client {
+    pub fn init(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: config.Config) Client {
         return .{ .io = io, .arena = arena, .cfg = cfg, .http = .{ .allocator = gpa, .io = io } };
     }
 
@@ -164,15 +164,13 @@ pub const Client = struct {
             if (r.status != .unauthorized) break r;
             try c.login();
         } else {
-            std.debug.print("authentication failed\n", .{});
+            log.warn("authentication failed", .{});
             return error.RequestFailed;
         };
 
         const dr = std.json.parseFromSliceLeaky(DownloadReply, arena, reply.body, parse_options) catch DownloadReply{};
         if (reply.status != .ok or dr.link == null) {
-            if (dr.message) |m| std.debug.print("download refused: {s}", .{m}) else std.debug.print("download refused: HTTP {d}", .{@backingInt(reply.status)});
-            if (dr.reset_time) |t| std.debug.print(" (quota resets {s})", .{t});
-            std.debug.print("\n", .{});
+            if (dr.message) |m| log.warn("download refused: {s}{s}{s}", .{ m, if (dr.reset_time != null) "; quota resets " else "", dr.reset_time orelse "" }) else log.warn("download refused: HTTP {d}", .{@backingInt(reply.status)});
             return error.RequestFailed;
         }
         return .{ .bytes = try c.fetchBytes(dr.link.?), .file_name = dr.file_name orelse "", .remaining = dr.remaining };
@@ -197,12 +195,12 @@ pub const Client = struct {
             },
             .response_writer = &aw.writer,
         }) catch |err| {
-            std.debug.print("network error: {s}\n", .{@errorName(err)});
+            log.warn("network error: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };
         log.debug("  -> {d} ({d} bytes)", .{ @backingInt(res.status), aw.written().len });
         if (res.status == .too_many_requests) {
-            std.debug.print("rate limited by OpenSubtitles, retry in a minute\n", .{});
+            log.warn("rate limited by OpenSubtitles, retry in a minute", .{});
             return error.RequestFailed;
         }
         return .{ .status = res.status, .body = aw.written() };
@@ -213,11 +211,11 @@ pub const Client = struct {
         var aw: Io.Writer.Allocating = .init(c.arena);
         log.debug("GET {s}", .{url});
         const res = c.http.fetch(.{ .location = .{ .url = url }, .response_writer = &aw.writer }) catch |err| {
-            std.debug.print("fetch failed: {s}\n", .{@errorName(err)});
+            log.warn("fetch failed: {s}", .{@errorName(err)});
             return error.RequestFailed;
         };
         if (res.status != .ok) {
-            std.debug.print("fetch failed: HTTP {d}\n", .{@backingInt(res.status)});
+            log.warn("fetch failed: HTTP {d}", .{@backingInt(res.status)});
             return error.RequestFailed;
         }
         return aw.written();
@@ -225,20 +223,20 @@ pub const Client = struct {
 
     fn apiError(c: *Client, what: []const u8, reply: Reply) error{RequestFailed} {
         const msg = std.json.parseFromSliceLeaky(Message, c.arena, reply.body, parse_options) catch Message{};
-        if (msg.message) |m| std.debug.print("{s}: {s}\n", .{ what, m }) else std.debug.print("{s}: HTTP {d}\n", .{ what, @backingInt(reply.status) });
+        if (msg.message) |m| log.warn("{s}: {s}", .{ what, m }) else log.warn("{s}: HTTP {d}", .{ what, @backingInt(reply.status) });
         return error.RequestFailed;
     }
 
     fn login(c: *Client) !void {
         const arena = c.arena;
         if (c.cfg.username.len == 0 or c.cfg.password.len == 0) {
-            std.debug.print("no username/password: set them in {s} or OPENSUBTITLES_USERNAME/OPENSUBTITLES_PASSWORD\n", .{c.cfg.path});
+            log.warn("no username/password: set them in {s} or OPENSUBTITLES_USERNAME/OPENSUBTITLES_PASSWORD", .{c.cfg.path});
             return error.NoCredentials;
         }
         const body = try std.json.Stringify.valueAlloc(arena, .{ .username = c.cfg.username, .password = c.cfg.password }, .{});
         const reply = try c.request(.POST, api_default ++ "/login", body, null);
         if (reply.status == .unauthorized) {
-            std.debug.print("bad credentials (check {s})\n", .{c.cfg.path});
+            log.warn("bad credentials (check {s})", .{c.cfg.path});
             return error.RequestFailed;
         }
         if (reply.status != .ok) return c.apiError("login failed", reply);
@@ -405,32 +403,6 @@ fn lessThan(opts: RankOptions, a: Candidate, b: Candidate) bool {
     return a.downloads > b.downloads;
 }
 
-/// One picker row: tags, download count, frame rate when it disagrees with
-/// the video, and the release (with the feature when results span several).
-pub fn formatRow(w: *Io.Writer, c: Candidate, multi_feature: bool) !void {
-    if (c.hash == 2) try w.writeAll("[HASH] ");
-    if (c.hash == 1) try w.writeAll("[HASH?] ");
-    try w.print("[{s}]", .{c.lang});
-    if (c.hi) try w.writeAll(" [HI]");
-    if (c.ai) try w.writeAll(" [AI]");
-    try w.print(" {d} dl", .{c.downloads});
-    if (c.fps_mismatch) if (c.fps) |f| {
-        try w.writeAll(", ");
-        try writeFps(w, f);
-        try w.writeAll(" fps");
-    };
-    try w.writeAll(" · ");
-    if (multi_feature) if (c.feature) |f| try w.print("{s} · ", .{f});
-    try w.writeAll(c.release);
-}
-
-/// Two decimals with the trailing zeros dropped: 23.98, 24.
-pub fn writeFps(w: *Io.Writer, fps: f64) !void {
-    var buf: [32]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, "{d:.2}", .{fps});
-    try w.writeAll(std.mem.trimEnd(u8, std.mem.trimEnd(u8, s, "0"), "."));
-}
-
 test "query string is canonical" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -514,27 +486,4 @@ test "rank order: language, ai, fps, hi, downloads" {
     for (order, c) |want, got| try std.testing.expectEqual(want, got.file_id);
     rank(&c, .{ .languages = &.{ "ko", "en" }, .prefer_hi = true, .episode = null });
     try std.testing.expectEqual(@as(u64, 5), c[0].file_id);
-}
-
-test "row format" {
-    var buf: [128]u8 = undefined;
-    var w: Io.Writer = .fixed(&buf);
-    var c = cand(1, "en", 2, 7);
-    c.hi = true;
-    c.downloads = 1200;
-    try formatRow(&w, c, false);
-    try std.testing.expectEqualStrings("[HASH] [en] [HI] 1200 dl · rel", w.buffered());
-
-    w = .fixed(&buf);
-    c = cand(2, "ko", 1, 9);
-    c.ai = true;
-    c.fps = 25;
-    c.fps_mismatch = true;
-    c.feature = "Show S01E02";
-    try formatRow(&w, c, true);
-    try std.testing.expectEqualStrings("[HASH?] [ko] [AI] 0 dl, 25 fps · Show S01E02 · rel", w.buffered());
-
-    w = .fixed(&buf);
-    try writeFps(&w, 23.976);
-    try std.testing.expectEqualStrings("23.98", w.buffered());
 }

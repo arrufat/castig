@@ -25,6 +25,7 @@ const std = @import("std");
 const Io = std.Io;
 const av = @import("av");
 const extra = @import("av_extra.zig");
+const Reporter = @import("../reporter.zig").Reporter;
 const pipeline = @import("pipeline.zig");
 
 const VideoSample = struct { pts: i64, dts: i64, duration: i64, size: u32, pos: i64, key: bool };
@@ -102,7 +103,7 @@ const AudioCollector = struct {
     gpa: std.mem.Allocator,
     aac: *std.ArrayList(u8),
     samples: *std.ArrayList(AacSample),
-    node: std.Progress.Node,
+    progress: ?Reporter,
     time_base: av.Rational,
     done_s: i64 = -1,
 
@@ -121,7 +122,7 @@ const AudioCollector = struct {
         const sec = extra.av_rescale_q(pkt.pts, self.time_base, extra.seconds);
         if (sec > self.done_s) {
             self.done_s = sec;
-            self.node.completeOne();
+            if (self.progress) |p| p.step(1);
         }
     }
 };
@@ -385,13 +386,13 @@ const ChunkResult = struct {
 };
 
 /// Encodes one chunk on its own demuxer, decoder and encoder.
-fn encodeChunk(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, node: std.Progress.Node, result: *ChunkResult) void {
-    encodeChunkInner(gpa, path, chunk, node, result) catch |err| {
+fn encodeChunk(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, progress: ?Reporter, result: *ChunkResult) void {
+    encodeChunkInner(gpa, path, chunk, progress, result) catch |err| {
         result.err = err;
     };
 }
 
-fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, node: std.Progress.Node, result: *ChunkResult) !void {
+fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, progress: ?Reporter, result: *ChunkResult) !void {
     const in = try pipeline.Input.open(gpa, path);
     defer in.deinit();
     extra.discardOthers(in.ic, &.{in.audio_index});
@@ -399,7 +400,7 @@ fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, node
     const enc = try pipeline.openStereoAacEncoder(in.dec);
     defer enc.free();
 
-    var collector: AudioCollector = .{ .gpa = gpa, .aac = &result.aac, .samples = &result.samples, .node = node, .time_base = enc.time_base };
+    var collector: AudioCollector = .{ .gpa = gpa, .aac = &result.aac, .samples = &result.samples, .progress = progress, .time_base = enc.time_base };
     var ctx = try pipeline.AudioCtx.init(in.dec, enc, in_tb, 0, AudioCollector.cb, &collector);
     defer ctx.deinit();
     // ~1 s of whole frames on each side of the slice (see above); the open
@@ -520,7 +521,7 @@ pub const UnsuitableError = error{
 /// Builds the virtual MP4 for `path`. An `UnsuitableError` means the source
 /// cannot be served this way (no video, unreliable byte positions, ...).
 /// The audio is encoded on `audio_jobs` cores at once.
-pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatContext) !*VMp4 {
+pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatContext, progress: ?Reporter) !*VMp4 {
     var ic_adopted = false; // by the VideoReader, which then owns it
     defer if (!ic_adopted) ic.close_input();
 
@@ -568,10 +569,8 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatCon
     // The audio may end before the container does; plan on its own length.
     const audio_s: ?f64 = if (in_audio.duration != av.NOPTS_VALUE) extra.toSeconds(in_audio.duration, in_audio.time_base) else duration;
 
-    const root = std.Progress.start(io, .{});
-    defer root.end();
-    const node = root.start("preparing seekable mp4 (seconds)", if (duration) |d| @intFromFloat(d) else 0);
-    defer node.end();
+    if (progress) |p| p.begin("preparing seekable mp4 (seconds)", if (duration) |d| @intFromFloat(d) else 0);
+    defer if (progress) |p| p.end();
 
     const chunks = try planChunks(gpa, enc.sample_rate, enc.frame_size, audio_s orelse 0, audioJobs(audio_s));
     defer gpa.free(chunks);
@@ -586,7 +585,7 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatCon
     var sweep: VideoSweep = .{ .ic = ic, .video_index = video_index, .is_bmff = is_bmff, .gpa = gpa, .video = &video };
     var group: Io.Group = .init;
     defer group.cancel(io);
-    for (chunks, results) |c, *r| group.async(io, encodeChunk, .{ gpa, path, c, node, r });
+    for (chunks, results) |c, *r| group.async(io, encodeChunk, .{ gpa, path, c, progress, r });
     group.async(io, VideoSweep.run, .{&sweep});
     try group.await(io);
     if (sweep.err) |err| return err;

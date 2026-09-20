@@ -21,6 +21,8 @@ const http = @import("serve/server.zig");
 const delivery = @import("serve/delivery.zig");
 const subs = @import("subs/lookup.zig");
 
+const log = std.log.scoped(.cast);
+
 /// Where the side-loaded subtitle track comes from.
 pub const Subtitles = union(enum) {
     /// A sidecar next to the video, when there is one.
@@ -135,7 +137,7 @@ pub const Session = struct {
 
         if (local) {
             Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
-                std.debug.print("cannot read {s}: {s}\n", .{ opts.source, @errorName(err) });
+                log.warn("cannot read {s}: {s}", .{ opts.source, @errorName(err) });
                 return error.SourceUnreadable;
             };
             const p = try pipeline.plan(arena, opts.source);
@@ -144,18 +146,18 @@ pub const Session = struct {
             defer if (probed) |ic| ic.close_input();
             duration = p.duration;
             if (p.video_unsupported) {
-                std.debug.print("warning: {s} video is not castable and video transcoding is not implemented; trying direct\n", .{p.video_codec});
+                log.warn("{s} video is not castable and video transcoding is not implemented; trying direct", .{p.video_codec});
             }
             if (p.direct or p.video_unsupported) {
                 s.target = try s.routes.addFile(content_type);
             } else switch (opts.remux) {
                 .auto, .hls => {
-                    std.debug.print("remuxing {s} audio to aac (hls)\n", .{p.audio_codec});
+                    log.info("remuxing {s} audio to aac (hls)", .{p.audio_codec});
                     probed = null;
                     s.target = try s.routes.addHls(p.ic);
                 },
                 .stream => {
-                    std.debug.print("remuxing {s} audio to aac (fragmented mp4, no seek)\n", .{p.audio_codec});
+                    log.info("remuxing {s} audio to aac (fragmented mp4, no seek)", .{p.audio_codec});
                     s.target = try s.routes.addStream();
                 },
                 .mp4 => {
@@ -166,7 +168,7 @@ pub const Session = struct {
             try s.routes.addEmbeddedSubtitles(p.subtitles);
             if (sub_source == null) sub_source = try subs.resolve(env, opts.source, want_download, p.fps);
         } else if (want_download) {
-            std.debug.print("--subs auto needs a local file\n", .{});
+            log.warn("--subs auto needs a local file", .{});
         }
         // The side-loaded track starts enabled; embedded tracks are advertised off.
         if (sub_source) |sub| try s.routes.addSideloaded(sub);
