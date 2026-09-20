@@ -59,8 +59,9 @@ pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32, wanted: ?[]cons
     const deadline = timeout.toDeadline(io);
 
     var devices: std.ArrayList(Device) = .empty;
-    errdefer freeDevices(gpa, devices.items);
+    // Reverse order: the strings go first, while the list still holds them.
     errdefer devices.deinit(gpa);
+    errdefer freeDevices(gpa, devices.items);
     var packet: [max_packet]u8 = undefined;
 
     while (true) {
