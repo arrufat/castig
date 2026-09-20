@@ -66,8 +66,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // Rendered from the library root, so the pages are the API and not the
-    // CLI entry point. Autodoc loads its sources over HTTP: serve zig-out/docs
-    // rather than opening index.html from disk.
+    // CLI entry point.
     const docs_obj = b.addObject(.{ .name = "castig", .root_module = castig });
     const docs_install = b.addInstallDirectory(.{
         .source_dir = docs_obj.getEmittedDocs(),
@@ -76,6 +75,26 @@ pub fn build(b: *std.Build) void {
     });
     const docs_step = b.step("docs", "Render the API documentation to zig-out/docs");
     docs_step.dependOn(&docs_install.step);
+
+    // Autodoc loads its sources over HTTP, so the pages cannot be opened from
+    // disk: this step serves them and opens a browser, the way `zig std` does.
+    // It runs until interrupted, which is why rendering has a step of its own.
+    const docs_server = b.addExecutable(.{
+        .name = "docs-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/docs_server.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const serve_docs = b.addRunArtifact(docs_server);
+    serve_docs.step.dependOn(&docs_install.step);
+    serve_docs.addDirectoryArg(docs_obj.getEmittedDocs());
+    serve_docs.addPassthruArgs(); // `zig build docs-serve -- 8080` pins the port.
+    serve_docs.stdio = .inherit;
+
+    const docs_serve_step = b.step("docs-serve", "Serve the API documentation and open a browser");
+    docs_serve_step.dependOn(&serve_docs.step);
 
     // Both modules: the CLI files are reachable only from the exe.
     const test_step = b.step("test", "Run unit tests");

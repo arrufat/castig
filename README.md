@@ -107,9 +107,10 @@ zig build -fsys=ffmpeg                                        # link system ffmp
 ffmpeg, which is much faster and gives you hardware codecs, at the cost of a
 dynamic binary. The bindings target ffmpeg 8.1 and work with 9.0.
 
-Autodoc loads its sources over HTTP, so browse the `docs` output with a
-static server such as `python -m http.server -d zig-out/docs` rather than
-opening `index.html` from disk.
+Autodoc loads its sources over HTTP and cannot be opened from disk, so
+`zig build docs-serve` serves the rendered pages on an ephemeral port and
+opens a browser, like `zig std` does; `zig build docs-serve -- 8080` pins the
+port and it runs until interrupted.
 
 castig is a Zig module as well as a program: `src/root.zig` is the library
 and `src/cli/` the command-line front end, so another project can depend on
