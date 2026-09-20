@@ -423,7 +423,20 @@ fn playbackPanel() !void {
     dvui.label(@src(), "{s}", .{state.note()}, .{ .expand = .horizontal });
 
     if (app.cast.progress.fraction()) |done| {
-        dvui.label(@src(), "{s}", .{app.cast.progress.label}, .{});
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer row.deinit();
+
+            // The label names what is counted, so the count belongs beside it.
+            dvui.label(@src(), "{s}", .{app.cast.progress.label}, .{ .gravity_y = 0.5 });
+            const counted = app.cast.progress.done.load(.monotonic);
+            const total = app.cast.progress.total.load(.monotonic);
+            if (total > 0) {
+                dvui.label(@src(), "{d} / {d}", .{ counted, total }, .{ .gravity_x = 1, .gravity_y = 0.5 });
+            } else {
+                dvui.label(@src(), "{d}", .{counted}, .{ .gravity_x = 1, .gravity_y = 0.5 });
+            }
+        }
         dvui.progress(@src(), .{ .percent = done }, .{ .expand = .horizontal, .min_size_content = .{ .h = 10 } });
         // Nothing arrives from the receiver while it prepares, so the bar
         // asks for the frames that move it.
