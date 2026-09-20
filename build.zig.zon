@@ -8,6 +8,13 @@
             .url = "git+https://github.com/allyourcodebase/ffmpeg#115295bda8cc25b2f468c0aa674891af706ab437",
             .hash = "ffmpeg-8.1.1-6-zT7QA6DlUQQylPHt_7XeseL7QHuOZ5bWgxovMUNNtMG8",
         },
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui?ref=0.17.x#1c183d957e797b1fc5ca660b64562544e181bec1",
+            .hash = "dvui-0.6.0-dev-AQFJme9wAwFWoB3WUPXa_W5aEcMOHeNKwhuu7UNTnbFp",
+            // Lazy, so the sources (~15 MB with SDL and freetype) arrive on
+            // the first build rather than with a clone.
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

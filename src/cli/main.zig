@@ -30,6 +30,7 @@ const usage =
     \\  seek <device> <pos>   jump to <pos>: seconds, m:ss, h:mm:ss, or +N / -N relative
     \\  rate <device> <x>     set playback speed, 0.5 to 2.0
     \\  stop <device>         stop whatever app is running on the receiver
+    \\  ui                    open the window (runs castigui, built by `zig build gui`)
     \\  subs <file> [--lang en,ko] [--auto]
     \\                        download a subtitle from OpenSubtitles.com next to
     \\                        the file: pick from a ranked list, or with --auto
@@ -64,7 +65,7 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     std.debug.print(prefix ++ format ++ "\n", args);
 }
 
-const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, subs, help };
+const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, subs, ui, help };
 
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
@@ -82,6 +83,7 @@ pub fn main(init: std.process.Init) u8 {
         error.NoCredentials,
         error.NoSubtitles,
         error.NoConfidentMatch,
+        error.NoWindow,
         => return 1,
         error.ConnectionClosed => {
             std.debug.print("the receiver closed the connection\n", .{});
@@ -220,10 +222,44 @@ fn run(init: std.process.Init) !void {
             if (saved.remaining) |n| try out.print(" ({d} downloads left today)", .{n});
             try out.writeAll("\n");
         },
+        .ui => {
+            if (args.len != 2) fail(usage);
+            try out.flush();
+            return openWindow(env);
+        },
         .help => try out.writeAll(usage),
     }
 
     try out.flush();
+}
+
+const gui_exe = "castigui";
+
+/// `castig ui` runs the window as a separate program, so the CLI links
+/// nothing of it: the copy next to this binary first, else one on PATH.
+fn openWindow(env: castig.Env) !void {
+    const io = env.io;
+    const sibling = sibling: {
+        const dir = std.process.executableDirPathAlloc(io, env.arena) catch break :sibling null;
+        break :sibling try Io.Dir.path.join(env.arena, &.{ dir, gui_exe });
+    };
+
+    var spawned: ?std.process.Child = null;
+    for ([_]?[]const u8{ sibling, gui_exe }) |candidate| {
+        const path = candidate orelse continue;
+        spawned = std.process.spawn(io, .{ .argv = &.{path} }) catch continue;
+        break;
+    }
+    var child = spawned orelse {
+        std.debug.print("cannot run {s}: build it with `zig build gui`\n", .{gui_exe});
+        return error.NoWindow;
+    };
+
+    const term = try child.wait(io);
+    if (!term.success()) {
+        std.debug.print("{s} {f}\n", .{ gui_exe, term });
+        return error.NoWindow;
+    }
 }
 
 fn fail(msg: []const u8) noreturn {

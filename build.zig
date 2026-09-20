@@ -101,4 +101,38 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Module{ castig, exe_mod }) |mod| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     }
+
+    // The window: a second shell over the same library, behind its own
+    // step, so `zig build` still compiles just the CLI.
+    const gui_step = b.step("gui", "Build the castig window");
+    if (b.lazyDependency("dvui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .sdl3,
+    })) |dvui_dep| {
+        const gui_mod = b.createModule(.{
+            .root_source_file = b.path("src/gui/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .strip = optimize != .debug,
+            .imports = &.{
+                .{ .name = "castig", .module = castig },
+                .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+            },
+        });
+        const gui = b.addExecutable(.{
+            .name = "castigui",
+            .root_module = gui_mod,
+        });
+        gui_step.dependOn(&b.addInstallArtifact(gui, .{}).step);
+
+        const run_gui = b.addRunArtifact(gui);
+        run_gui.step.dependOn(gui_step);
+        run_gui.addPassthruArgs();
+        const run_gui_step = b.step("run-gui", "Run the castig window");
+        run_gui_step.dependOn(&run_gui.step);
+
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mod })).step);
+    }
 }

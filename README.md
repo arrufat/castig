@@ -17,6 +17,7 @@ castig pause|play <device>
 castig seek <device> <pos>       # 90, 1:30, 1:02:03, +30, -10
 castig rate <device> <x>         # 0.5 to 2.0
 castig subs <file>               # download a subtitle next to the video
+castig ui                        # open the window (see below)
 ```
 
 `<device>` is an IP, `ip:port`, or any part of a name shown by `ls`. The
@@ -85,6 +86,19 @@ The credentials are stored in plain text; keep the file at mode 0600 and out
 of public dotfiles. `OPENSUBTITLES_API_KEY`, `OPENSUBTITLES_USERNAME` and
 `OPENSUBTITLES_PASSWORD` override it.
 
+## The window
+
+`castig ui` opens a window with the same things in it: the receivers found on
+the network, the file to cast with its stream list and verdict, the subtitle
+and remux choices, and, once it is playing, the position, the transport
+controls and the speed. It is a separate binary, `castigui`, built with
+`zig build gui`; `castig ui` runs the copy next to it, or one on PATH.
+
+The window is [dvui](https://github.com/david-vanderson/dvui) over SDL3, both
+compiled in, so it stays a single file like the CLI. The library does the
+work on its own thread and the window draws what it reports, which is why a
+long mp4 preparation shows a progress bar instead of freezing.
+
 ## Building
 
 The project pins a Zig version in `build.zig.zon`; with
@@ -96,7 +110,12 @@ zig build                 # debug build, compiles ffmpeg from source the first t
 zig build test            # unit tests
 zig build docs            # API documentation into zig-out/docs
 zig build run -- ls
+zig build gui             # the window, into zig-out/bin/castigui
+zig build run-gui
 ```
+
+`zig build` builds the CLI alone; only `gui` compiles SDL3 and the rest of
+the window. Their sources are fetched with the other dependencies.
 
 ```sh
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl   # static release
@@ -112,9 +131,10 @@ Autodoc loads its sources over HTTP and cannot be opened from disk, so
 opens a browser, like `zig std` does; `zig build docs-serve -- 8080` pins the
 port and it runs until interrupted.
 
-castig is a Zig module as well as a program: `src/root.zig` is the library
-and `src/cli/` the command-line front end, so another project can depend on
-castig and `@import("castig")`.
+castig is a Zig module as well as a program: `src/root.zig` is the library,
+`src/cli/` the command-line front end and `src/gui/` the window, each a
+module that can only reach the library through `@import("castig")`, so
+another project can depend on castig the same way.
 
 ## License
 
