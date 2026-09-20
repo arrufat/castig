@@ -47,11 +47,22 @@ const parse_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 
 pub const Error = error{
     FrameTooLarge,
-    RequestFailed,
+    /// The receiver said no: a denied cast, or an error reply to our request.
+    ReceiverRefused,
+    /// The receiver answered something we cannot read.
+    BadReply,
     LaunchFailed,
     ConnectionClosed,
+    /// The app has no media loaded.
     NoMedia,
 };
+
+/// A MEDIA_STATUS we could not read. Logged here so the failure is never
+/// silent, whatever the caller does with the error.
+fn badMediaStatus() error{BadReply} {
+    log.warn("receiver sent a MEDIA_STATUS we cannot read", .{});
+    return error.BadReply;
+}
 
 pub const Channel = struct {
     io: Io,
@@ -197,7 +208,7 @@ pub const Channel = struct {
     /// Sends `payload` (a pointer to a struct with a `requestId` field) and
     /// waits for the reply that carries the same id. Unrelated messages in
     /// between are dropped. An error reply (LAUNCH_ERROR, LOAD_FAILED, ...)
-    /// is reported on stderr and returned as `error.RequestFailed`.
+    /// is logged and returned as `error.ReceiverRefused`.
     pub fn request(ch: *Channel, arena: std.mem.Allocator, destination: []const u8, namespace: []const u8, payload: anytype, expected_type: []const u8) !Reply {
         ch.request_id += 1;
         payload.requestId = ch.request_id;
@@ -213,14 +224,14 @@ pub const Channel = struct {
                     log.info("waiting for the cast to be allowed on the device...", .{});
                 } else if (std.mem.eql(u8, status, "USER_NOT_ALLOWED")) {
                     log.warn("the cast was denied on the device", .{});
-                    return error.RequestFailed;
+                    return error.ReceiverRefused;
                 }
                 continue;
             }
             if (reply.requestId != ch.request_id) continue;
             if (std.mem.eql(u8, reply.type, expected_type)) return reply;
             log.warn("receiver answered {s}{s}{s}", .{ reply.type, if (reply.reason != null) ": " else "", reply.reason orelse "" });
-            return error.RequestFailed;
+            return error.ReceiverRefused;
         }
     }
 
@@ -261,7 +272,7 @@ pub const Channel = struct {
     fn parseStatus(arena: std.mem.Allocator, reply: Reply) !Status {
         return std.json.parseFromValueLeaky(Status, arena, reply.status, parse_options) catch |err| {
             log.warn("unexpected RECEIVER_STATUS shape: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            return error.BadReply;
         };
     }
 
@@ -399,7 +410,7 @@ pub const Channel = struct {
             req.activeTrackIds = opts.active_track_ids;
         }
         const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
+        return mediaStatusFrom(arena, reply) orelse badMediaStatus();
     }
 
     /// The first entry of a MEDIA_STATUS reply, or null if it has none.
@@ -419,19 +430,19 @@ pub const Channel = struct {
     pub fn setPlaybackRate(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, rate: f64) !MediaStatus {
         var req: SetPlaybackRate = .{ .mediaSessionId = media_session_id, .playbackRate = rate };
         const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
+        return mediaStatusFrom(arena, reply) orelse badMediaStatus();
     }
 
     pub fn mediaCommand(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, kind: []const u8) !MediaStatus {
         var req: MediaCommand = .{ .type = kind, .mediaSessionId = media_session_id };
         const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
+        return mediaStatusFrom(arena, reply) orelse badMediaStatus();
     }
 
     pub fn seek(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, seconds: f64) !MediaStatus {
         var req: Seek = .{ .mediaSessionId = media_session_id, .currentTime = seconds };
         const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
+        return mediaStatusFrom(arena, reply) orelse badMediaStatus();
     }
 };
 

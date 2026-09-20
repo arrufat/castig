@@ -17,6 +17,11 @@ const opensubtitles = @import("opensubtitles.zig");
 const log = std.log.scoped(.subs);
 
 pub const Candidate = opensubtitles.Candidate;
+/// The language an explicit subtitle path claims, e.g. `Movie.en.srt`.
+pub const languageOf = release.languageOf;
+
+/// A subtitle file to side-load, and the language it is in when known.
+pub const Subtitle = struct { path: []const u8, lang: ?[]const u8 };
 
 pub const Options = struct {
     /// Overrides the configured language order.
@@ -61,7 +66,7 @@ pub const Lookup = struct {
             return error.NoCredentials;
         }
 
-        const stem = std.fs.path.stem(video);
+        const stem = Io.Dir.path.stem(video);
         const title = try release.guessTitle(arena, stem);
         const episode = release.parseEpisode(stem);
         const hash = release.moviehash(io, video) catch |err| blk: {
@@ -126,20 +131,20 @@ pub const Lookup = struct {
     fn save(l: Lookup, name: []const u8, bytes: []const u8) ![]const u8 {
         const io = l.env.io;
         const arena = l.env.arena;
-        const beside = try std.fs.path.join(arena, &.{ std.fs.path.dirname(l.video) orelse ".", name });
+        const beside = try Io.Dir.path.join(arena, &.{ Io.Dir.path.dirname(l.video) orelse ".", name });
         if (Io.Dir.cwd().writeFile(io, .{ .sub_path = beside, .data = bytes })) |_| return beside else |err| {
             log.debug("cannot write {s}: {s}", .{ beside, @errorName(err) });
         }
-        const dir = if (l.cfg.fallback_dir.len > 0) l.cfg.fallback_dir else try std.fs.path.join(arena, &.{ l.cfg.cache_dir, "subs" });
+        const dir = if (l.cfg.fallback_dir.len > 0) l.cfg.fallback_dir else try Io.Dir.path.join(arena, &.{ l.cfg.cache_dir, "subs" });
         log.warn("video dir not writable, saving to {s}", .{dir});
-        const path = try std.fs.path.join(arena, &.{ dir, name });
+        const path = try Io.Dir.path.join(arena, &.{ dir, name });
         Io.Dir.cwd().createDirPath(io, dir) catch |err| {
             log.warn("cannot create {s}: {s}", .{ dir, @errorName(err) });
-            return error.SourceUnreadable;
+            return error.SaveFailed;
         };
         Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch |err| {
             log.warn("cannot write {s}: {s}", .{ path, @errorName(err) });
-            return error.SourceUnreadable;
+            return error.SaveFailed;
         };
         return path;
     }
@@ -148,17 +153,17 @@ pub const Lookup = struct {
 /// The subtitle file to side-load for `video`: a sidecar next to it, else,
 /// with `download`, a confident OpenSubtitles match. Null when there is none,
 /// which is not an error: the cast goes on without a track.
-pub fn resolve(env: Env, video: []const u8, download: bool, fps: ?f64) !?[]const u8 {
+pub fn resolve(env: Env, video: []const u8, download: bool, fps: ?f64) !?Subtitle {
     const cfg = try config.load(env.arena, env.io, env.environ);
-    if (try release.findSidecar(env.arena, env.io, video, cfg.languages)) |path| {
-        log.info("subtitles: {s}", .{path});
-        return path;
+    if (try release.findSidecar(env.arena, env.io, video, cfg.languages)) |sidecar| {
+        log.info("subtitles: {s}", .{sidecar.path});
+        return .{ .path = sidecar.path, .lang = sidecar.lang orelse languageOf(sidecar.path) };
     }
     if (!download) return null;
 
     var l = Lookup.openWith(env, cfg, video, .{ .fps = fps }) catch |err| switch (err) {
         // Already explained; a cast without subtitles is still a cast.
-        error.NoCredentials, error.NoSubtitles, error.SourceUnreadable, error.RequestFailed => return null,
+        error.NoCredentials, error.NoSubtitles, error.SourceUnreadable, error.ApiFailed => return null,
         else => return err,
     };
     defer l.deinit();
@@ -167,11 +172,12 @@ pub fn resolve(env: Env, video: []const u8, download: bool, fps: ?f64) !?[]const
         log.warn("{s}; run `castig subs {s}` to pick from {d} result(s)", .{ l.doubt(), video, l.candidates.len });
         return null;
     };
+    const c = l.candidates[index];
     const saved = l.take(index) catch |err| switch (err) {
-        error.NoCredentials, error.RequestFailed => return null,
+        error.NoCredentials, error.ApiFailed, error.SaveFailed => return null,
         else => return err,
     };
-    return saved.path;
+    return .{ .path = saved.path, .lang = c.lang };
 }
 
 fn videoFps(gpa: std.mem.Allocator, path: []const u8) ?f64 {

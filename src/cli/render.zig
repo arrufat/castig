@@ -106,7 +106,7 @@ pub fn candidate(out: *Io.Writer, c: castig.subs.Candidate, multi_feature: bool)
 /// Two decimals with the trailing zeros dropped: 23.98, 24.
 pub fn fps(out: *Io.Writer, value: f64) !void {
     var buf: [32]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, "{d:.2}", .{value});
+    const s = try std.mem.print(&buf, "{d:.2}", .{value});
     try out.writeAll(std.mem.trimEnd(u8, std.mem.trimEnd(u8, s, "0"), "."));
 }
 

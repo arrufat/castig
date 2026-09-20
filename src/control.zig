@@ -65,7 +65,7 @@ fn open(env: Env, device: []const u8) !Playing {
     const st = try ch.getStatus(env.arena);
     const app = st.mediaApp() orelse {
         log.warn("nothing is playing on {f}", .{address});
-        return error.NoMedia;
+        return error.NothingPlaying;
     };
     try ch.connectTransport(app.transportId);
     const media = ch.getMediaStatus(env.arena, app.transportId) catch |err| switch (err) {

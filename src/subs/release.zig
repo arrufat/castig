@@ -145,16 +145,19 @@ fn parseCode(s: []const u8, max_a: usize, seps: []const u8, max_b: usize) ?Episo
 
 const sidecar_exts = [_][]const u8{ ".srt", ".vtt" };
 
+/// A sidecar file and the language its name claims, if any.
+pub const Sidecar = struct { path: []const u8, lang: ?[]const u8 };
+
 /// Sidecar subtitle paths to look for, in preference order:
 /// `<stem>.<lang>.srt|vtt` per configured language, then `<stem>.srt|vtt`.
-fn sidecarNames(arena: std.mem.Allocator, video: []const u8, languages: []const []const u8) ![]const []const u8 {
-    const dir = std.fs.path.dirname(video);
-    const stem = std.fs.path.stem(video);
-    var names: std.ArrayList([]const u8) = .empty;
+fn sidecarNames(arena: std.mem.Allocator, video: []const u8, languages: []const []const u8) ![]const Sidecar {
+    const dir = Io.Dir.path.dirname(video);
+    const stem = Io.Dir.path.stem(video);
+    var names: std.ArrayList(Sidecar) = .empty;
     for (languages) |lang| {
-        for (sidecar_exts) |ext| try names.append(arena, try joinName(arena, dir, stem, lang, ext));
+        for (sidecar_exts) |ext| try names.append(arena, .{ .path = try joinName(arena, dir, stem, lang, ext), .lang = lang });
     }
-    for (sidecar_exts) |ext| try names.append(arena, try joinName(arena, dir, stem, null, ext));
+    for (sidecar_exts) |ext| try names.append(arena, .{ .path = try joinName(arena, dir, stem, null, ext), .lang = null });
     return names.toOwnedSlice(arena);
 }
 
@@ -168,19 +171,30 @@ fn joinName(arena: std.mem.Allocator, dir: ?[]const u8, stem: []const u8, lang: 
 }
 
 /// The first sidecar of `sidecarNames` that exists, or null.
-pub fn findSidecar(arena: std.mem.Allocator, io: Io, video: []const u8, languages: []const []const u8) !?[]const u8 {
-    for (try sidecarNames(arena, video, languages)) |name| {
-        Io.Dir.cwd().access(io, name, .{}) catch continue;
-        return name;
+pub fn findSidecar(arena: std.mem.Allocator, io: Io, video: []const u8, languages: []const []const u8) !?Sidecar {
+    for (try sidecarNames(arena, video, languages)) |candidate| {
+        Io.Dir.cwd().access(io, candidate.path, .{}) catch continue;
+        return candidate;
     }
     return null;
+}
+
+/// The language an explicit subtitle path claims in `<stem>.<lang>.srt`, if
+/// the name has that shape and the code is one we can name.
+pub fn languageOf(path: []const u8) ?[]const u8 {
+    const stem = Io.Dir.path.stem(path);
+    const dot = std.mem.findScalarLast(u8, stem, '.') orelse return null;
+    const tag = stem[dot + 1 ..];
+    if (tag.len < 2 or tag.len > 3) return null;
+    for (tag) |c| if (!std.ascii.isAlphabetic(c)) return null;
+    return tag;
 }
 
 /// `<stem>.<lang>.<ext>`, the extension taken from the downloaded file's name
 /// (`.srt` when it has none).
 pub fn destName(arena: std.mem.Allocator, video: []const u8, lang: []const u8, remote_name: []const u8) ![]const u8 {
-    const ext = std.fs.path.extension(remote_name);
-    return joinName(arena, null, std.fs.path.stem(video), lang, if (ext.len > 1) ext else sidecar_exts[0]);
+    const ext = Io.Dir.path.extension(remote_name);
+    return joinName(arena, null, Io.Dir.path.stem(video), lang, if (ext.len > 1) ext else sidecar_exts[0]);
 }
 
 test "moviehash of synthetic chunks" {
@@ -225,9 +239,18 @@ test "sidecar and destination names" {
     const names = try sidecarNames(a, "/v/Movie.mkv", &.{ "en", "ko" });
     const want = [_][]const u8{ "/v/Movie.en.srt", "/v/Movie.en.vtt", "/v/Movie.ko.srt", "/v/Movie.ko.vtt", "/v/Movie.srt", "/v/Movie.vtt" };
     try std.testing.expectEqual(want.len, names.len);
-    for (want, names) |w, n| try std.testing.expectEqualStrings(w, n);
+    for (want, names) |w, n| try std.testing.expectEqualStrings(w, n.path);
+    try std.testing.expectEqualStrings("en", names[0].lang.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), names[4].lang);
     const bare = try sidecarNames(a, "Movie.mkv", &.{});
-    try std.testing.expectEqualStrings("Movie.srt", bare[0]);
+    try std.testing.expectEqualStrings("Movie.srt", bare[0].path);
     try std.testing.expectEqualStrings("Movie.en.SRT", try destName(a, "/v/Movie.mkv", "en", "x.SRT"));
     try std.testing.expectEqualStrings("Movie.en.srt", try destName(a, "/v/Movie.mkv", "en", "noext"));
+}
+
+test "language claimed by a subtitle name" {
+    try std.testing.expectEqualStrings("en", languageOf("/v/Movie.en.srt").?);
+    try std.testing.expectEqualStrings("eng", languageOf("Movie.eng.vtt").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), languageOf("/v/Movie.srt"));
+    try std.testing.expectEqual(@as(?[]const u8, null), languageOf("/v/Movie.2019.srt"));
 }

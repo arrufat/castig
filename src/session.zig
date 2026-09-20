@@ -129,8 +129,8 @@ pub const Session = struct {
         errdefer if (s.server) |server| server.stop();
 
         var duration: ?f64 = null;
-        var sub_source: ?[]const u8 = switch (opts.subtitles) {
-            .source => |p| p,
+        var sub_source: ?subs.Subtitle = switch (opts.subtitles) {
+            .source => |p| .{ .path = p, .lang = subs.languageOf(p) },
             .sidecar, .download => null,
         };
         const want_download = opts.subtitles == .download;
@@ -171,7 +171,7 @@ pub const Session = struct {
             log.warn("--subs auto needs a local file", .{});
         }
         // The side-loaded track starts enabled; embedded tracks are advertised off.
-        if (sub_source) |sub| try s.routes.addSideloaded(sub);
+        if (sub_source) |sub| try s.routes.addSideloaded(sub.path, sub.lang);
 
         resolved = true;
         s.address = try resolving.await(io);
@@ -192,7 +192,7 @@ pub const Session = struct {
         }
 
         s.extras = .{
-            .title = opts.title orelse (if (local) std.fs.path.basename(opts.source) else null),
+            .title = opts.title orelse (if (local) Io.Dir.path.basename(opts.source) else null),
             .text_tracks = s.routes.tracks.items,
             .active_track_ids = s.routes.active.items,
             .duration = duration,

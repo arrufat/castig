@@ -140,7 +140,7 @@ pub const Routes = struct {
 
     /// The source as it is, with Range support.
     pub fn addFile(s: *Routes, content_type: []const u8) !Target {
-        const path = try s.env.arena.print("/media{s}", .{std.fs.path.extension(s.source)});
+        const path = try s.env.arena.print("/media{s}", .{Io.Dir.path.extension(s.source)});
         try s.list.append(s.env.arena, .{
             .path = path,
             .body = .{ .file = .{ .content_type = content_type, .data = s.source } },
@@ -185,7 +185,9 @@ pub const Routes = struct {
     }
 
     /// The `--subs` / sidecar / downloaded track, enabled from the start.
-    pub fn addSideloaded(s: *Routes, sub: []const u8) !void {
+    /// A known language names it, so the receiver's menu reads "English"
+    /// rather than "Subtitles".
+    pub fn addSideloaded(s: *Routes, sub: []const u8, lang: ?[]const u8) !void {
         const arena = s.env.arena;
         const url = if (isUrl(sub)) sub else blk: {
             const srt = Io.Dir.cwd().readFileAlloc(s.env.io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
@@ -199,7 +201,12 @@ pub const Routes = struct {
             break :blk "/sub.vtt";
         };
         const id: u32 = @intCast(s.tracks.items.len + 1);
-        try s.tracks.append(arena, .{ .id = id, .url = url, .name = "Subtitles" });
+        try s.tracks.append(arena, .{
+            .id = id,
+            .url = url,
+            .language = lang orelse "und",
+            .name = if (lang) |l| language.name(l) else "Subtitles",
+        });
         try s.active.append(arena, id);
     }
 
@@ -244,7 +251,7 @@ pub const Routes = struct {
 /// whose contentType they do not recognise, so an unknown extension gets the
 /// most likely one rather than nothing.
 pub fn guessContentType(url: []const u8) []const u8 {
-    const ext = std.fs.path.extension(std.mem.sliceTo(url, '?'));
+    const ext = Io.Dir.path.extension(std.mem.sliceTo(url, '?'));
     const table = std.StaticStringMap([]const u8).initComptime(.{
         .{ ".mp4", "video/mp4" },
         .{ ".m4v", "video/mp4" },

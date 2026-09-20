@@ -16,7 +16,7 @@ pub fn pick(io: Io, out: *Io.Writer, l: castig.subs.Lookup) !?usize {
         if (first_feature == null) first_feature = c.feature_id else if (first_feature != c.feature_id) multi_feature = true;
     }
 
-    try out.print("subtitles for {s}", .{std.fs.path.basename(l.video)});
+    try out.print("subtitles for {s}", .{Io.Dir.path.basename(l.video)});
     if (l.fps) |f| {
         try out.writeAll(" (video ");
         try render.fps(out, f);

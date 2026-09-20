@@ -25,8 +25,8 @@ pub const Config = struct {
 /// The config file (absent is fine: defaults), then the env overrides.
 pub fn load(arena: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map) !Config {
     var cfg: Config = .{
-        .path = try std.fs.path.join(arena, &.{ try xdgDir(arena, environ, "XDG_CONFIG_HOME", ".config"), "castig", "config" }),
-        .cache_dir = try std.fs.path.join(arena, &.{ try xdgDir(arena, environ, "XDG_CACHE_HOME", ".cache"), "castig" }),
+        .path = try Io.Dir.path.join(arena, &.{ try xdgDir(arena, environ, "XDG_CONFIG_HOME", ".config"), "castig", "config" }),
+        .cache_dir = try Io.Dir.path.join(arena, &.{ try xdgDir(arena, environ, "XDG_CACHE_HOME", ".cache"), "castig" }),
     };
     const text = Io.Dir.cwd().readFileAlloc(io, cfg.path, arena, .limited(64 * 1024)) catch |err| switch (err) {
         error.FileNotFound => "",
@@ -42,8 +42,8 @@ pub fn load(arena: std.mem.Allocator, io: Io, environ: *const std.process.Enviro
 
 /// `$<name>` when set to an absolute path, else `$HOME/<fallback>`.
 fn xdgDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map, name: []const u8, fallback: []const u8) ![]const u8 {
-    if (environ.get(name)) |v| if (std.fs.path.isAbsolute(v)) return v;
-    return std.fs.path.join(arena, &.{ environ.get("HOME") orelse ".", fallback });
+    if (environ.get(name)) |v| if (Io.Dir.path.isAbsolute(v)) return v;
+    return Io.Dir.path.join(arena, &.{ environ.get("HOME") orelse ".", fallback });
 }
 
 pub fn parse(arena: std.mem.Allocator, text: []const u8, cfg: *Config) !void {

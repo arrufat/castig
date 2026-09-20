@@ -607,3 +607,102 @@ const MuxEmit = struct {
 test {
     std.testing.refAllDecls(@This());
 }
+
+// --- tests ------------------------------------------------------------------
+
+/// Encodes a second of silence with `codec_name` into an MPEG-TS buffer.
+/// MPEG-TS needs no seeking, so the muxer can write straight to memory.
+fn synthesise(gpa: std.mem.Allocator, codec_name: [*:0]const u8) ![]u8 {
+    const codec = try av.Codec.find_encoder_by_name(codec_name);
+    const enc = try av.Codec.Context.alloc(codec);
+    defer enc.free();
+    enc.sample_rate = 48000;
+    extra.av_channel_layout_default(&enc.ch_layout, 2);
+    enc.sample_fmt = .FLTP;
+    enc.bit_rate = 128_000;
+    enc.time_base = .{ .num = 1, .den = 48000 };
+    try enc.open(codec, null);
+
+    var buffer: Io.Writer.Allocating = .init(gpa);
+    errdefer buffer.deinit();
+    var sink: Sink = .{ .w = &buffer.writer };
+
+    const oc = try extra.allocOutputContext("mpegts");
+    defer av.avformat_free_context(oc);
+    const avio = try Sink.Avio.alloc(&sink, null);
+    defer av.IOContext.free(avio);
+    oc.pb = avio;
+    _ = try extra.addEncodedStream(oc, enc);
+    try extra.writeHeader(oc, null);
+
+    const frame = try av.Frame.alloc();
+    defer frame.free();
+    const pkt = try av.Packet.alloc();
+    defer pkt.free();
+
+    const frame_size: c_int = if (enc.frame_size > 0) enc.frame_size else 1024;
+    var pts: i64 = 0;
+    while (pts < enc.sample_rate) : (pts += frame_size) {
+        frame.unref();
+        frame.nb_samples = frame_size;
+        frame.format = .{ .sample = enc.sample_fmt };
+        try extra.copyChannelLayout(&frame.ch_layout, &enc.ch_layout);
+        frame.sample_rate = enc.sample_rate;
+        try extra.frameGetBuffer(frame);
+        for (0..@intCast(frame.ch_layout.nb_channels)) |ch| {
+            const plane = frame.data[ch];
+            @memset(plane[0..@intCast(frame.linesize[0])], 0);
+        }
+        frame.pts = pts;
+        try extra.sendFrame(enc, frame);
+        try drainEncoder(oc, enc, pkt);
+    }
+    try extra.sendFrame(enc, null);
+    try drainEncoder(oc, enc, pkt);
+    try extra.writeTrailer(oc);
+    return buffer.toOwnedSlice();
+}
+
+fn drainEncoder(oc: *av.FormatContext, enc: *av.Codec.Context, pkt: *av.Packet) !void {
+    while (true) {
+        extra.receivePacket(enc, pkt) catch |err| switch (err) {
+            error.WouldBlock, error.EndOfFile => return,
+            else => return err,
+        };
+        defer pkt.unref();
+        pkt.stream_index = 0;
+        try extra.writeFrame(oc, pkt);
+    }
+}
+
+/// Writes `bytes` into the test's temp directory and returns the path libav
+/// should open, which is relative to the cwd the test runner inherits.
+fn fixture(gpa: std.mem.Allocator, dir: *std.testing.TmpDir, name: []const u8, bytes: []const u8) ![]u8 {
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    return gpa.print(".zig-cache/tmp/{s}/{s}", .{ dir.sub_path, name });
+}
+
+test "plan: aac plays directly, ac3 has to be remuxed" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]struct { codec: [*:0]const u8, name: []const u8, direct: bool }{
+        .{ .codec = "aac", .name = "direct.ts", .direct = true },
+        .{ .codec = "ac3", .name = "remux.ts", .direct = false },
+    }) |c| {
+        const bytes = try synthesise(gpa, c.codec);
+        defer gpa.free(bytes);
+        const path = try fixture(gpa, &tmp, c.name, bytes);
+        defer gpa.free(path);
+
+        const p = try plan(gpa, path);
+        defer p.ic.close_input();
+        defer gpa.free(p.subtitles);
+
+        try std.testing.expectEqualStrings(std.mem.span(c.codec), p.audio_codec);
+        try std.testing.expectEqual(c.direct, p.direct);
+        try std.testing.expect(!p.video_unsupported);
+        try std.testing.expectEqual(@as(usize, 0), p.subtitles.len);
+    }
+}

@@ -114,9 +114,9 @@ pub const Client = struct {
         const sorted = try arena.dupe([]const u8, q.languages);
         std.mem.sort([]const u8, sorted, {}, stringLessThan);
         try params.append(arena, .{ .name = "languages", .value = try std.mem.join(arena, ",", sorted) });
-        if (q.hash) |h| try params.append(arena, .{ .name = "moviehash", .value = try std.fmt.allocPrint(arena, "{x:0>16}", .{h}) });
+        if (q.hash) |h| try params.append(arena, .{ .name = "moviehash", .value = try arena.print("{x:0>16}", .{h}) });
         if (q.title.len > 0) try params.append(arena, .{ .name = "query", .value = q.title });
-        const url = try std.fmt.allocPrint(arena, "{s}/subtitles?{s}", .{ api_default, try queryString(arena, params.items) });
+        const url = try arena.print("{s}/subtitles?{s}", .{ api_default, try queryString(arena, params.items) });
 
         const reply = try c.request(.GET, url, null, null);
         if (reply.status != .ok) return c.apiError("search failed", reply);
@@ -159,26 +159,26 @@ pub const Client = struct {
 
         var attempt: u8 = 0;
         const reply = while (attempt < 2) : (attempt += 1) {
-            const url = try std.fmt.allocPrint(arena, "{s}/download", .{c.base});
+            const url = try arena.print("{s}/download", .{c.base});
             const r = try c.request(.POST, url, body, c.token.?);
             if (r.status != .unauthorized) break r;
             try c.login();
         } else {
             log.warn("authentication failed", .{});
-            return error.RequestFailed;
+            return error.ApiFailed;
         };
 
         const dr = std.json.parseFromSliceLeaky(DownloadReply, arena, reply.body, parse_options) catch DownloadReply{};
         if (reply.status != .ok or dr.link == null) {
             if (dr.message) |m| log.warn("download refused: {s}{s}{s}", .{ m, if (dr.reset_time != null) "; quota resets " else "", dr.reset_time orelse "" }) else log.warn("download refused: HTTP {d}", .{@backingInt(reply.status)});
-            return error.RequestFailed;
+            return error.ApiFailed;
         }
         return .{ .bytes = try c.fetchBytes(dr.link.?), .file_name = dr.file_name orelse "", .remaining = dr.remaining };
     }
 
     fn request(c: *Client, method: std.http.Method, url: []const u8, payload: ?[]const u8, bearer: ?[]const u8) !Reply {
         var aw: Io.Writer.Allocating = .init(c.arena);
-        const auth: std.http.Client.Request.Headers.Value = if (bearer) |t| .{ .override = try std.fmt.allocPrint(c.arena, "Bearer {s}", .{t}) } else .default;
+        const auth: std.http.Client.Request.Headers.Value = if (bearer) |t| .{ .override = try c.arena.print("Bearer {s}", .{t}) } else .default;
         log.debug("{s} {s}", .{ @tagName(method), url });
         const res = c.http.fetch(.{
             .location = .{ .url = url },
@@ -196,12 +196,12 @@ pub const Client = struct {
             .response_writer = &aw.writer,
         }) catch |err| {
             log.warn("network error: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            return error.ApiFailed;
         };
         log.debug("  -> {d} ({d} bytes)", .{ @backingInt(res.status), aw.written().len });
         if (res.status == .too_many_requests) {
             log.warn("rate limited by OpenSubtitles, retry in a minute", .{});
-            return error.RequestFailed;
+            return error.ApiFailed;
         }
         return .{ .status = res.status, .body = aw.written() };
     }
@@ -212,19 +212,19 @@ pub const Client = struct {
         log.debug("GET {s}", .{url});
         const res = c.http.fetch(.{ .location = .{ .url = url }, .response_writer = &aw.writer }) catch |err| {
             log.warn("fetch failed: {s}", .{@errorName(err)});
-            return error.RequestFailed;
+            return error.ApiFailed;
         };
         if (res.status != .ok) {
             log.warn("fetch failed: HTTP {d}", .{@backingInt(res.status)});
-            return error.RequestFailed;
+            return error.ApiFailed;
         }
         return aw.written();
     }
 
-    fn apiError(c: *Client, what: []const u8, reply: Reply) error{RequestFailed} {
+    fn apiError(c: *Client, what: []const u8, reply: Reply) error{ApiFailed} {
         const msg = std.json.parseFromSliceLeaky(Message, c.arena, reply.body, parse_options) catch Message{};
         if (msg.message) |m| log.warn("{s}: {s}", .{ what, m }) else log.warn("{s}: HTTP {d}", .{ what, @backingInt(reply.status) });
-        return error.RequestFailed;
+        return error.ApiFailed;
     }
 
     fn login(c: *Client) !void {
@@ -237,7 +237,7 @@ pub const Client = struct {
         const reply = try c.request(.POST, api_default ++ "/login", body, null);
         if (reply.status == .unauthorized) {
             log.warn("bad credentials (check {s})", .{c.cfg.path});
-            return error.RequestFailed;
+            return error.ApiFailed;
         }
         if (reply.status != .ok) return c.apiError("login failed", reply);
         const lr = std.json.parseFromSliceLeaky(LoginReply, arena, reply.body, parse_options) catch return c.apiError("login failed", reply);
@@ -247,7 +247,7 @@ pub const Client = struct {
     }
 
     fn tokenPath(c: *Client) ![]const u8 {
-        return std.fs.path.join(c.arena, &.{ c.cfg.cache_dir, "token.json" });
+        return Io.Dir.path.join(c.arena, &.{ c.cfg.cache_dir, "token.json" });
     }
 
     fn loadSession(c: *Client) void {
@@ -283,7 +283,7 @@ fn sessionFresh(created: i64, now: i64) bool {
 fn apiBase(arena: std.mem.Allocator, host: []const u8) ![]const u8 {
     if (host.len == 0 or std.mem.find(u8, host, "api.opensubtitles.com") != null) return api_default;
     const scheme: []const u8 = if (std.mem.find(u8, host, "://") == null) "https://" else "";
-    return std.fmt.allocPrint(arena, "{s}{s}/api/v1", .{ scheme, host });
+    return arena.print("{s}{s}/api/v1", .{ scheme, host });
 }
 
 fn jsonFps(v: std.json.Value) ?f64 {
@@ -300,11 +300,11 @@ fn featureLabel(arena: std.mem.Allocator, fd: ?FeatureDetails) !?[]const u8 {
     const f = fd orelse return null;
     const title = f.title orelse return null;
     if (f.parent_title) |parent| if (std.mem.eql(u8, f.feature_type orelse "", "Episode")) {
-        if (f.season_number) |season| if (f.episode_number) |ep| return try std.fmt.allocPrint(arena, "{s} S{d:0>2}E{d:0>2}", .{ parent, season, ep });
-        if (f.episode_number) |ep| return try std.fmt.allocPrint(arena, "{s} E{d:0>2}", .{ parent, ep });
+        if (f.season_number) |season| if (f.episode_number) |ep| return try arena.print("{s} S{d:0>2}E{d:0>2}", .{ parent, season, ep });
+        if (f.episode_number) |ep| return try arena.print("{s} E{d:0>2}", .{ parent, ep });
         return parent;
     };
-    if (f.year) |y| return try std.fmt.allocPrint(arena, "{s} ({d})", .{ title, y });
+    if (f.year) |y| return try arena.print("{s} ({d})", .{ title, y });
     return title;
 }
 

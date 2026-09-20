@@ -69,7 +69,21 @@ const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, s
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
         // Already explained on stderr by the library.
-        error.InvalidRate, error.InvalidSeek, error.NoMedia, error.RequestFailed, error.DeviceNotFound, error.SourceUnreadable, error.NoCredentials, error.NoSubtitles => return 1,
+        // Already explained by whoever raised them.
+        error.InvalidRate,
+        error.InvalidSeek,
+        error.NoMedia,
+        error.NothingPlaying,
+        error.ReceiverRefused,
+        error.BadReply,
+        error.ApiFailed,
+        error.DeviceNotFound,
+        error.SourceUnreadable,
+        error.SaveFailed,
+        error.NoCredentials,
+        error.NoSubtitles,
+        error.NoConfidentMatch,
+        => return 1,
         error.ConnectionClosed => {
             std.debug.print("the receiver closed the connection\n", .{});
             return 1;
@@ -95,7 +109,6 @@ fn run(init: std.process.Init) !void {
         .io = io,
         .arena = arena,
         .gpa = init.gpa,
-        .out = out,
         .environ = init.environ_map,
         .progress = bar.reporter(),
     };
@@ -206,7 +219,7 @@ fn run(init: std.process.Init) !void {
             defer lookup.deinit();
             const index = if (auto) lookup.confident() orelse {
                 std.debug.print("{s}; {d} result(s) to pick from\n", .{ lookup.doubt(), lookup.candidates.len });
-                return error.NoSubtitles;
+                return error.NoConfidentMatch;
             } else (try prompt.pick(io, out, lookup)) orelse return;
 
             const saved = try lookup.take(index);
