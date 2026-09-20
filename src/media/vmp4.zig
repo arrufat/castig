@@ -24,7 +24,7 @@
 const std = @import("std");
 const Io = std.Io;
 const av = @import("av");
-const extra = @import("../av_extra.zig");
+const extra = @import("av_extra.zig");
 const pipeline = @import("pipeline.zig");
 
 const VideoSample = struct { pts: i64, dts: i64, duration: i64, size: u32, pos: i64, key: bool };

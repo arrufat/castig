@@ -15,9 +15,9 @@
 const std = @import("std");
 const Io = std.Io;
 const av = @import("av");
-const extra = @import("../av_extra.zig");
-const probe = @import("../probe.zig");
-const subtitles = @import("subtitles.zig");
+const extra = @import("av_extra.zig");
+const support = @import("support.zig");
+const webvtt = @import("webvtt.zig");
 
 const aac_bitrate = 192_000;
 
@@ -66,14 +66,14 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
             .VIDEO => if (!have_video) {
                 have_video = true;
                 video_codec = name;
-                video_ok = probe.videoSupport(name) != .transcode;
+                video_ok = support.videoSupport(name) != .transcode;
             },
             .AUDIO => if (!have_audio) {
                 have_audio = true;
                 audio_codec = name;
-                audio_ok = probe.audioSupport(name) == .direct;
+                audio_ok = support.audioSupport(name) == .direct;
             },
-            .SUBTITLE => if (subtitles.textIsSupported(name)) {
+            .SUBTITLE => if (support.textIsSupported(name)) {
                 try subs.append(gpa, .{
                     .index = i,
                     .language = try gpa.dupe(u8, extra.dictGet(st.metadata, "language") orelse "und"),
@@ -109,7 +109,7 @@ pub fn extractSubtitles(gpa: std.mem.Allocator, path: []const u8, indices: []con
     defer gpa.free(outs);
     @memset(outs, .empty);
     errdefer for (outs) |*out| out.deinit(gpa);
-    for (outs) |*out| try subtitles.writeVttHeader(gpa, out);
+    for (outs) |*out| try webvtt.writeVttHeader(gpa, out);
 
     const pkt = try av.Packet.alloc();
     defer pkt.free();
@@ -126,7 +126,7 @@ pub fn extractSubtitles(gpa: std.mem.Allocator, path: []const u8, indices: []con
         const codec = extra.codecName(extra.codecId(st.codecpar));
         const start_ms = extra.av_rescale_q(pkt.pts, st.time_base, extra.millis);
         const end_ms = if (pkt.duration > 0) extra.av_rescale_q(pkt.pts + pkt.duration, st.time_base, extra.millis) else start_ms + 2000;
-        try subtitles.writeVttCue(gpa, &outs[slot], start_ms, end_ms, codec, pkt.data[0..@intCast(pkt.size)]);
+        try webvtt.writeVttCue(gpa, &outs[slot], start_ms, end_ms, codec, pkt.data[0..@intCast(pkt.size)]);
     }
 
     const result = try gpa.alloc([]u8, indices.len);

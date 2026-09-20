@@ -13,9 +13,9 @@
 const std = @import("std");
 const Io = std.Io;
 const av = @import("av");
-const extra = @import("../av_extra.zig");
+const extra = @import("av_extra.zig");
 const pipeline = @import("pipeline.zig");
-const server = @import("../http/server.zig");
+const server = @import("../serve/server.zig");
 
 const log = std.log.scoped(.hls);
 

@@ -1,11 +1,12 @@
 const std = @import("std");
 const Io = std.Io;
 
-const commands = @import("commands.zig");
-const discovery = @import("discovery.zig");
-const probe = @import("probe.zig");
-const vmp4 = @import("media/vmp4.zig");
-const subs = @import("subs/subs.zig");
+const castig = @import("castig");
+const commands = castig.commands;
+const discovery = castig.discovery;
+const probe = castig.probe;
+const vmp4 = castig.vmp4;
+const subs = castig.subs;
 
 const usage =
     \\usage: castig <command> [args]
@@ -82,7 +83,7 @@ fn run(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
-    const env: commands.Env = .{ .io = io, .arena = arena, .gpa = init.gpa, .out = out, .environ = init.environ_map };
+    const env: castig.Env = .{ .io = io, .arena = arena, .gpa = init.gpa, .out = out, .environ = init.environ_map };
 
     if (args.len < 2) fail(usage);
     debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
@@ -167,8 +168,4 @@ fn run(init: std.process.Init) !void {
 fn fail(msg: []const u8) noreturn {
     std.debug.print("{s}", .{msg});
     std.process.exit(1);
-}
-
-test {
-    _ = @import("root.zig");
 }

@@ -4,30 +4,20 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const av = @import("av");
-const discovery = @import("discovery.zig");
-const channel = @import("cast/channel.zig");
+const discovery = @import("device/discovery.zig");
+const channel = @import("device/channel.zig");
 const Channel = channel.Channel;
-const http = @import("http/server.zig");
-const subtitles = @import("media/subtitles.zig");
+const http = @import("serve/server.zig");
+const webvtt = @import("media/webvtt.zig");
+const language = @import("language.zig");
+const Env = @import("env.zig").Env;
 const pipeline = @import("media/pipeline.zig");
 const hls = @import("media/hls.zig");
 const vmp4 = @import("media/vmp4.zig");
-const extra = @import("av_extra.zig");
-const subs_mod = @import("subs/subs.zig");
+const extra = @import("media/av_extra.zig");
+const subs_mod = @import("subs/lookup.zig");
 
 const log = std.log.scoped(.cast);
-
-/// What every command runs with. `arena` holds strings that live for the
-/// whole command; `gpa` backs the subsystems that allocate and free as they
-/// serve (channel, server, segmenter, mp4 assembler).
-pub const Env = struct {
-    io: Io,
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    out: *Io.Writer,
-    /// The process environment, for XDG directories and credential overrides.
-    environ: *const std.process.Environ.Map,
-};
 
 pub fn status(env: Env, device: []const u8) !void {
     const address = try discovery.resolve(env.io, env.gpa, device);
@@ -243,7 +233,7 @@ const Serving = struct {
             };
             try s.routes.append(arena, .{
                 .path = "/sub.vtt",
-                .body = .{ .bytes = .{ .content_type = "text/vtt", .data = try subtitles.srtToVtt(arena, srt) } },
+                .body = .{ .bytes = .{ .content_type = "text/vtt", .data = try webvtt.srtToVtt(arena, srt) } },
             });
             break :blk "/sub.vtt";
         };
@@ -270,7 +260,7 @@ const Serving = struct {
             const name = if (e.title.len > 0)
                 e.title
             else if (!std.mem.eql(u8, e.language, "und"))
-                subtitles.languageName(e.language)
+                language.name(e.language)
             else
                 "Subtitles";
             try tracks.append(arena, .{ .id = @intCast(tracks.items.len + 1), .url = path, .language = e.language, .name = name });

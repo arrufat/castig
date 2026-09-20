@@ -27,14 +27,29 @@ pub fn build(b: *std.Build) void {
         break :blk mod;
     } else ffmpeg_dep.module("av");
 
+    // The library. `b.addModule` publishes it, so another Zig project can
+    // depend on castig and import it by name.
+    const castig = b.addModule("castig", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "av", .module = av },
+        },
+    });
+
+    // The shell. Rooted in src/cli/, so a relative import of a library file is
+    // outside its module path and the compiler rejects it: the CLI can only
+    // reach the library through `@import("castig")`.
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .strip = optimize != .debug,
         .imports = &.{
-            .{ .name = "av", .module = av },
+            .{ .name = "castig", .module = castig },
         },
     });
 
@@ -53,16 +68,7 @@ pub fn build(b: *std.Build) void {
     // Rendered from the library root, so the pages are the API and not the
     // CLI entry point. Autodoc loads its sources over HTTP: serve zig-out/docs
     // rather than opening index.html from disk.
-    const lib_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "av", .module = av },
-        },
-    });
-    const docs_obj = b.addObject(.{ .name = "castig", .root_module = lib_mod });
+    const docs_obj = b.addObject(.{ .name = "castig", .root_module = castig });
     const docs_install = b.addInstallDirectory(.{
         .source_dir = docs_obj.getEmittedDocs(),
         .install_dir = .prefix,
@@ -71,8 +77,9 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Render the API documentation to zig-out/docs");
     docs_step.dependOn(&docs_install.step);
 
-    const tests = b.addTest(.{ .root_module = exe_mod });
-    const run_tests = b.addRunArtifact(tests);
+    // Both modules: the CLI files are reachable only from the exe.
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
+    for ([_]*std.Build.Module{ castig, exe_mod }) |mod| {
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+    }
 }

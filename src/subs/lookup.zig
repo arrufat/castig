@@ -4,8 +4,8 @@
 
 const std = @import("std");
 const Io = std.Io;
-const commands = @import("../commands.zig");
-const extra = @import("../av_extra.zig");
+const Env = @import("../env.zig").Env;
+const extra = @import("../media/av_extra.zig");
 /// Credentials and the language order.
 pub const config = @import("config.zig");
 const release = @import("release.zig");
@@ -26,7 +26,7 @@ pub const Options = struct {
 /// with `download`, an OpenSubtitles hash match. Null when there is none;
 /// a download that cannot happen is explained on stderr and is not an error,
 /// since the cast goes on without a track.
-pub fn resolve(env: commands.Env, video: []const u8, download: bool, fps: ?f64) !?[]const u8 {
+pub fn resolve(env: Env, video: []const u8, download: bool, fps: ?f64) !?[]const u8 {
     const cfg = try config.load(env.arena, env.io, env.environ);
     if (try release.findSidecar(env.arena, env.io, video, cfg.languages)) |path| {
         std.debug.print("subtitles: {s}\n", .{path});
@@ -42,12 +42,12 @@ pub fn resolve(env: commands.Env, video: []const u8, download: bool, fps: ?f64) 
 
 /// Returns the saved path, or null when the user declined the pick. Every
 /// failure is explained on stderr before its error.
-pub fn fetch(env: commands.Env, video: []const u8, opts: Options) !?[]const u8 {
+pub fn fetch(env: Env, video: []const u8, opts: Options) !?[]const u8 {
     const cfg = try config.load(env.arena, env.io, env.environ);
     return fetchWith(env, &cfg, video, opts);
 }
 
-fn fetchWith(env: commands.Env, cfg: *const config.Config, video: []const u8, opts: Options) !?[]const u8 {
+fn fetchWith(env: Env, cfg: *const config.Config, video: []const u8, opts: Options) !?[]const u8 {
     const io = env.io;
     const arena = env.arena;
 
@@ -122,7 +122,7 @@ fn pickAuto(cands: []const opensubtitles.Candidate, video: []const u8) ?usize {
 }
 
 /// Numbered list, best last so it sits right above the prompt; Enter takes it.
-fn pickInteractive(env: commands.Env, cands: []const opensubtitles.Candidate, video: []const u8, fps: ?f64) !?usize {
+fn pickInteractive(env: Env, cands: []const opensubtitles.Candidate, video: []const u8, fps: ?f64) !?usize {
     const out = env.out;
     var first_feature: ?u64 = null;
     var multi_feature = false;
@@ -167,7 +167,7 @@ fn pickInteractive(env: commands.Env, cands: []const opensubtitles.Candidate, vi
 }
 
 /// Next to the video, else `fallback_dir`, else `<cache_dir>/subs`.
-fn save(env: commands.Env, cfg: *const config.Config, video: []const u8, name: []const u8, bytes: []const u8) ![]const u8 {
+fn save(env: Env, cfg: *const config.Config, video: []const u8, name: []const u8, bytes: []const u8) ![]const u8 {
     const io = env.io;
     const arena = env.arena;
     const beside = try std.fs.path.join(arena, &.{ std.fs.path.dirname(video) orelse ".", name });

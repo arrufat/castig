@@ -1,4 +1,5 @@
-//! Subtitle conversion for the receiver, which only plays WebVTT sidecars.
+//! Subtitle text to WebVTT, which is the only sidecar format the receiver
+//! plays. Cues come either from a whole SubRip file or from demuxed packets.
 
 const std = @import("std");
 
@@ -39,37 +40,6 @@ pub fn srtToVtt(gpa: std.mem.Allocator, srt: []const u8) ![]u8 {
     // One newline ends the last cue; drop the blank lines a trailing CRLF adds.
     while (std.mem.endsWith(u8, out.items, "\n\n")) out.items.len -= 1;
     return out.toOwnedSlice(gpa);
-}
-
-/// Whether a libav subtitle codec name is a text format we can turn into
-/// WebVTT from its packets alone. Bitmap subtitles (PGS, DVB, VOBSUB, DVD)
-/// are images and cannot become text tracks.
-pub fn textIsSupported(codec: []const u8) bool {
-    return text_codecs.has(codec);
-}
-
-const text_codecs = std.StaticStringMap(void).initComptime(.{
-    .{"subrip"}, .{"srt"}, .{"text"}, .{"ass"}, .{"ssa"}, .{"mov_text"}, .{"webvtt"},
-});
-
-/// A human-readable name for an ISO 639 language code (as ffmpeg reports it,
-/// usually 639-2/B), falling back to the code itself for anything unlisted.
-pub fn languageName(code: []const u8) []const u8 {
-    const table = std.StaticStringMap([]const u8).initComptime(.{
-        .{ "eng", "English" },    .{ "ger", "German" },   .{ "deu", "German" },
-        .{ "fre", "French" },     .{ "fra", "French" },   .{ "spa", "Spanish" },
-        .{ "ita", "Italian" },    .{ "dut", "Dutch" },    .{ "nld", "Dutch" },
-        .{ "por", "Portuguese" }, .{ "rus", "Russian" },  .{ "pol", "Polish" },
-        .{ "vie", "Vietnamese" }, .{ "jpn", "Japanese" }, .{ "chi", "Chinese" },
-        .{ "zho", "Chinese" },    .{ "kor", "Korean" },   .{ "ara", "Arabic" },
-        .{ "hin", "Hindi" },      .{ "swe", "Swedish" },  .{ "nor", "Norwegian" },
-        .{ "dan", "Danish" },     .{ "fin", "Finnish" },  .{ "tur", "Turkish" },
-        .{ "gre", "Greek" },      .{ "ell", "Greek" },    .{ "heb", "Hebrew" },
-        .{ "tha", "Thai" },       .{ "cze", "Czech" },    .{ "ces", "Czech" },
-        .{ "hun", "Hungarian" },  .{ "rum", "Romanian" }, .{ "ron", "Romanian" },
-        .{ "ukr", "Ukrainian" },  .{ "cat", "Catalan" },  .{ "ind", "Indonesian" },
-    });
-    return table.get(code) orelse code;
 }
 
 /// Starts a WebVTT document.
@@ -199,20 +169,6 @@ test "vtt passes through" {
     const vtt = try srtToVtt(std.testing.allocator, "WEBVTT\n\n00:00.000 --> 00:01.000\nx\n");
     defer std.testing.allocator.free(vtt);
     try std.testing.expect(std.mem.startsWith(u8, vtt, "WEBVTT"));
-}
-
-test "language names" {
-    try std.testing.expectEqualStrings("English", languageName("eng"));
-    try std.testing.expectEqualStrings("German", languageName("ger"));
-    try std.testing.expectEqualStrings("xyz", languageName("xyz"));
-}
-
-test "text codec detection" {
-    try std.testing.expect(textIsSupported("subrip"));
-    try std.testing.expect(textIsSupported("ass"));
-    try std.testing.expect(textIsSupported("mov_text"));
-    try std.testing.expect(!textIsSupported("hdmv_pgs_subtitle"));
-    try std.testing.expect(!textIsSupported("dvb_subtitle"));
 }
 
 test "vtt cue from ass packet" {
