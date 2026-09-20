@@ -2,11 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const castig = @import("castig");
-const commands = castig.commands;
-const discovery = castig.discovery;
-const probe = castig.probe;
-const vmp4 = castig.vmp4;
-const subs = castig.subs;
+const render = @import("render.zig");
 
 const usage =
     \\usage: castig <command> [args]
@@ -37,9 +33,9 @@ const usage =
     \\                        the file: pick from a ranked list, or with --auto
     \\                        take a trusted hash match only. Needs an API key
     \\                        and login in ~/.config/castig/config (see README)
+    \\  help                  show this message
     \\
     \\<device> is an IP, IP:port, or part of a name shown by `ls`.
-    \\  help                  show this message
     \\
 ;
 
@@ -61,7 +57,7 @@ const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, s
 
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
-        // Already explained on stderr by the command.
+        // Already explained on stderr by the library.
         error.InvalidRate, error.InvalidSeek, error.NoMedia, error.RequestFailed, error.DeviceNotFound, error.SourceUnreadable, error.NoCredentials, error.NoSubtitles => return 1,
         error.ConnectionClosed => {
             std.debug.print("the receiver closed the connection\n", .{});
@@ -87,7 +83,7 @@ fn run(init: std.process.Init) !void {
 
     if (args.len < 2) fail(usage);
     debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
-    if (init.environ_map.get("CASTIG_AUDIO_JOBS")) |v| vmp4.audio_jobs = std.fmt.parseInt(usize, v, 10) catch null;
+    if (init.environ_map.get("CASTIG_AUDIO_JOBS")) |v| castig.vmp4.audio_jobs = std.fmt.parseInt(usize, v, 10) catch null;
 
     const cmd = if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))
         Command.help
@@ -96,7 +92,7 @@ fn run(init: std.process.Init) !void {
 
     switch (cmd) {
         .ls => {
-            var timeout_ms: u32 = discovery.default_timeout_ms;
+            var timeout_ms: u32 = castig.discovery.default_timeout_ms;
             var i: usize = 2;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
@@ -104,30 +100,51 @@ fn run(init: std.process.Init) !void {
                     timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch fail("--timeout expects a number of milliseconds\n");
                 } else fail(usage);
             }
-            try discovery.run(io, init.gpa, out, timeout_ms);
+            const found = try castig.discovery.discover(io, init.gpa, timeout_ms, null);
+            defer init.gpa.free(found);
+            defer castig.discovery.freeDevices(init.gpa, found);
+            try render.devices(out, found, timeout_ms);
         },
         .probe => {
             if (args.len != 3) fail(usage);
-            try probe.run(arena, out, args[2]);
+            const r = castig.probe.inspect(arena, args[2]) catch |err| {
+                std.debug.print("cannot open {s}: {s}\n", .{ args[2], @errorName(err) });
+                return error.SourceUnreadable;
+            };
+            try render.report(out, r);
         },
-        .status, .stop, .pause, .play => {
+        .status => {
             if (args.len != 3) fail(usage);
-            switch (cmd) {
-                inline .status, .stop, .pause, .play => |c| try @field(commands, @tagName(c))(env, args[2]),
+            try render.status(out, try castig.control.status(env, args[2]));
+        },
+        .stop => {
+            if (args.len != 3) fail(usage);
+            try render.stopped(out, try castig.control.stop(env, args[2]));
+        },
+        .pause, .play => {
+            if (args.len != 3) fail(usage);
+            const m = switch (cmd) {
+                .pause => try castig.control.pause(env, args[2]),
+                .play => try castig.control.play(env, args[2]),
                 else => unreachable,
-            }
+            };
+            try render.media(out, m);
         },
         .seek => {
             if (args.len != 4) fail(usage);
-            try commands.seek(env, args[2], args[3]);
+            try render.media(out, try castig.control.seek(env, args[2], args[3]));
         },
         .rate => {
             if (args.len != 4) fail(usage);
-            try commands.rate(env, args[2], args[3]);
+            const value = std.fmt.parseFloat(f64, args[3]) catch {
+                std.debug.print("rate must be a number\n", .{});
+                return error.InvalidRate;
+            };
+            try render.media(out, try castig.control.rate(env, args[2], value));
         },
         .cast => {
             if (args.len < 4) fail(usage);
-            var opts: commands.CastOptions = .{ .source = args[3] };
+            var opts: castig.session.Options = .{ .source = args[3] };
             var i: usize = 4;
             while (i < args.len) : (i += 1) {
                 const flag = args[i];
@@ -140,24 +157,26 @@ fn run(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, flag, "--subs")) {
                     opts.subtitles = if (std.mem.eql(u8, args[i], "auto")) .download else .{ .source = args[i] };
                 } else if (std.mem.eql(u8, flag, "--remux")) {
-                    opts.remux = std.meta.stringToEnum(commands.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
+                    opts.remux = std.meta.stringToEnum(castig.delivery.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
                 } else fail(usage);
             }
-            try commands.cast(env, args[2], opts);
+            const session = try castig.session.Session.start(env, args[2], opts);
+            defer session.deinit();
+            while (try session.next()) |e| try render.event(out, e);
         },
         .subs => {
             if (args.len < 3) fail(usage);
-            var opts: subs.Options = .{};
+            var opts: castig.subs.Options = .{};
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--auto")) {
                     opts.auto = true;
                 } else if (std.mem.eql(u8, args[i], "--lang") and i + 1 < args.len) {
                     i += 1;
-                    opts.languages = try subs.config.splitLanguages(arena, args[i]);
+                    opts.languages = try castig.subs.config.splitLanguages(arena, args[i]);
                 } else fail(usage);
             }
-            _ = try subs.fetch(env, args[2], opts);
+            _ = try castig.subs.fetch(env, args[2], opts);
         },
         .help => try out.writeAll(usage),
     }

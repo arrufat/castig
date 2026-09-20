@@ -1,80 +1,110 @@
-//! `castig probe <file>`: open a media file through libavformat, list its
-//! streams and say whether a default Cast receiver can play them as they are.
+//! What a media file contains and whether a receiver can play it as it is.
 //!
-//! The verdict is the input the media pipeline will use to choose between
-//! serving the file directly, remuxing with an audio transcode, or a full
-//! software transcode.
+//! The same verdict drives the delivery decision: play the file directly,
+//! remux with an audio transcode, or give up because the video would need a
+//! software transcode, which castig does not do.
 
 const std = @import("std");
-const Io = std.Io;
 const extra = @import("av_extra.zig");
 const support = @import("support.zig");
 
-pub fn run(gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8) !void {
-    const fc = extra.openInput(gpa, path) catch |err| {
-        std.debug.print("cannot open {s}: {s}\n", .{ path, @errorName(err) });
-        std.process.exit(1);
-    };
+pub const Kind = enum { video, audio, subtitle, other };
+
+pub const Stream = struct {
+    index: usize,
+    kind: Kind,
+    /// libav's name for the stream type, which is finer than `kind`:
+    /// "attachment" and "data" both land in `.other`.
+    type_name: []const u8,
+    codec: []const u8,
+    /// From container metadata, usually a three-letter ISO 639-2 code.
+    language: ?[]const u8,
+    /// How the receiver copes with this codec; null for `.other`.
+    support: ?support.Support = null,
+    video: ?struct { width: u32, height: u32, fps: f64 } = null,
+    audio: ?struct { channels: u32, sample_rate: u32 } = null,
+    /// A subtitle stream castig can turn into WebVTT; bitmap subtitles cannot.
+    text: bool = false,
+};
+
+pub const Report = struct {
+    path: []const u8,
+    container: []const u8,
+    duration: ?f64,
+    streams: []const Stream,
+    /// The worst support level across the streams of each kind, so a file
+    /// with one unplayable track is reported by that track.
+    video: ?support.Support = null,
+    audio: ?support.Support = null,
+    text_subs: usize = 0,
+    bitmap_subs: usize = 0,
+
+    pub fn castable(r: Report) bool {
+        return r.video != null or r.audio != null;
+    }
+};
+
+/// Opens `path`, reads its stream info and describes it. Strings taken from
+/// the container are duped into `gpa`; codec and container names are libav's
+/// own static ones.
+pub fn inspect(gpa: std.mem.Allocator, path: []const u8) !Report {
+    const fc = try extra.openInput(gpa, path);
     defer fc.close_input();
 
-    try out.print("{s}\n", .{path});
-    try out.print("  container: {s}", .{std.mem.span(fc.iformat.name)});
-    if (extra.durationSeconds(fc)) |secs| try out.print(", duration: {d:.1} s", .{secs});
-    try out.writeAll("\n");
-
-    var worst_video: ?support.Support = null;
-    var worst_audio: ?support.Support = null;
-    var text_subs: usize = 0;
-    var bitmap_subs: usize = 0;
+    var streams: std.ArrayList(Stream) = .empty;
+    errdefer streams.deinit(gpa);
+    var report: Report = .{
+        .path = path,
+        .container = std.mem.span(fc.iformat.name),
+        .duration = extra.durationSeconds(fc),
+        .streams = &.{},
+    };
 
     for (fc.streams[0..fc.nb_streams]) |st| {
         const par = st.codecpar;
         const codec = extra.codecName(extra.codecId(par));
-
-        try out.print("  #{d} {s} {s}", .{ st.index, extra.mediaTypeName(par.codec_type), codec });
-        if (extra.dictGet(st.metadata, "language")) |lang| try out.print(" [{s}]", .{lang});
-
-        switch (par.codec_type) {
-            .VIDEO => {
-                const fps = extra.streamFps(st) orelse 0;
-                try out.print(" {d}x{d} {d:.3} fps", .{ par.width, par.height, fps });
-                const s = support.videoSupport(codec);
-                try out.print(" -> {s}", .{s.label()});
-                worst_video = worse(worst_video, s);
+        const language = if (extra.dictGet(st.metadata, "language")) |l| try gpa.dupe(u8, l) else null;
+        var s: Stream = .{
+            .index = @intCast(st.index),
+            .kind = switch (par.codec_type) {
+                .VIDEO => .video,
+                .AUDIO => .audio,
+                .SUBTITLE => .subtitle,
+                else => .other,
             },
-            .AUDIO => {
-                try out.print(" {d} ch {d} Hz", .{ par.ch_layout.nb_channels, par.sample_rate });
-                const s = support.audioSupport(codec);
-                try out.print(" -> {s}", .{s.label()});
-                worst_audio = worse(worst_audio, s);
+            .type_name = extra.mediaTypeName(par.codec_type),
+            .codec = codec,
+            .language = language,
+        };
+        switch (s.kind) {
+            .video => {
+                s.video = .{
+                    .width = @intCast(par.width),
+                    .height = @intCast(par.height),
+                    .fps = extra.streamFps(st) orelse 0,
+                };
+                s.support = support.videoSupport(codec);
+                report.video = worse(report.video, s.support.?);
             },
-            .SUBTITLE => {
-                if (support.textIsSupported(codec)) {
-                    text_subs += 1;
-                    try out.writeAll(" -> webvtt");
-                } else {
-                    bitmap_subs += 1;
-                    try out.writeAll(" -> bitmap, burn-in only");
-                }
+            .audio => {
+                s.audio = .{
+                    .channels = @intCast(par.ch_layout.nb_channels),
+                    .sample_rate = @intCast(par.sample_rate),
+                };
+                s.support = support.audioSupport(codec);
+                report.audio = worse(report.audio, s.support.?);
             },
-            else => {},
+            .subtitle => {
+                s.text = support.textIsSupported(codec);
+                if (s.text) report.text_subs += 1 else report.bitmap_subs += 1;
+            },
+            .other => {},
         }
-        try out.writeAll("\n");
+        try streams.append(gpa, s);
     }
 
-    try out.writeAll("  verdict: ");
-    if (worst_video == null and worst_audio == null) {
-        try out.writeAll("nothing to cast\n");
-        return;
-    }
-    if (worst_video) |v| try out.print("video {s}", .{v.label()});
-    if (worst_audio) |a| {
-        if (worst_video != null) try out.writeAll(", ");
-        try out.print("audio {s}", .{a.label()});
-    }
-    if (text_subs > 0) try out.print(", {d} text subtitle track(s)", .{text_subs});
-    if (bitmap_subs > 0) try out.print(", {d} bitmap subtitle track(s)", .{bitmap_subs});
-    try out.writeAll("\n");
+    report.streams = try streams.toOwnedSlice(gpa);
+    return report;
 }
 
 /// The worst support level seen across the streams of one kind.

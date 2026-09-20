@@ -178,20 +178,6 @@ pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address
     return error.DeviceNotFound;
 }
 
-pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, timeout_ms: u32) !void {
-    const devices = try discover(io, gpa, timeout_ms, null);
-    defer gpa.free(devices);
-    defer freeDevices(gpa, devices);
-    if (devices.len == 0) {
-        try out.print("no cast devices answered within {d} ms\n", .{timeout_ms});
-        try out.writeAll("(check with `avahi-browse -rt _googlecast._tcp`; if devices show there, they ignore unicast-response queries)\n");
-        return;
-    }
-    for (devices) |d| {
-        try out.print("{s}\t{s}\t{f}\t{s}\n", .{ d.friendly_name, d.model, d.address, d.id });
-    }
-}
-
 test {
     std.testing.refAllDecls(@This());
 }

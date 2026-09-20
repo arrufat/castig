@@ -32,13 +32,16 @@ pub const av_extra = @import("media/av_extra.zig");
 
 /// The media server the receiver pulls from.
 pub const http = @import("serve/server.zig");
+/// The routes that serve one source, and what the receiver is told to load.
+pub const delivery = @import("serve/delivery.zig");
 
 /// Subtitle lookup: sidecars and OpenSubtitles.
 pub const subs = @import("subs/lookup.zig");
 
-/// Receiver-driving commands. Shell-shaped still; stage 2 splits it into a
-/// session iterator and one-shot controls.
-pub const commands = @import("commands.zig");
+/// One cast, from a source to the end of playback, as an event iterator.
+pub const session = @import("session.zig");
+/// Controlling whatever is already playing: status, stop, pause, seek, rate.
+pub const control = @import("control.zig");
 
 test {
     _ = Env;
@@ -56,5 +59,7 @@ test {
     _ = av_extra;
     _ = http;
     _ = subs;
-    _ = commands;
+    _ = session;
+    _ = control;
+    _ = delivery;
 }
