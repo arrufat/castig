@@ -170,30 +170,34 @@ const VideoReader = struct {
 
     fn locate(self: *VideoReader, pts: i64) !void {
         if (self.have and self.cur_pts == pts) return; // same sample, another slice
-        try self.advance(); // sequential fast path: the next packet is usually it
-        if (self.cur_pts == pts) return;
+        // Sequential fast path: the next packet is usually it. At end of file
+        // (a request for the tail leaves the reader there) it is a jump.
+        if (try self.advance() and self.cur_pts == pts) return;
         // A jump: seek to the keyframe at/before this PTS and scan forward.
         try self.ic.seek_frame(self.stream_index, pts, extra.AVSEEK_FLAG_BACKWARD);
-        self.have = false;
         var guard: usize = 0;
-        while (true) : (guard += 1) {
-            if (guard > 1_000_000) return error.SampleNotFound;
-            try self.advance();
+        while (try self.advance()) : (guard += 1) {
             if (self.cur_pts == pts) return;
+            if (guard > 1_000_000) break;
         }
+        return error.SampleNotFound;
     }
 
-    fn advance(self: *VideoReader) !void {
+    /// Reads the next video packet into `pkt`; false at end of file.
+    fn advance(self: *VideoReader) !bool {
         while (true) {
             self.pkt.unref();
             self.ic.read_frame(self.pkt) catch |err| switch (err) {
-                error.EndOfFile => return error.SampleNotFound,
+                error.EndOfFile => {
+                    self.have = false;
+                    return false;
+                },
                 else => return err,
             };
             if (self.pkt.stream_index != self.stream_index) continue;
             self.cur_pts = if (self.pkt.pts == av.NOPTS_VALUE) self.pkt.dts else self.pkt.pts;
             self.have = true;
-            return;
+            return true;
         }
     }
 };
