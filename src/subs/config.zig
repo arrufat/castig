@@ -80,9 +80,9 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, cfg: *Config) !void {
 /// blank a credential by accident.
 pub fn applyEnv(cfg: *Config, environ: *const std.process.Environ.Map) void {
     inline for (.{
-        .{ "CASTIG_OS_API_KEY", &cfg.api_key },
-        .{ "CASTIG_OS_USERNAME", &cfg.username },
-        .{ "CASTIG_OS_PASSWORD", &cfg.password },
+        .{ "OPENSUBTITLES_API_KEY", &cfg.api_key },
+        .{ "OPENSUBTITLES_USERNAME", &cfg.username },
+        .{ "OPENSUBTITLES_PASSWORD", &cfg.password },
     }) |over| {
         if (environ.get(over[0])) |v| if (v.len > 0) {
             over[1].* = v;
@@ -133,8 +133,8 @@ test "config parsing" {
 test "env overrides the file" {
     var map = std.process.Environ.Map.init(std.testing.allocator);
     defer map.deinit();
-    try map.put("CASTIG_OS_API_KEY", "ENVKEY");
-    try map.put("CASTIG_OS_PASSWORD", "");
+    try map.put("OPENSUBTITLES_API_KEY", "ENVKEY");
+    try map.put("OPENSUBTITLES_PASSWORD", "");
     var cfg: Config = .{ .api_key = "filekey", .username = "me", .password = "pw" };
     applyEnv(&cfg, &map);
     try std.testing.expectEqualStrings("ENVKEY", cfg.api_key);

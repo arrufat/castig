@@ -56,7 +56,7 @@ fn fetchWith(env: Env, cfg: *const config.Config, video: []const u8, opts: Optio
         return error.SourceUnreadable;
     };
     if (cfg.api_key.len == 0) {
-        std.debug.print("no api_key: set it in {s} or CASTIG_OS_API_KEY (see README)\n", .{cfg.path});
+        std.debug.print("no api_key: set it in {s} or OPENSUBTITLES_API_KEY (see README)\n", .{cfg.path});
         return error.NoCredentials;
     }
 

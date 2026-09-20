@@ -82,8 +82,8 @@ fallback_dir=
 ```
 
 The credentials are stored in plain text; keep the file at mode 0600 and out
-of public dotfiles. `CASTIG_OS_API_KEY`, `CASTIG_OS_USERNAME` and
-`CASTIG_OS_PASSWORD` override it.
+of public dotfiles. `OPENSUBTITLES_API_KEY`, `OPENSUBTITLES_USERNAME` and
+`OPENSUBTITLES_PASSWORD` override it.
 
 ## Building
 

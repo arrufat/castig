@@ -232,7 +232,7 @@ pub const Client = struct {
     fn login(c: *Client) !void {
         const arena = c.arena;
         if (c.cfg.username.len == 0 or c.cfg.password.len == 0) {
-            std.debug.print("no username/password: set them in {s} or CASTIG_OS_USERNAME/CASTIG_OS_PASSWORD\n", .{c.cfg.path});
+            std.debug.print("no username/password: set them in {s} or OPENSUBTITLES_USERNAME/OPENSUBTITLES_PASSWORD\n", .{c.cfg.path});
             return error.NoCredentials;
         }
         const body = try std.json.Stringify.valueAlloc(arena, .{ .username = c.cfg.username, .password = c.cfg.password }, .{});
