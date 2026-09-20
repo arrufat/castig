@@ -31,6 +31,16 @@ pub fn Task(comptime Result: type) type {
             self.arena.deinit();
         }
 
+        /// Cancels a call still running and hands back what it returned, so
+        /// a result that owns something can be closed.
+        pub fn cancel(self: *Self, io: Io) ?Result {
+            if (self.future) |*f| {
+                defer self.future = null;
+                return f.cancel(io);
+            }
+            return null;
+        }
+
         pub fn busy(self: *const Self) bool {
             return self.future != null;
         }

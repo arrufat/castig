@@ -15,6 +15,9 @@ pub const dvui_app: dvui.App = .{
         .size = .{ .w = 560, .h = 700 },
         .min_size = .{ .w = 420, .h = 520 },
         .title = "castig",
+        // An empty org keeps the remembered window geometry in
+        // ~/.local/share/castig instead of a dvui/castig below it.
+        .org = "",
     } },
     .initFn = init,
     .deinitFn = deinit,
@@ -32,7 +35,10 @@ pub const std_options: std.Options = .{
 /// themselves: only their warnings reach the terminal.
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
     if (level == .debug) return;
-    const library = scope == .cast;
+    const library = switch (scope) {
+        .cast, .subs, .http, .hls => true,
+        else => false,
+    };
     if (library) messages.add(level, format, args);
     if (library or level != .info) dvui.App.logFn(level, scope, format, args);
 }
@@ -116,6 +122,14 @@ const App = struct {
     subtitle_path: ?[:0]const u8 = null,
     remux: castig.delivery.Remux = .auto,
 
+    /// An OpenSubtitles search, open until the picker closes: the ranked
+    /// candidates and the HTTP client live as long as the `Lookup` does.
+    search: work.Task(anyerror!castig.subs.Lookup),
+    lookup: ?castig.subs.Lookup = null,
+    picking: bool = false,
+    /// One download at a time: each spends one of the day's allowance.
+    fetch: work.Task(anyerror!castig.subs.Saved),
+
     cast: Cast,
     /// Playback commands, each opening its own connection to whatever is
     /// playing.
@@ -150,6 +164,8 @@ fn init(win: *dvui.Window) !void {
         .examine = .init(process.gpa),
         .cast = .init(process.gpa),
         .control = .init(process.gpa),
+        .search = .init(process.gpa),
+        .fetch = .init(process.gpa),
     };
     castig.av_extra.quietLibav();
     try startScan();
@@ -160,6 +176,9 @@ fn deinit(_: *dvui.Window) void {
     app.scan.deinit(app.io);
     app.examine.deinit(app.io);
     app.control.deinit(app.io);
+    app.fetch.deinit(app.io);
+    closeSearch();
+    app.search.deinit(app.io);
     if (app.path) |p| app.gpa.free(p);
     if (app.subtitle_path) |p| app.gpa.free(p);
 }
@@ -194,6 +213,7 @@ fn frame() !dvui.App.Result {
     _ = dvui.separator(@src(), .{ .expand = .horizontal, .margin = dvui.Rect{ .y = 10, .h = 10 } });
     try playbackPanel();
     messagePanel();
+    try subtitlePanel();
 
     return .ok;
 }
@@ -214,6 +234,16 @@ fn collect() void {
     }
     if (app.control.collect(app.io)) |result| {
         result catch |err| std.log.err("{s}", .{@errorName(err)});
+    }
+    if (app.search.collect(app.io)) |result| {
+        // The library says on its way out why it found nothing.
+        app.lookup = result catch null;
+        // Closed while it searched: there is nothing to show it in.
+        if (app.lookup == null or !app.picking) closePicker();
+    }
+    if (app.fetch.collect(app.io)) |result| {
+        if (result) |saved| takeSaved(saved) catch |err| std.log.err("{s}", .{@errorName(err)})
+        else |err| std.log.err("{s}", .{@errorName(err)});
     }
     app.cast.poll(app.io);
 }
@@ -290,6 +320,11 @@ fn sourcePanel() !void {
         if (app.subtitles == .file) {
             const name = if (app.subtitle_path) |p| Io.Dir.path.basename(p) else "none chosen";
             dvui.label(@src(), "{s}", .{name}, .{ .gravity_y = 0.5 });
+        }
+
+        const searching = app.search.busy() or app.picking;
+        if (dvui.button(@src(), "Find ...", .{ .grayed = searching }, .{ .gravity_x = 1, .gravity_y = 0.5 }) and !searching) {
+            try startSearch();
         }
     }
     {
@@ -431,6 +466,161 @@ fn messagePanel() void {
     for (0..count) |i| {
         tl.format("{s}\n", .{lines[i][0..lens[i]]}, .{});
     }
+}
+
+/// A ranked OpenSubtitles search, shown as a list to pick from. The video's
+/// frame rate comes from the probe, so a candidate that disagrees is ranked
+/// down without reading the file twice.
+fn startSearch() !void {
+    const path = app.path orelse return;
+    if (app.fetch.busy()) return;
+    closePicker();
+    app.picking = true;
+    try app.search.start(app.io, app.win, castig.subs.Lookup.open, .{
+        castig.Env{
+            .io = app.io,
+            .arena = app.search.allocator(),
+            .gpa = app.gpa,
+            .environ = app.environ,
+        },
+        @as([]const u8, path),
+        castig.subs.Options{ .fps = videoFps() },
+    });
+}
+
+/// The frame rate of the probed video, when it has one.
+fn videoFps() ?f64 {
+    const report = app.report orelse return null;
+    for (report.streams) |st| if (st.video) |v| return v.fps;
+    return null;
+}
+
+/// Everything the search owns: the call still running, then the `Lookup` it
+/// left behind.
+fn closeSearch() void {
+    if (app.search.cancel(app.io)) |result| {
+        if (result) |found| {
+            var open = found;
+            open.deinit();
+        } else |_| {}
+    }
+    closePicker();
+}
+
+/// Ends the search: the client is the `Lookup`'s to close, and the arena
+/// behind the candidates is reset by the next search.
+fn closePicker() void {
+    if (app.lookup) |*l| l.deinit();
+    app.lookup = null;
+    app.picking = false;
+}
+
+/// What the download left behind: the file to side-load on the next cast.
+fn takeSaved(saved: castig.subs.Saved) !void {
+    const path = try app.gpa.dupeSentinel(u8, saved.path, 0);
+    if (app.subtitle_path) |p| app.gpa.free(p);
+    app.subtitle_path = path;
+    app.subtitles = .file;
+    if (saved.remaining) |n| {
+        std.log.info("saved {s} ({d} downloads left today)", .{ Io.Dir.path.basename(path), n });
+    } else {
+        std.log.info("saved {s}", .{Io.Dir.path.basename(path)});
+    }
+    closePicker();
+}
+
+fn subtitlePanel() !void {
+    if (!app.picking) return;
+
+    var win = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &app.picking }, .{
+        .min_size_content = .{ .w = 520, .h = 420 },
+        .max_size_content = .{ .w = 760, .h = 640 },
+    });
+    defer win.deinit();
+
+    const title = if (app.path) |p| Io.Dir.path.basename(p) else "subtitles";
+    var open = true;
+    // No way to close over a download: it is holding the `Lookup` this
+    // would free.
+    win.dragAreaSet(dvui.windowHeader(title, "", if (app.fetch.busy()) null else &open));
+    if (!open) {
+        closePicker();
+        return;
+    }
+
+    if (app.search.busy()) {
+        dvui.spinner(@src(), .{ .gravity_x = 0.5, .gravity_y = 0.5 });
+        dvui.label(@src(), "searching OpenSubtitles ...", .{}, .{ .gravity_x = 0.5 });
+        return;
+    }
+    // Before the candidates are read: the download mutates the `Lookup` it
+    // runs on, so this thread leaves it alone until it is over.
+    if (app.fetch.busy()) {
+        dvui.spinner(@src(), .{ .gravity_x = 0.5, .gravity_y = 0.5 });
+        dvui.label(@src(), "downloading ...", .{}, .{ .gravity_x = 0.5 });
+        return;
+    }
+    const candidates = if (app.lookup) |l| l.candidates else return;
+
+    dvui.label(@src(), "each download spends one of the day's allowance", .{}, .{ .expand = .horizontal });
+
+    var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
+    defer scroll.deinit();
+
+    // Only worth naming the film or episode when the results disagree about
+    // which one it is.
+    var feature: ?u64 = null;
+    var many = false;
+    for (candidates) |c| {
+        const id = c.feature_id orelse continue;
+        if (feature) |first| many = many or first != id else feature = id;
+    }
+
+    const arena = dvui.currentWindow().arena();
+    for (candidates, 0..) |c, i| {
+        if (try candidateButton(try describe(arena, c, many), i)) {
+            try app.fetch.start(app.io, app.win, take, .{ &app.lookup.?, i });
+        }
+    }
+}
+
+/// A full-width button with its label on the left, which `dvui.button`
+/// centres instead.
+fn candidateButton(label: []const u8, index: usize) !bool {
+    const opts: dvui.Options = .{ .id_extra = index, .expand = .horizontal };
+    var bw: dvui.ButtonWidget = undefined;
+    bw.init(@src(), .{}, opts);
+    bw.processEvents();
+    bw.drawBackground();
+    const clicked = bw.clicked();
+    dvui.labelNoFmt(@src(), label, .{ .align_x = 0 }, opts.strip().override(bw.style()).override(.{ .gravity_y = 0.5 }));
+    bw.drawFocus();
+    bw.deinit();
+    return clicked;
+}
+
+/// One candidate on one line: what vouches for it, then what it is.
+fn describe(arena: std.mem.Allocator, c: castig.subs.Candidate, many: bool) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    switch (c.hash) {
+        .voted => try w.writeAll("[HASH] "),
+        .match => try w.writeAll("[HASH?] "),
+        .none => {},
+    }
+    try w.print("[{s}]", .{c.lang});
+    if (c.hi) try w.writeAll(" [HI]");
+    if (c.ai) try w.writeAll(" [AI]");
+    try w.print(" {d} dl", .{c.downloads});
+    if (c.fps_mismatch) if (c.fps) |f| try w.print(", {d} fps", .{f});
+    try w.writeAll(" \u{b7} ");
+    if (many) if (c.feature) |f| try w.print("{s} \u{b7} ", .{f});
+    try w.writeAll(c.release);
+    return out.written();
+}
+
+fn take(lookup: *castig.subs.Lookup, index: usize) anyerror!castig.subs.Saved {
+    return lookup.take(index);
 }
 
 fn openFile() !void {

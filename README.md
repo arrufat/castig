@@ -94,6 +94,11 @@ and remux choices, and, once it is playing, the position, the transport
 controls and the speed. It is a separate binary, `castigui`, built with
 `zig build gui`; `castig ui` runs the copy next to it, or one on PATH.
 
+`Find ...` next to the subtitle choice is `castig subs` without the prompt:
+the ranked list of OpenSubtitles results, best first, one click to download
+it next to the video and side-load it on the next cast. It needs the same
+credentials, and spends the same daily allowance.
+
 The window is [dvui](https://github.com/david-vanderson/dvui) over SDL3, both
 compiled in, so it stays a single file like the CLI. The library does the
 work on its own thread and the window draws what it reports, which is why a
