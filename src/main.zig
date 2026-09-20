@@ -4,6 +4,7 @@ const Io = std.Io;
 const commands = @import("commands.zig");
 const discovery = @import("discovery.zig");
 const probe = @import("probe.zig");
+const vmp4 = @import("media/vmp4.zig");
 
 const usage =
     \\usage: castig <command> [args]
@@ -76,6 +77,7 @@ fn run(init: std.process.Init) !void {
 
     if (args.len < 2) fail(usage);
     debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
+    if (init.environ_map.get("CASTIG_AUDIO_JOBS")) |v| vmp4.audio_jobs = std.fmt.parseInt(usize, v, 10) catch null;
 
     const cmd = if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))
         Command.help

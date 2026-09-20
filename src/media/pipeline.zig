@@ -170,6 +170,7 @@ pub fn openStereoAacEncoder(dec: *const av.Codec.Context) !*av.Codec.Context {
     enc.time_base = .{ .num = 1, .den = dec.sample_rate };
     enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
     try enc.open(codec, null);
+    std.debug.assert(enc.frame_size > 0); // AAC frames are 1024 samples
     return enc;
 }
 
@@ -430,6 +431,18 @@ pub const AudioCtx = struct {
     converted_samples: c_int = 0,
     next_pts: i64,
     pts_set: bool = false,
+    /// Timestamp of the first decoded sample (encoder time base); the origin
+    /// every later pts counts from.
+    first_pts: i64 = 0,
+    /// Decoded samples to discard before encoding starts. The pts still
+    /// advance over them, so the output stays where it would be in a full
+    /// encode. Set before the first `feed`.
+    skip_samples: i64 = 0,
+    /// Only packets whose pts, counted from the first decoded sample, fall in
+    /// [emit_lo, emit_hi) reach `emit`. Lets a slice of the audio be encoded
+    /// with warm-up on both sides and only the slice kept.
+    emit_lo: i64 = std.math.minInt(i64),
+    emit_hi: i64 = std.math.maxInt(i64),
     in_time_base: av.Rational,
     emit: Emit,
     emit_ctx: *anyopaque,
@@ -470,6 +483,11 @@ pub const AudioCtx = struct {
         ctx.dec_frame.free();
     }
 
+    /// Samples consumed so far, counted from the first decoded one.
+    pub fn consumed(ctx: *const AudioCtx) i64 {
+        return ctx.next_pts - ctx.first_pts;
+    }
+
     /// Decodes one audio packet, emitting any AAC packets it completes.
     pub fn feed(ctx: *AudioCtx, pkt: *av.Packet) !void {
         try ctx.dec.send_packet(pkt);
@@ -496,9 +514,16 @@ pub const AudioCtx = struct {
                 // The encoder time base is 1/sample_rate, so this is a sample count.
                 const ts = frame.best_effort_timestamp;
                 if (ts != av.NOPTS_VALUE) ctx.next_pts = extra.av_rescale_q(ts, ctx.in_time_base, ctx.enc.time_base);
+                ctx.first_pts = ctx.next_pts;
                 ctx.pts_set = true;
             }
             try ctx.pushToFifo(frame);
+            if (ctx.skip_samples > 0) {
+                const drop: c_int = @intCast(@min(ctx.skip_samples, extra.av_audio_fifo_size(ctx.fifo)));
+                if (extra.av_audio_fifo_drain(ctx.fifo, drop) < 0) return error.FifoRead;
+                ctx.skip_samples -= drop;
+                ctx.next_pts += drop;
+            }
             try ctx.encodeFifo(false);
         }
     }
@@ -553,6 +578,8 @@ pub const AudioCtx = struct {
                 else => return err,
             };
             defer ctx.out_packet.unref();
+            const rel = ctx.out_packet.pts - ctx.first_pts;
+            if (rel < ctx.emit_lo or rel >= ctx.emit_hi) continue;
             try ctx.emit(ctx.emit_ctx, ctx.out_packet);
         }
     }

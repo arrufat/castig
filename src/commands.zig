@@ -198,7 +198,7 @@ const Serving = struct {
     /// std.Progress bar during the build pass, so `out` should be flushed.
     fn addMp4(s: *Serving, ic: *av.FormatContext) !Delivery {
         const vm = vmp4.build(s.env.gpa, s.env.io, s.source, ic) catch |err| switch (err) {
-            error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved => {
+            error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved, error.SeamMismatch => {
                 std.debug.print("note: this file cannot be made seekable without a copy ({s}); serving without seek.\n", .{@errorName(err)});
                 return s.addStream();
             },

@@ -42,8 +42,10 @@ pub fn toSeconds(ts: i64, tb: av.Rational) f64 {
     return @as(f64, @floatFromInt(ts)) * tb.q2d();
 }
 
-/// Tells the demuxer to skip every stream but `keep`, so `read_frame` never
-/// materialises their packets (the mov demuxer skips the bytes entirely).
+/// Tells the demuxer to skip every stream but `keep` (the mov demuxer skips
+/// the bytes entirely). Packets it buffered before the call, during stream
+/// probing, still come out of `read_frame`, so callers filter by
+/// `stream_index` as well.
 pub fn discardOthers(ic: *av.FormatContext, keep: []const usize) void {
     for (ic.streams[0..ic.nb_streams], 0..) |st, i| {
         st.discard = if (std.mem.findScalar(usize, keep, i) != null) .DEFAULT else .ALL;
@@ -160,6 +162,7 @@ pub extern fn av_audio_fifo_free(af: *AudioFifo) void;
 pub extern fn av_audio_fifo_write(af: *AudioFifo, data: [*]const ?*anyopaque, nb_samples: c_int) c_int;
 pub extern fn av_audio_fifo_read(af: *AudioFifo, data: [*]const ?*anyopaque, nb_samples: c_int) c_int;
 pub extern fn av_audio_fifo_size(af: *AudioFifo) c_int;
+pub extern fn av_audio_fifo_drain(af: *AudioFifo, nb_samples: c_int) c_int;
 
 // --- wrappers, returning av.Error through av.wrap --------------------------
 
