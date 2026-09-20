@@ -275,7 +275,8 @@ fn devicePanel() !void {
     dvui.label(@src(), "Device", .{}, .{ .gravity_y = 0.5 });
 
     if (app.scan.busy()) {
-        dvui.spinner(@src(), .{ .gravity_y = 0.5 });
+        // The default spinner is 50 across and would set the row's height.
+        dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 20, .h = 20 } });
         dvui.label(@src(), "scanning ...", .{}, .{ .gravity_y = 0.5 });
     } else if (app.devices.len == 0) {
         dvui.label(@src(), "none found", .{}, .{ .gravity_y = 0.5 });
