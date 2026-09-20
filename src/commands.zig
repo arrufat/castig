@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+const av = @import("av");
 const discovery = @import("discovery.zig");
 const channel = @import("cast/channel.zig");
 const Channel = channel.Channel;
@@ -11,39 +12,51 @@ const subtitles = @import("media/subtitles.zig");
 const pipeline = @import("media/pipeline.zig");
 const hls = @import("media/hls.zig");
 const vmp4 = @import("media/vmp4.zig");
+const extra = @import("av_extra.zig");
 
 const log = std.log.scoped(.cast);
 
-pub fn status(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8) !void {
-    const address = try discovery.resolve(io, arena, device);
-    const ch = try Channel.connect(io, arena, address);
+/// What every command runs with. `arena` holds strings that live for the
+/// whole command; `gpa` backs the subsystems that allocate and free as they
+/// serve (channel, server, segmenter, mp4 assembler).
+pub const Env = struct {
+    io: Io,
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+};
+
+pub fn status(env: Env, device: []const u8) !void {
+    const address = try discovery.resolve(env.io, env.gpa, device);
+    const ch = try Channel.connect(env.io, env.gpa, address);
     defer ch.deinit();
 
-    const st = try ch.getStatus(arena);
+    const st = try ch.getStatus(env.arena);
+    const out = env.out;
     try out.print("{f}\n", .{address});
-    try out.print("  volume: {d:.0}%{s}\n", .{ st.volume_level * 100, if (st.muted) " (muted)" else "" });
-    if (st.apps.len == 0) try out.writeAll("  no app running\n");
-    for (st.apps) |a| {
-        try out.print("  app: {s} ({s}){s}", .{ a.display_name, a.app_id, if (a.is_idle_screen) " idle screen" else "" });
-        if (a.status_text.len > 0) try out.print(" - {s}", .{a.status_text});
-        try out.print("\n       session {s}, transport {s}\n", .{ a.session_id, a.transport_id });
+    try out.print("  volume: {d:.0}%{s}\n", .{ st.volume.level * 100, if (st.volume.muted) " (muted)" else "" });
+    if (st.applications.len == 0) try out.writeAll("  no app running\n");
+    for (st.applications) |a| {
+        try out.print("  app: {s} ({s}){s}", .{ a.displayName, a.appId, if (a.isIdleScreen) " idle screen" else "" });
+        if (a.statusText.len > 0) try out.print(" - {s}", .{a.statusText});
+        try out.print("\n       session {s}, transport {s}\n", .{ a.sessionId, a.transportId });
     }
 }
 
-pub fn stop(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8) !void {
-    const address = try discovery.resolve(io, arena, device);
-    const ch = try Channel.connect(io, arena, address);
+pub fn stop(env: Env, device: []const u8) !void {
+    const address = try discovery.resolve(env.io, env.gpa, device);
+    const ch = try Channel.connect(env.io, env.gpa, address);
     defer ch.deinit();
 
-    const st = try ch.getStatus(arena);
+    const st = try ch.getStatus(env.arena);
     var stopped: usize = 0;
-    for (st.apps) |a| {
-        if (a.is_idle_screen) continue;
-        try ch.stopApp(arena, a.session_id);
-        try out.print("stopped {s}\n", .{a.display_name});
+    for (st.applications) |a| {
+        if (a.isIdleScreen) continue;
+        try ch.stopApp(env.arena, a.sessionId);
+        try env.out.print("stopped {s}\n", .{a.displayName});
         stopped += 1;
     }
-    if (stopped == 0) try out.writeAll("nothing to stop\n");
+    if (stopped == 0) try env.out.writeAll("nothing to stop\n");
 }
 
 /// How to deliver a file whose audio must be remuxed.
@@ -86,10 +99,6 @@ const Delivery = struct {
 const mp4_path = "/media.mp4";
 const mp4_type = "video/mp4";
 
-fn mp4Route(context: *const anyopaque, handle: @FieldType(http.Route.Dynamic, "handle")) http.Route {
-    return .{ .path = mp4_path, .body = .{ .dynamic = .{ .context = context, .handle = handle } } };
-}
-
 /// Streams a fragmented-MP4 (`--remux stream`) as it is muxed.
 const StreamCtx = struct { gpa: std.mem.Allocator, path: []const u8 };
 
@@ -98,7 +107,7 @@ fn streamHandle(context: *const anyopaque, request: *http.Request, _: []const u8
     if (request.head.method == .HEAD) return http.respondHead(request, mp4_type);
     var buf: [64 * 1024]u8 = undefined;
     var body = try http.beginStream(request, &buf, mp4_type);
-    pipeline.remuxWindow(c.gpa, c.path, 0, null, .fmp4, &body.writer) catch |err| {
+    pipeline.remuxFile(c.gpa, c.path, .fmp4, &body.writer) catch |err| {
         log.debug("stream aborted: {s}", .{@errorName(err)});
         return;
     };
@@ -115,59 +124,129 @@ fn vmp4Handle(context: *const anyopaque, request: *http.Request, _: []const u8) 
     try http.respondVirtual(request, mp4_type, vm.total, vm, vmp4ReadFn);
 }
 
-/// Registers the fragmented-MP4 live-stream route (instant, no seek). Used by
-/// `--remux stream` and as the `--remux mp4` fallback.
-fn addStreamRoute(arena: std.mem.Allocator, routes: *std.ArrayList(http.Route), source: []const u8) !Delivery {
-    const c = try arena.create(StreamCtx);
-    c.* = .{ .gpa = arena, .path = source };
-    try routes.append(arena, mp4Route(c, streamHandle));
-    return .{ .path = mp4_path, .content_type = mp4_type };
-}
-
-/// Registers the on-the-fly seekable-mp4 route, or the no-seek stream route
-/// if the file cannot be made seekable byte-exactly. Shows a std.Progress bar
-/// during the build pass, so `out` should be flushed first.
-fn addMp4Route(arena: std.mem.Allocator, io: Io, routes: *std.ArrayList(http.Route), source: []const u8) !Delivery {
-    const vm = vmp4.build(arena, io, source) catch |err| switch (err) {
-        error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved => {
-            std.debug.print("note: this file cannot be made seekable without a copy ({s}); serving without seek.\n", .{@errorName(err)});
-            return addStreamRoute(arena, routes, source);
-        },
-        else => return err,
-    };
-    try routes.append(arena, mp4Route(vm, vmp4Handle));
-    return .{ .path = mp4_path, .content_type = mp4_type };
-}
-
-fn addHlsRoute(arena: std.mem.Allocator, routes: *std.ArrayList(http.Route), source: []const u8) !Delivery {
-    const seg = try arena.create(hls.Segmenter);
-    seg.* = try hls.Segmenter.init(arena, source);
-    try routes.append(arena, .{
-        .path = hls.url_prefix,
-        .body = .{ .dynamic = .{ .context = seg, .handle = hls.handleRoute } },
-    });
-    return .{ .path = hls.url_prefix ++ hls.master_name, .content_type = hls.cast_content_type, .hls = true };
-}
-
-/// One embedded subtitle stream, converted to WebVTT the first time the
-/// receiver asks for it (scanning the source), then cached.
-const EmbSubCtx = struct {
+/// The text subtitle streams embedded in the source, all converted to WebVTT
+/// in one pass over the file the first time any of them is requested.
+const EmbeddedSubtitles = struct {
     gpa: std.mem.Allocator,
+    io: Io,
     path: []const u8,
-    stream_index: usize,
-    cached: ?[]const u8 = null,
+    indices: []const usize,
+    mutex: Io.Mutex = .init,
+    cached: ?[]const []u8 = null,
+
+    fn vtt(self: *EmbeddedSubtitles, slot: usize) ![]const u8 {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.cached == null) self.cached = try pipeline.extractSubtitles(self.gpa, self.path, self.indices);
+        return self.cached.?[slot];
+    }
+
+    fn deinit(self: *EmbeddedSubtitles) void {
+        if (self.cached) |tracks| {
+            for (tracks) |t| self.gpa.free(t);
+            self.gpa.free(tracks);
+        }
+    }
 };
 
+const EmbeddedSubtitleRoute = struct { subs: *EmbeddedSubtitles, slot: usize };
+
 fn embSubHandle(context: *const anyopaque, request: *http.Request, _: []const u8) anyerror!void {
-    const c: *EmbSubCtx = @ptrCast(@alignCast(@constCast(context)));
-    if (c.cached == null) {
-        c.cached = pipeline.extractSubtitle(c.gpa, c.path, c.stream_index) catch |err| {
-            log.debug("subtitle extract failed: {s}", .{@errorName(err)});
-            return request.respond("subtitle extract failed\n", .{ .status = .internal_server_error, .extra_headers = http.cors });
-        };
-    }
-    try http.respondBuffer(request, "text/vtt", c.cached.?);
+    const r: *const EmbeddedSubtitleRoute = @ptrCast(@alignCast(context));
+    const body = r.subs.vtt(r.slot) catch |err| {
+        log.debug("subtitle extract failed: {s}", .{@errorName(err)});
+        return request.respond("subtitle extract failed\n", .{ .status = .internal_server_error, .extra_headers = http.cors });
+    };
+    try http.respondBuffer(request, "text/vtt", body);
 }
+
+/// The routes of one cast and the gpa-owned state behind them. Route contexts
+/// live in the arena; the segmenter, mp4 assembler and subtitle cache are
+/// freed by `deinit`, after the server has stopped.
+const Serving = struct {
+    env: Env,
+    source: []const u8,
+    routes: std.ArrayList(http.Route) = .empty,
+    segmenter: ?*hls.Segmenter = null,
+    mp4: ?*vmp4.VMp4 = null,
+    embedded: ?*EmbeddedSubtitles = null,
+
+    fn deinit(s: *Serving) void {
+        if (s.segmenter) |seg| {
+            seg.deinit();
+            s.env.gpa.destroy(seg);
+        }
+        if (s.mp4) |vm| vm.deinit();
+        if (s.embedded) |e| e.deinit();
+    }
+
+    fn addRoute(s: *Serving, path: []const u8, context: *const anyopaque, handle: @FieldType(http.Route.Dynamic, "handle")) !void {
+        try s.routes.append(s.env.arena, .{ .path = path, .body = .{ .dynamic = .{ .context = context, .handle = handle } } });
+    }
+
+    /// The fragmented-MP4 live stream (instant, no seek). Used by `--remux
+    /// stream` and as the `--remux mp4` fallback.
+    fn addStream(s: *Serving) !Delivery {
+        const c = try s.env.arena.create(StreamCtx);
+        c.* = .{ .gpa = s.env.gpa, .path = s.source };
+        try s.addRoute(mp4_path, c, streamHandle);
+        return .{ .path = mp4_path, .content_type = mp4_type };
+    }
+
+    /// The on-the-fly seekable mp4, or the no-seek stream if the file cannot
+    /// be made seekable byte-exactly. Takes ownership of `ic`. Shows a
+    /// std.Progress bar during the build pass, so `out` should be flushed.
+    fn addMp4(s: *Serving, ic: *av.FormatContext) !Delivery {
+        const vm = vmp4.build(s.env.gpa, s.env.io, s.source, ic) catch |err| switch (err) {
+            error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved => {
+                std.debug.print("note: this file cannot be made seekable without a copy ({s}); serving without seek.\n", .{@errorName(err)});
+                return s.addStream();
+            },
+            else => return err,
+        };
+        errdefer vm.deinit();
+        try s.addRoute(mp4_path, vm, vmp4Handle);
+        s.mp4 = vm;
+        return .{ .path = mp4_path, .content_type = mp4_type };
+    }
+
+    /// On-demand HLS. Takes ownership of `ic`.
+    fn addHls(s: *Serving, ic: *av.FormatContext) !Delivery {
+        const seg = try s.env.gpa.create(hls.Segmenter);
+        errdefer s.env.gpa.destroy(seg);
+        seg.* = try hls.Segmenter.init(s.env.gpa, s.env.io, s.source, ic);
+        errdefer seg.deinit();
+        try s.addRoute(hls.url_prefix, seg, hls.handleRoute);
+        s.segmenter = seg;
+        return .{ .path = hls.url_prefix ++ hls.master_name, .content_type = hls.cast_content_type, .hls = true };
+    }
+
+    /// One route per embedded text subtitle stream, all extracted together.
+    fn addEmbeddedSubtitles(s: *Serving, streams: []const pipeline.SubtitleStream, tracks: *std.ArrayList(Channel.TextTrack)) !void {
+        if (streams.len == 0) return;
+        const arena = s.env.arena;
+        const indices = try arena.alloc(usize, streams.len);
+        for (streams, 0..) |e, i| indices[i] = e.index;
+        const subs = try arena.create(EmbeddedSubtitles);
+        subs.* = .{ .gpa = s.env.gpa, .io = s.env.io, .path = s.source, .indices = indices };
+        s.embedded = subs;
+
+        for (streams, 0..) |e, slot| {
+            const path = try arena.print("/embsub{d}.vtt", .{e.index});
+            const route = try arena.create(EmbeddedSubtitleRoute);
+            route.* = .{ .subs = subs, .slot = slot };
+            try s.addRoute(path, route, embSubHandle);
+            const name = if (e.title.len > 0)
+                e.title
+            else if (!std.mem.eql(u8, e.language, "und"))
+                subtitles.languageName(e.language)
+            else
+                "Subtitles";
+            try tracks.append(arena, .{ .id = @intCast(tracks.items.len + 1), .url = path, .language = e.language, .name = name });
+        }
+        std.debug.print("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu\n", .{streams.len});
+    }
+};
 
 /// Everything a LOAD needs besides the delivery.
 const LoadExtras = struct {
@@ -183,8 +262,8 @@ const Playback = struct { app: Channel.App, media: Channel.MediaStatus };
 fn startPlayback(ch: *Channel, arena: std.mem.Allocator, delivery: Delivery, extras: LoadExtras) !Playback {
     const st = try ch.getStatus(arena);
     const app = st.find(channel.default_media_receiver) orelse try ch.launch(arena, channel.default_media_receiver);
-    try ch.connectTransport(app.transport_id);
-    const media = try ch.load(arena, app.transport_id, .{
+    try ch.connectTransport(app.transportId);
+    const media = try ch.load(arena, app.transportId, .{
         .url = delivery.path,
         .content_type = delivery.content_type,
         .title = extras.title,
@@ -199,16 +278,24 @@ fn startPlayback(ch: *Channel, arena: std.mem.Allocator, delivery: Delivery, ext
 /// Launches the default media receiver, loads the source and follows
 /// playback until it ends. Local files are served from a built-in HTTP
 /// server for as long as the session lasts.
-pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, opts: CastOptions) !void {
-    const address = try discovery.resolve(io, arena, device);
+pub fn cast(env: Env, device: []const u8, opts: CastOptions) !void {
+    const io = env.io;
+    const arena = env.arena;
+    const out = env.out;
     const local = !isUrl(opts.source);
 
-    // Routes for whatever must be served locally.
-    var routes: std.ArrayList(http.Route) = .empty;
+    // Discovery waits on the network while the file is probed and prepared.
+    var resolving = io.async(discovery.resolve, .{ io, env.gpa, device });
+    var resolved = false;
+    defer if (!resolved) {
+        _ = resolving.cancel(io) catch {};
+    };
+
+    var serving: Serving = .{ .env = env, .source = opts.source };
+    defer serving.deinit();
     var text_tracks: std.ArrayList(Channel.TextTrack) = .empty;
     var active_tracks: std.ArrayList(u32) = .empty;
     var duration: ?f64 = null;
-    var embedded_subs: []const pipeline.SubtitleStream = &.{};
     const content_type = opts.content_type orelse guessContentType(opts.source);
     var delivery: Delivery = .{
         .path = opts.source,
@@ -223,41 +310,45 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             return error.SourceUnreadable;
         };
         const p = try pipeline.plan(arena, opts.source);
+        // The probed demuxer goes to the delivery that can reuse it.
+        var probed: ?*av.FormatContext = p.ic;
+        defer if (probed) |ic| ic.close_input();
         duration = p.duration;
-        embedded_subs = p.subtitles;
         if (p.video_unsupported) {
             std.debug.print("warning: {s} video is not castable and video transcoding is not implemented; trying direct\n", .{p.video_codec});
         }
         if (p.direct or p.video_unsupported) {
             delivery.path = try arena.print("/media{s}", .{std.fs.path.extension(opts.source)});
-            try routes.append(arena, .{
+            try serving.routes.append(arena, .{
                 .path = delivery.path,
                 .body = .{ .file = .{ .content_type = content_type, .data = opts.source } },
             });
         } else switch (opts.remux) {
             .auto, .hls => {
                 std.debug.print("remuxing {s} audio to aac (hls)\n", .{p.audio_codec});
-                delivery = try addHlsRoute(arena, &routes, opts.source);
+                probed = null;
+                delivery = try serving.addHls(p.ic);
             },
             .stream => {
                 std.debug.print("remuxing {s} audio to aac (fragmented mp4, no seek)\n", .{p.audio_codec});
-                delivery = try addStreamRoute(arena, &routes, opts.source);
+                delivery = try serving.addStream();
             },
             .mp4 => {
                 try out.flush();
-                delivery = try addMp4Route(arena, io, &routes, opts.source);
+                probed = null;
+                delivery = try serving.addMp4(p.ic);
             },
         }
+        try serving.addEmbeddedSubtitles(p.subtitles, &text_tracks);
     }
-    // The --subs track starts enabled. Embedded tracks are advertised off and
-    // extracted on demand, since each one costs a pass over the source.
+    // The --subs track starts enabled; embedded tracks are advertised off.
     if (opts.subtitles) |sub| {
         const url = if (isUrl(sub)) sub else blk: {
             const srt = Io.Dir.cwd().readFileAlloc(io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
                 std.debug.print("cannot read {s}: {s}\n", .{ sub, @errorName(err) });
                 return error.SourceUnreadable;
             };
-            try routes.append(arena, .{
+            try serving.routes.append(arena, .{
                 .path = "/sub.vtt",
                 .body = .{ .bytes = .{ .content_type = "text/vtt", .data = try subtitles.srtToVtt(arena, srt) } },
             });
@@ -267,37 +358,20 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         try text_tracks.append(arena, .{ .id = id, .url = url, .name = "Subtitles" });
         try active_tracks.append(arena, id);
     }
-    for (embedded_subs) |e| {
-        const id: u32 = @intCast(text_tracks.items.len + 1);
-        const path = try arena.print("/embsub{d}.vtt", .{e.index});
-        const ctx = try arena.create(EmbSubCtx);
-        ctx.* = .{ .gpa = arena, .path = opts.source, .stream_index = e.index };
-        try routes.append(arena, .{
-            .path = path,
-            .body = .{ .dynamic = .{ .context = ctx, .handle = embSubHandle } },
-        });
-        const name = if (e.title.len > 0)
-            e.title
-        else if (!std.mem.eql(u8, e.language, "und"))
-            subtitles.languageName(e.language)
-        else
-            "Subtitles";
-        try text_tracks.append(arena, .{ .id = id, .url = path, .language = e.language, .name = name });
-    }
-    if (embedded_subs.len > 0) {
-        std.debug.print("found {d} embedded subtitle track(s); pick one from the receiver's subtitle menu\n", .{embedded_subs.len});
-    }
+
+    resolved = true;
+    const address = try resolving.await(io);
 
     // Connect after the heavy work: the receiver drops a channel whose
     // heartbeat PINGs go unanswered during a long mp4 build.
-    var ch = try Channel.connect(io, arena, address);
+    var ch = try Channel.connect(io, env.gpa, address);
     defer ch.deinit();
 
     var server: ?*http.Server = null;
     defer if (server) |s| s.stop();
     var base: []const u8 = "";
-    if (routes.items.len > 0) {
-        const s = try http.Server.start(io, arena, routes.items);
+    if (serving.routes.items.len > 0) {
+        const s = try http.Server.start(io, env.gpa, serving.routes.items);
         server = s;
         var served_at = ch.localAddress();
         served_at.port = s.port;
@@ -319,7 +393,7 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
     var pb = try startPlayback(ch, arena, delivery, extras);
 
     // A scratch arena reset per message keeps a long session's memory bounded.
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var scratch = std.heap.ArenaAllocator.init(env.gpa);
     defer scratch.deinit();
 
     session: while (true) {
@@ -339,9 +413,9 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
             };
             if (!std.mem.eql(u8, msg.namespace, channel.ns_media)) continue;
             _ = scratch.reset(.retain_capacity);
-            const json = try Channel.parsePayload(scratch.allocator(), msg);
-            pb.media = Channel.mediaStatusFrom(json) orelse continue;
-            if (pb.media.player_state == .PLAYING) played = true;
+            const reply = Channel.parseReply(scratch.allocator(), msg) orelse continue;
+            pb.media = Channel.mediaStatusFrom(scratch.allocator(), reply) orelse continue;
+            if (pb.media.playerState == .PLAYING) played = true;
             try printMedia(out, pb.media);
             try out.flush();
         }
@@ -349,31 +423,31 @@ pub fn cast(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         // In auto mode a refused HLS load fails asynchronously (idleReason
         // ERROR) before ever playing, and the seekable mp4 is the fallback. The
         // build takes a while, so the idle channel is reopened afterwards.
-        const errored = pb.media.idle_reason == .ERROR;
+        const errored = pb.media.idleReason == .ERROR;
         if (!played and errored and opts.remux == .auto and delivery.hls and local) {
             std.debug.print("receiver refused HLS; falling back to seekable mp4 ...\n", .{});
             try out.flush();
             ch.deinit();
-            delivery = try addMp4Route(arena, io, &routes, opts.source);
+            delivery = try serving.addMp4(try extra.openInput(env.gpa, opts.source));
             delivery.path = try std.mem.concat(arena, u8, &.{ base, delivery.path });
-            if (server) |s| s.setRoutes(routes.items);
-            ch = try Channel.connect(io, arena, address);
+            if (server) |s| s.setRoutes(serving.routes.items);
+            ch = try Channel.connect(io, env.gpa, address);
             pb = try startPlayback(ch, arena, delivery, extras);
             continue :session;
         }
 
-        try out.print("finished: {s}\n", .{if (pb.media.idle_reason) |r| @tagName(r) else "?"});
+        try out.print("finished: {s}\n", .{if (pb.media.idleReason) |r| @tagName(r) else "?"});
         // Leave the receiver as we found it instead of parked on the idle screen.
-        ch.stopApp(arena, pb.app.session_id) catch {};
+        ch.stopApp(arena, pb.app.sessionId) catch {};
         return;
     }
 }
 
 fn printMedia(out: *Io.Writer, m: Channel.MediaStatus) !void {
-    try out.print("  {t} at {d:.1} s", .{ m.player_state, m.current_time });
-    if (m.duration) |d| try out.print(" of {d:.1} s", .{d});
-    if (m.playback_rate != 1) try out.print(" x{d:.2}", .{m.playback_rate});
-    if (m.idle_reason) |r| try out.print(" ({t})", .{r});
+    try out.print("  {t} at {d:.1} s", .{ m.playerState, m.currentTime });
+    if (m.duration()) |d| try out.print(" of {d:.1} s", .{d});
+    if (m.playbackRate != 1) try out.print(" x{d:.2}", .{m.playbackRate});
+    if (m.idleReason) |r| try out.print(" ({t})", .{r});
     try out.writeAll("\n");
 }
 
@@ -386,61 +460,61 @@ const Session = struct {
 };
 
 /// Connects to the app that is playing on the device and fetches its media status.
-fn openSession(io: Io, arena: std.mem.Allocator, device: []const u8) !Session {
-    const address = try discovery.resolve(io, arena, device);
-    const ch = try Channel.connect(io, arena, address);
+fn openSession(env: Env, device: []const u8) !Session {
+    const address = try discovery.resolve(env.io, env.gpa, device);
+    const ch = try Channel.connect(env.io, env.gpa, address);
     errdefer ch.deinit();
 
-    const st = try ch.getStatus(arena);
+    const st = try ch.getStatus(env.arena);
     const app = st.mediaApp() orelse {
         std.debug.print("nothing is playing on {f}\n", .{address});
         return error.NoMedia;
     };
-    try ch.connectTransport(app.transport_id);
-    const media = ch.getMediaStatus(arena, app.transport_id) catch |err| switch (err) {
+    try ch.connectTransport(app.transportId);
+    const media = ch.getMediaStatus(env.arena, app.transportId) catch |err| switch (err) {
         error.NoMedia => {
-            std.debug.print("{s} has no media loaded\n", .{app.display_name});
+            std.debug.print("{s} has no media loaded\n", .{app.displayName});
             return err;
         },
         else => return err,
     };
-    return .{ .ch = ch, .transport_id = app.transport_id, .media = media };
+    return .{ .ch = ch, .transport_id = app.transportId, .media = media };
 }
 
 /// Replies to commands carry no `media` object, so the duration learned at
 /// session start is kept.
 fn report(out: *Io.Writer, s: Session, reply: Channel.MediaStatus) !void {
     var m = reply;
-    if (m.duration == null) m.duration = s.media.duration;
+    if (m.media == null) m.media = s.media.media;
     try printMedia(out, m);
 }
 
-pub fn pause(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8) !void {
-    const s = try openSession(io, arena, device);
+pub fn pause(env: Env, device: []const u8) !void {
+    const s = try openSession(env, device);
     defer s.ch.deinit();
-    try report(out, s, try s.ch.mediaCommand(arena, s.transport_id, s.media.media_session_id, "PAUSE"));
+    try report(env.out, s, try s.ch.mediaCommand(env.arena, s.transport_id, s.media.mediaSessionId, "PAUSE"));
 }
 
-pub fn play(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8) !void {
-    const s = try openSession(io, arena, device);
+pub fn play(env: Env, device: []const u8) !void {
+    const s = try openSession(env, device);
     defer s.ch.deinit();
-    try report(out, s, try s.ch.mediaCommand(arena, s.transport_id, s.media.media_session_id, "PLAY"));
+    try report(env.out, s, try s.ch.mediaCommand(env.arena, s.transport_id, s.media.mediaSessionId, "PLAY"));
 }
 
 /// `spec` is absolute ("90", "1:30", "1:02:03") or relative ("+30", "-10").
-pub fn seek(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, spec: []const u8) !void {
-    const s = try openSession(io, arena, device);
+pub fn seek(env: Env, device: []const u8, spec: []const u8) !void {
+    const s = try openSession(env, device);
     defer s.ch.deinit();
 
-    var target = parseSeek(spec, s.media.current_time) catch {
+    var target = parseSeek(spec, s.media.currentTime) catch {
         std.debug.print("cannot parse position {s}\n", .{spec});
         return error.InvalidSeek;
     };
-    target = std.math.clamp(target, 0, s.media.duration orelse std.math.inf(f64));
-    try report(out, s, try s.ch.seek(arena, s.transport_id, s.media.media_session_id, target));
+    target = std.math.clamp(target, 0, s.media.duration() orelse std.math.inf(f64));
+    try report(env.out, s, try s.ch.seek(env.arena, s.transport_id, s.media.mediaSessionId, target));
 }
 
-pub fn rate(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u8, spec: []const u8) !void {
+pub fn rate(env: Env, device: []const u8, spec: []const u8) !void {
     const value = std.fmt.parseFloat(f64, spec) catch {
         std.debug.print("rate must be a number\n", .{});
         return error.InvalidRate;
@@ -449,9 +523,9 @@ pub fn rate(io: Io, arena: std.mem.Allocator, out: *Io.Writer, device: []const u
         std.debug.print("rate must be between 0.5 and 2.0\n", .{});
         return error.InvalidRate;
     }
-    const s = try openSession(io, arena, device);
+    const s = try openSession(env, device);
     defer s.ch.deinit();
-    try report(out, s, try s.ch.setPlaybackRate(arena, s.transport_id, s.media.media_session_id, value));
+    try report(env.out, s, try s.ch.setPlaybackRate(env.arena, s.transport_id, s.media.mediaSessionId, value));
 }
 
 pub fn parseSeek(spec: []const u8, current: f64) !f64 {

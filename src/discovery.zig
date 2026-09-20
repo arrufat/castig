@@ -27,6 +27,12 @@ pub const Device = struct {
     model: []const u8,
     address: net.Ip4Address,
 
+    pub fn deinit(d: Device, gpa: std.mem.Allocator) void {
+        gpa.free(d.id);
+        gpa.free(d.friendly_name);
+        gpa.free(d.model);
+    }
+
     /// Case-insensitive fragment of the friendly name or model, or a prefix
     /// of the id.
     pub fn matches(d: Device, spec: []const u8) bool {
@@ -51,6 +57,7 @@ pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32, wanted: ?[]cons
     const deadline = timeout.toDeadline(io);
 
     var devices: std.ArrayList(Device) = .empty;
+    errdefer freeDevices(gpa, devices.items);
     errdefer devices.deinit(gpa);
     var packet: [max_packet]u8 = undefined;
 
@@ -73,6 +80,10 @@ pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32, wanted: ?[]cons
     return devices.toOwnedSlice(gpa);
 }
 
+pub fn freeDevices(gpa: std.mem.Allocator, devices: []const Device) void {
+    for (devices) |d| d.deinit(gpa);
+}
+
 /// Appends the device announced by `packet`, if any and not seen yet.
 fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Address, devices: *std.ArrayList(Device)) !bool {
     var parser = try dns.Parser.init(packet);
@@ -82,16 +93,20 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
     var target_buf: [dns.max_name_len]u8 = undefined;
 
     var instance: ?[]const u8 = null;
+    defer if (instance) |i| gpa.free(i);
     var id: ?[]const u8 = null;
+    errdefer if (id) |i| gpa.free(i);
     var friendly: ?[]const u8 = null;
+    errdefer if (friendly) |f| gpa.free(f);
     var model: ?[]const u8 = null;
+    errdefer if (model) |m| gpa.free(m);
     var port: ?u16 = null;
     var ip: ?[4]u8 = null;
 
     while (try parser.next(&name_buf)) |rec| {
         switch (rec.type) {
             dns.Type.PTR => if (std.ascii.eqlIgnoreCase(rec.name, service)) {
-                instance = try gpa.dupe(u8, try parser.ptrTarget(rec, &target_buf));
+                if (instance == null) instance = try gpa.dupe(u8, try parser.ptrTarget(rec, &target_buf));
             },
             dns.Type.SRV => {
                 const s = try parser.srv(rec, &target_buf);
@@ -101,11 +116,11 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
             dns.Type.TXT => {
                 var it = dns.txtIterator(rec);
                 while (it.next()) |e| {
-                    if (std.mem.eql(u8, e.key, "id")) {
+                    if (std.mem.eql(u8, e.key, "id") and id == null) {
                         id = try gpa.dupe(u8, e.value);
-                    } else if (std.mem.eql(u8, e.key, "fn")) {
+                    } else if (std.mem.eql(u8, e.key, "fn") and friendly == null) {
                         friendly = try gpa.dupe(u8, e.value);
-                    } else if (std.mem.eql(u8, e.key, "md")) {
+                    } else if (std.mem.eql(u8, e.key, "md") and model == null) {
                         model = try gpa.dupe(u8, e.value);
                     }
                 }
@@ -118,18 +133,24 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
 
     // Not a cast announcement (or an answer to somebody else's question).
     if (id == null and port == null) return false;
-
     const bytes = ip orelse (from orelse return false).bytes;
+
     const dev: Device = .{
-        .id = id orelse "",
-        .friendly_name = friendly orelse instance orelse "?",
-        .model = model orelse "",
+        .id = id orelse try gpa.dupe(u8, ""),
+        .friendly_name = friendly orelse try gpa.dupe(u8, instance orelse "?"),
+        .model = model orelse try gpa.dupe(u8, ""),
         .address = .{ .bytes = bytes, .port = port orelse default_port },
     };
+    id = null;
+    friendly = null;
+    model = null;
 
     for (devices.items) |d| {
         const same_id = dev.id.len > 0 and std.mem.eql(u8, d.id, dev.id);
-        if (same_id or d.address.eql(dev.address)) return false;
+        if (same_id or d.address.eql(dev.address)) {
+            dev.deinit(gpa);
+            return false;
+        }
     }
     try devices.append(gpa, dev);
     return true;
@@ -151,6 +172,7 @@ pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address
 
     const devices = try discover(io, gpa, default_timeout_ms, spec);
     defer gpa.free(devices);
+    defer freeDevices(gpa, devices);
     for (devices) |d| if (d.matches(spec)) return d.address;
     std.debug.print("no cast device matches \"{s}\"; try `castig ls`\n", .{spec});
     return error.DeviceNotFound;
@@ -158,6 +180,8 @@ pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address
 
 pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, timeout_ms: u32) !void {
     const devices = try discover(io, gpa, timeout_ms, null);
+    defer gpa.free(devices);
+    defer freeDevices(gpa, devices);
     if (devices.len == 0) {
         try out.print("no cast devices answered within {d} ms\n", .{timeout_ms});
         try out.writeAll("(check with `avahi-browse -rt _googlecast._tcp`; if devices show there, they ignore unicast-response queries)\n");

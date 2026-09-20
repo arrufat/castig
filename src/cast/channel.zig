@@ -14,6 +14,9 @@
 //! Every request carries an incrementing `requestId` and the matching
 //! response is picked out by it. After LAUNCH, media messages go to the
 //! app's transport id, and a second CONNECT must be sent to that id first.
+//!
+//! Payloads are JSON; the wire structs below use the protocol's own camelCase
+//! field names so `std.json` reads and writes them directly.
 
 const std = @import("std");
 const Io = std.Io;
@@ -38,6 +41,9 @@ const buffer_len = tls.max_ciphertext_record_len;
 const max_frame = 1 << 20;
 
 pub const Json = std.json.Value;
+
+/// Receivers add fields freely, so unknown ones are ignored everywhere.
+const parse_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 
 pub const Error = error{
     FrameTooLarge,
@@ -84,6 +90,7 @@ pub const Channel = struct {
             .buffers = buffers,
             .json = .init(gpa),
         };
+        errdefer ch.json.deinit();
 
         var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
         try io.randomSecure(&entropy);
@@ -143,11 +150,10 @@ pub const Channel = struct {
     pub fn receive(ch: *Channel) !proto.Message {
         while (true) {
             const r = &ch.client.reader;
-            const prefix = r.takeArray(4) catch |err| switch (err) {
+            const len = r.takeInt(u32, .big) catch |err| switch (err) {
                 error.EndOfStream => return error.ConnectionClosed,
                 else => return err,
             };
-            const len = std.mem.readInt(u32, prefix, .big);
             if (len > max_frame) return error.FrameTooLarge;
             try ch.frame.resize(ch.gpa, len);
             r.readSliceAll(ch.frame.items) catch |err| switch (err) {
@@ -172,26 +178,37 @@ pub const Channel = struct {
         }
     }
 
-    pub fn parsePayload(arena: std.mem.Allocator, msg: proto.Message) !Json {
-        if (msg.payload != .utf8) return .null;
-        return std.json.parseFromSliceLeaky(Json, arena, msg.payload.utf8, .{});
+    /// The fields every receiver message may carry; `status` is decoded per
+    /// message type since it is an object, an array or a string.
+    pub const Reply = struct {
+        type: []const u8 = "",
+        requestId: ?i64 = null,
+        launchRequestId: ?i64 = null,
+        reason: ?[]const u8 = null,
+        status: Json = .null,
+    };
+
+    /// Parses a message's JSON payload; null when it is binary or not JSON.
+    pub fn parseReply(arena: std.mem.Allocator, msg: proto.Message) ?Reply {
+        if (msg.payload != .utf8) return null;
+        return std.json.parseFromSliceLeaky(Reply, arena, msg.payload.utf8, parse_options) catch null;
     }
 
     /// Sends `payload` (a pointer to a struct with a `requestId` field) and
     /// waits for the reply that carries the same id. Unrelated messages in
     /// between are dropped. An error reply (LAUNCH_ERROR, LOAD_FAILED, ...)
     /// is reported on stderr and returned as `error.RequestFailed`.
-    pub fn request(ch: *Channel, arena: std.mem.Allocator, destination: []const u8, namespace: []const u8, payload: anytype, expected_type: []const u8) !Json {
+    pub fn request(ch: *Channel, arena: std.mem.Allocator, destination: []const u8, namespace: []const u8, payload: anytype, expected_type: []const u8) !Reply {
         ch.request_id += 1;
         payload.requestId = ch.request_id;
         try ch.sendJson(destination, namespace, payload.*);
 
         while (true) {
             const msg = try ch.receive();
-            const json = try parsePayload(arena, msg);
+            const reply = parseReply(arena, msg) orelse continue;
             // Progress of our LAUNCH: the device may ask its user first.
-            if (getInt(json, "launchRequestId") == ch.request_id) {
-                const status = getStr(json, "status") orelse "";
+            if (reply.launchRequestId == ch.request_id) {
+                const status = if (reply.status == .string) reply.status.string else "";
                 if (std.mem.eql(u8, status, "USER_PENDING_AUTHORIZATION")) {
                     std.debug.print("waiting for the cast to be allowed on the device...\n", .{});
                 } else if (std.mem.eql(u8, status, "USER_NOT_ALLOWED")) {
@@ -200,11 +217,10 @@ pub const Channel = struct {
                 }
                 continue;
             }
-            if (getInt(json, "requestId") != ch.request_id) continue;
-            const kind = getStr(json, "type") orelse continue;
-            if (std.mem.eql(u8, kind, expected_type)) return json;
-            std.debug.print("receiver answered {s}", .{kind});
-            if (getStr(json, "reason")) |reason| std.debug.print(": {s}", .{reason});
+            if (reply.requestId != ch.request_id) continue;
+            if (std.mem.eql(u8, reply.type, expected_type)) return reply;
+            std.debug.print("receiver answered {s}", .{reply.type});
+            if (reply.reason) |reason| std.debug.print(": {s}", .{reason});
             std.debug.print("\n", .{});
             return error.RequestFailed;
         }
@@ -213,43 +229,52 @@ pub const Channel = struct {
     // --- receiver namespace -------------------------------------------------
 
     pub const App = struct {
-        app_id: []const u8,
-        display_name: []const u8,
-        transport_id: []const u8,
-        session_id: []const u8,
-        status_text: []const u8,
-        is_idle_screen: bool,
+        appId: []const u8 = "",
+        displayName: []const u8 = "",
+        transportId: []const u8 = "",
+        sessionId: []const u8 = "",
+        statusText: []const u8 = "",
+        isIdleScreen: bool = false,
+        namespaces: []const struct { name: []const u8 = "" } = &.{},
+
         /// Whether the app accepts media namespace commands.
-        has_media: bool,
+        pub fn hasMedia(a: App) bool {
+            for (a.namespaces) |n| if (std.mem.eql(u8, n.name, ns_media)) return true;
+            return false;
+        }
     };
 
     pub const Status = struct {
-        apps: []App,
-        volume_level: f64,
-        muted: bool,
+        applications: []const App = &.{},
+        volume: struct { level: f64 = 0, muted: bool = false } = .{},
 
         pub fn find(s: Status, app_id: []const u8) ?App {
-            for (s.apps) |a| if (std.mem.eql(u8, a.app_id, app_id)) return a;
+            for (s.applications) |a| if (std.mem.eql(u8, a.appId, app_id)) return a;
             return null;
         }
 
         /// The app currently able to play media, if any.
         pub fn mediaApp(s: Status) ?App {
-            for (s.apps) |a| if (a.has_media and !a.is_idle_screen) return a;
+            for (s.applications) |a| if (a.hasMedia() and !a.isIdleScreen) return a;
             return null;
         }
     };
 
+    fn parseStatus(arena: std.mem.Allocator, reply: Reply) !Status {
+        return std.json.parseFromValueLeaky(Status, arena, reply.status, parse_options) catch |err| {
+            std.debug.print("unexpected RECEIVER_STATUS shape: {s}\n", .{@errorName(err)});
+            return error.RequestFailed;
+        };
+    }
+
     pub fn getStatus(ch: *Channel, arena: std.mem.Allocator) !Status {
         var req: GetStatus = .{};
-        const json = try ch.request(arena, receiver_id, ns_receiver, &req, "RECEIVER_STATUS");
-        return parseStatus(arena, json);
+        return parseStatus(arena, try ch.request(arena, receiver_id, ns_receiver, &req, "RECEIVER_STATUS"));
     }
 
     pub fn launch(ch: *Channel, arena: std.mem.Allocator, app_id: []const u8) !App {
         var req: Launch = .{ .appId = app_id };
-        const json = try ch.request(arena, receiver_id, ns_receiver, &req, "RECEIVER_STATUS");
-        const status = try parseStatus(arena, json);
+        const status = try parseStatus(arena, try ch.request(arena, receiver_id, ns_receiver, &req, "RECEIVER_STATUS"));
         return status.find(app_id) orelse error.LaunchFailed;
     }
 
@@ -263,57 +288,60 @@ pub const Channel = struct {
         try ch.sendJson(transport_id, ns_connection, Connect{});
     }
 
-    fn parseStatus(arena: std.mem.Allocator, json: Json) !Status {
-        const status = getObj(json, "status") orelse return error.RequestFailed;
-        var apps: std.ArrayList(App) = .empty;
-        if (getArr(status, "applications")) |list| {
-            for (list) |a| try apps.append(arena, .{
-                .app_id = getStr(a, "appId") orelse "",
-                .display_name = getStr(a, "displayName") orelse "",
-                .transport_id = getStr(a, "transportId") orelse "",
-                .session_id = getStr(a, "sessionId") orelse "",
-                .status_text = getStr(a, "statusText") orelse "",
-                .is_idle_screen = getBool(a, "isIdleScreen") orelse false,
-                .has_media = hasNamespace(a, ns_media),
-            });
-        }
-        const volume = getObj(status, "volume");
-        return .{
-            .apps = try apps.toOwnedSlice(arena),
-            .volume_level = if (volume) |v| getNum(v, "level") orelse 0 else 0,
-            .muted = if (volume) |v| getBool(v, "muted") orelse false else false,
-        };
-    }
-
-    fn hasNamespace(app: Json, namespace: []const u8) bool {
-        const list = getArr(app, "namespaces") orelse return false;
-        for (list) |n| {
-            if (getStr(n, "name")) |name| if (std.mem.eql(u8, name, namespace)) return true;
-        }
-        return false;
-    }
-
     // --- media namespace ----------------------------------------------------
 
     /// `playerState` of a MEDIA_STATUS; tags are the protocol's own words.
-    pub const PlayerState = enum { IDLE, PLAYING, PAUSED, BUFFERING, UNKNOWN };
+    pub const PlayerState = enum {
+        IDLE,
+        PLAYING,
+        PAUSED,
+        BUFFERING,
+        UNKNOWN,
+
+        pub fn jsonParseFromValue(_: std.mem.Allocator, source: Json, _: std.json.ParseOptions) error{UnexpectedToken}!PlayerState {
+            return lenientEnum(PlayerState, source);
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !PlayerState {
+            return lenientEnum(PlayerState, try Json.jsonParse(allocator, source, options));
+        }
+    };
 
     /// `idleReason` of a MEDIA_STATUS; INTERRUPTED (which a seek-reload
     /// produces) is not terminal.
-    pub const IdleReason = enum { FINISHED, CANCELLED, INTERRUPTED, ERROR, UNKNOWN };
+    pub const IdleReason = enum {
+        FINISHED,
+        CANCELLED,
+        INTERRUPTED,
+        ERROR,
+        UNKNOWN,
+
+        pub fn jsonParseFromValue(_: std.mem.Allocator, source: Json, _: std.json.ParseOptions) error{UnexpectedToken}!IdleReason {
+            return lenientEnum(IdleReason, source);
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !IdleReason {
+            return lenientEnum(IdleReason, try Json.jsonParse(allocator, source, options));
+        }
+    };
 
     pub const MediaStatus = struct {
-        media_session_id: i64,
-        player_state: PlayerState,
-        current_time: f64,
-        duration: ?f64,
-        idle_reason: ?IdleReason,
-        playback_rate: f64,
+        mediaSessionId: i64 = 0,
+        playerState: PlayerState = .UNKNOWN,
+        currentTime: f64 = 0,
+        playbackRate: f64 = 1,
+        idleReason: ?IdleReason = null,
+        /// Absent from replies to commands; only status broadcasts carry it.
+        media: ?struct { duration: ?f64 = null } = null,
+
+        pub fn duration(m: MediaStatus) ?f64 {
+            return if (m.media) |x| x.duration else null;
+        }
 
         /// True only for terminal states.
         pub fn isFinished(m: MediaStatus) bool {
-            if (m.player_state != .IDLE) return false;
-            return switch (m.idle_reason orelse return false) {
+            if (m.playerState != .IDLE) return false;
+            return switch (m.idleReason orelse return false) {
                 .FINISHED, .CANCELLED, .ERROR => true,
                 .INTERRUPTED, .UNKNOWN => false,
             };
@@ -372,51 +400,49 @@ pub const Channel = struct {
             // races the session and fails with INVALID_MEDIA_SESSION_ID.
             req.activeTrackIds = opts.active_track_ids;
         }
-        const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(json) orelse error.RequestFailed;
+        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
     }
 
-    /// Extracts the first entry of a MEDIA_STATUS message, or null if it has none.
-    pub fn mediaStatusFrom(json: Json) ?MediaStatus {
-        const list = getArr(json, "status") orelse return null;
-        if (list.len == 0) return null;
-        const s = list[0];
-        return .{
-            .media_session_id = getInt(s, "mediaSessionId") orelse 0,
-            .player_state = getEnum(PlayerState, s, "playerState") orelse .UNKNOWN,
-            .current_time = getNum(s, "currentTime") orelse 0,
-            .duration = if (getObj(s, "media")) |m| getNum(m, "duration") else null,
-            .idle_reason = getEnum(IdleReason, s, "idleReason"),
-            .playback_rate = getNum(s, "playbackRate") orelse 1,
-        };
+    /// The first entry of a MEDIA_STATUS reply, or null if it has none.
+    pub fn mediaStatusFrom(arena: std.mem.Allocator, reply: Reply) ?MediaStatus {
+        const list = std.json.parseFromValueLeaky([]const MediaStatus, arena, reply.status, parse_options) catch return null;
+        return if (list.len > 0) list[0] else null;
     }
 
     /// Asks the app for its media status. `error.NoMedia` when nothing is loaded.
     pub fn getMediaStatus(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8) !MediaStatus {
         var req: GetStatus = .{};
-        const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(json) orelse error.NoMedia;
+        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return mediaStatusFrom(arena, reply) orelse error.NoMedia;
     }
 
     /// Rate between 0.5 and 2.0 on the Default Media Receiver.
     pub fn setPlaybackRate(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, rate: f64) !MediaStatus {
         var req: SetPlaybackRate = .{ .mediaSessionId = media_session_id, .playbackRate = rate };
-        const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(json) orelse error.RequestFailed;
+        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
     }
 
     pub fn mediaCommand(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, kind: []const u8) !MediaStatus {
         var req: MediaCommand = .{ .type = kind, .mediaSessionId = media_session_id };
-        const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(json) orelse error.RequestFailed;
+        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
     }
 
     pub fn seek(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, seconds: f64) !MediaStatus {
         var req: Seek = .{ .mediaSessionId = media_session_id, .currentTime = seconds };
-        const json = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
-        return mediaStatusFrom(json) orelse error.RequestFailed;
+        const reply = try ch.request(arena, transport_id, ns_media, &req, "MEDIA_STATUS");
+        return mediaStatusFrom(arena, reply) orelse error.RequestFailed;
     }
 };
+
+/// A protocol word as an enum; `E.UNKNOWN` for a word we do not know, since
+/// receivers may add states.
+fn lenientEnum(comptime E: type, source: Json) error{UnexpectedToken}!E {
+    if (source != .string) return error.UnexpectedToken;
+    return std.meta.stringToEnum(E, source.string) orelse .UNKNOWN;
+}
 
 // --- wire structs (field names are the JSON keys) ----------------------------
 
@@ -474,57 +500,6 @@ const Load = struct {
     };
 };
 
-// --- json.Value helpers ------------------------------------------------------
-
-/// `v[key]` when `v` is an object that has it.
-fn child(v: Json, key: []const u8) ?Json {
-    if (v != .object) return null;
-    return v.object.get(key);
-}
-
-pub fn getObj(v: Json, key: []const u8) ?Json {
-    const c = child(v, key) orelse return null;
-    return if (c == .object) c else null;
-}
-
-pub fn getArr(v: Json, key: []const u8) ?[]Json {
-    const c = child(v, key) orelse return null;
-    return if (c == .array) c.array.items else null;
-}
-
-pub fn getStr(v: Json, key: []const u8) ?[]const u8 {
-    const c = child(v, key) orelse return null;
-    return if (c == .string) c.string else null;
-}
-
-pub fn getInt(v: Json, key: []const u8) ?i64 {
-    return switch (child(v, key) orelse return null) {
-        .integer => |i| i,
-        .float => |f| @intFromFloat(f),
-        else => null,
-    };
-}
-
-pub fn getNum(v: Json, key: []const u8) ?f64 {
-    return switch (child(v, key) orelse return null) {
-        .integer => |i| @floatFromInt(i),
-        .float => |f| f,
-        else => null,
-    };
-}
-
-pub fn getBool(v: Json, key: []const u8) ?bool {
-    const c = child(v, key) orelse return null;
-    return if (c == .bool) c.bool else null;
-}
-
-/// A string field as an enum whose tag names are the protocol's words;
-/// `E.UNKNOWN` for a word we do not know.
-pub fn getEnum(comptime E: type, v: Json, key: []const u8) ?E {
-    const s = getStr(v, key) orelse return null;
-    return std.meta.stringToEnum(E, s) orelse .UNKNOWN;
-}
-
 test "wire structs serialise to the expected JSON" {
     const gpa = std.testing.allocator;
     var req: Load = .{ .media = .{ .contentId = "http://x/a.mp4", .contentType = "video/mp4" } };
@@ -537,16 +512,36 @@ test "wire structs serialise to the expected JSON" {
 }
 
 test "media status parsing" {
-    const arena = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const text =
-        \\{"type":"MEDIA_STATUS","requestId":3,"status":[{"mediaSessionId":1,"playerState":"PLAYING","currentTime":12.5,"media":{"duration":600}}]}
+        \\{"type":"MEDIA_STATUS","requestId":3,"status":[{"mediaSessionId":1,"playerState":"PLAYING","currentTime":12.5,"playbackRate":1,"media":{"duration":600,"contentId":"x"},"extra":true}]}
     ;
-    const parsed = try std.json.parseFromSlice(Json, arena, text, .{});
-    defer parsed.deinit();
-    const s = Channel.mediaStatusFrom(parsed.value).?;
-    try std.testing.expectEqual(@as(i64, 1), s.media_session_id);
-    try std.testing.expectEqual(Channel.PlayerState.PLAYING, s.player_state);
-    try std.testing.expectEqual(@as(f64, 12.5), s.current_time);
-    try std.testing.expectEqual(@as(?f64, 600), s.duration);
+    const reply = try std.json.parseFromSliceLeaky(Channel.Reply, arena.allocator(), text, parse_options);
+    try std.testing.expectEqual(@as(?i64, 3), reply.requestId);
+    const s = Channel.mediaStatusFrom(arena.allocator(), reply).?;
+    try std.testing.expectEqual(@as(i64, 1), s.mediaSessionId);
+    try std.testing.expectEqual(Channel.PlayerState.PLAYING, s.playerState);
+    try std.testing.expectEqual(@as(f64, 12.5), s.currentTime);
+    try std.testing.expectEqual(@as(?f64, 600), s.duration());
     try std.testing.expect(!s.isFinished());
+}
+
+test "receiver status parsing tolerates unknown words and fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const text =
+        \\{"type":"RECEIVER_STATUS","requestId":1,"status":{"applications":[{"appId":"CC1AD845","displayName":"Default Media Receiver","namespaces":[{"name":"urn:x-cast:com.google.cast.media"}],"sessionId":"s","transportId":"t","isIdleScreen":false,"launchedFromCloud":false}],"volume":{"controlType":"attenuation","level":0.5,"muted":false,"stepInterval":0.05}}}
+    ;
+    const reply = try std.json.parseFromSliceLeaky(Channel.Reply, arena.allocator(), text, parse_options);
+    const st = try Channel.parseStatus(arena.allocator(), reply);
+    try std.testing.expectEqual(@as(f64, 0.5), st.volume.level);
+    try std.testing.expect(st.mediaApp() != null);
+    try std.testing.expectEqualStrings("t", st.find("CC1AD845").?.transportId);
+
+    const media = try std.json.parseFromSliceLeaky(Channel.MediaStatus, arena.allocator(),
+        \\{"playerState":"LOADING","idleReason":"WHATEVER"}
+    , parse_options);
+    try std.testing.expectEqual(Channel.PlayerState.UNKNOWN, media.playerState);
+    try std.testing.expectEqual(@as(?Channel.IdleReason, .UNKNOWN), media.idleReason);
 }

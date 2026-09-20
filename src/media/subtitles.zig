@@ -32,7 +32,7 @@ pub fn srtToVtt(gpa: std.mem.Allocator, srt: []const u8) ![]u8 {
         if (isTiming(line)) {
             try appendTiming(gpa, &out, line);
         } else {
-            try appendText(gpa, &out, line);
+            try appendCleanText(gpa, &out, line);
         }
         try out.append(gpa, '\n');
     }
@@ -120,8 +120,9 @@ fn cueText(codec: []const u8, data: []const u8) []const u8 {
     return data; // subrip / srt / text / webvtt: raw text
 }
 
-/// Copies text, dropping `{...}` override blocks and CRs, and turning the ASS
-/// line breaks `\N` and `\n` into newlines and `\h` into a space.
+/// Copies text, dropping `{\...}` override blocks and CRs, and turning the
+/// ASS line breaks `\N` and `\n` into newlines and `\h` into a space. Used
+/// for SubRip lines too, which carry the same override tags.
 fn appendCleanText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
     var i: usize = 0;
     while (i < text.len) {
@@ -130,7 +131,7 @@ fn appendCleanText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []cons
             i += 1;
             continue;
         }
-        if (c == '{') {
+        if (c == '{' and i + 1 < text.len and text[i + 1] == '\\') {
             if (std.mem.findScalarPos(u8, text, i, '}')) |close| {
                 i = close + 1;
                 continue;
@@ -181,20 +182,6 @@ fn appendTiming(gpa: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u
     const start = out.items.len;
     try out.appendSlice(gpa, line);
     std.mem.replaceScalar(u8, out.items[start..], ',', '.');
-}
-
-fn appendText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8) !void {
-    var i: usize = 0;
-    while (i < line.len) {
-        if (line[i] == '{' and i + 1 < line.len and line[i + 1] == '\\') {
-            if (std.mem.findScalarPos(u8, line, i, '}')) |close| {
-                i = close + 1;
-                continue;
-            }
-        }
-        try out.append(gpa, line[i]);
-        i += 1;
-    }
 }
 
 test "srt to vtt" {

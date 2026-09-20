@@ -31,6 +31,7 @@ const target_seconds: f64 = 6;
 
 pub const Segmenter = struct {
     gpa: std.mem.Allocator,
+    io: Io,
     path: []const u8,
     /// Start time of each segment, in seconds; ascending, first is 0.
     starts: []f64,
@@ -42,10 +43,14 @@ pub const Segmenter = struct {
     /// initialise its media source, or it never fetches a segment.
     codecs: []const u8,
     bandwidth: u64,
+    /// Opened demuxers, handed out one per segment being served and returned
+    /// afterwards. Concurrent requests each open their own.
+    inputs: std.ArrayList(*pipeline.Input) = .empty,
+    inputs_mutex: Io.Mutex = .init,
 
-    pub fn init(gpa: std.mem.Allocator, path: []const u8) !Segmenter {
-        const ic = try extra.openInput(gpa, path);
-        defer ic.close_input();
+    /// Takes ownership of the probed `ic`, which becomes the first pooled input.
+    pub fn init(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatContext) !Segmenter {
+        errdefer ic.close_input();
 
         const video_index: usize = if (ic.find_best_stream(.VIDEO, -1, -1)) |v|
             @intCast(v[0])
@@ -65,6 +70,7 @@ pub const Segmenter = struct {
         else
             "avc1.640028";
         const codecs = try gpa.print("{s},mp4a.40.2", .{avc1_str});
+        errdefer gpa.free(codecs);
         const bandwidth: u64 = if (vpar.bit_rate > 0) @as(u64, @intCast(vpar.bit_rate)) + 192_000 else 6_000_000;
 
         var keyframes: std.ArrayList(f64) = .empty;
@@ -86,16 +92,47 @@ pub const Segmenter = struct {
         }
 
         const starts = try boundaries(gpa, keyframes.items, duration);
+        errdefer gpa.free(starts);
+        const owned_path = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned_path);
+
+        var inputs: std.ArrayList(*pipeline.Input) = .empty;
+        errdefer inputs.deinit(gpa);
+        try inputs.ensureTotalCapacity(gpa, 1);
+        inputs.appendAssumeCapacity(try pipeline.Input.adopt(gpa, ic));
+
         return .{
             .gpa = gpa,
-            .path = try gpa.dupe(u8, path),
+            .io = io,
+            .path = owned_path,
             .starts = starts,
+            .inputs = inputs,
             .duration = duration,
             .width = vpar.width,
             .height = vpar.height,
             .codecs = codecs,
             .bandwidth = bandwidth,
         };
+    }
+
+    pub fn deinit(s: *Segmenter) void {
+        for (s.inputs.items) |in| in.deinit();
+        s.inputs.deinit(s.gpa);
+        s.gpa.free(s.path);
+        s.gpa.free(s.starts);
+        s.gpa.free(s.codecs);
+    }
+
+    fn acquireInput(s: *Segmenter) !*pipeline.Input {
+        try s.inputs_mutex.lock(s.io);
+        defer s.inputs_mutex.unlock(s.io);
+        return s.inputs.pop() orelse pipeline.Input.open(s.gpa, s.path);
+    }
+
+    fn releaseInput(s: *Segmenter, in: *pipeline.Input) void {
+        s.inputs_mutex.lock(s.io) catch return in.deinit();
+        defer s.inputs_mutex.unlock(s.io);
+        s.inputs.append(s.gpa, in) catch in.deinit();
     }
 
     pub fn writeMaster(s: *const Segmenter, w: *Io.Writer) !void {
@@ -164,7 +201,7 @@ fn scanKeyframes(gpa: std.mem.Allocator, ic: *av.FormatContext, video_index: usi
 /// Serves `/hls/master.m3u8`, `/hls/index.m3u8` and `/hls/segN.ts`. Wired as
 /// a dynamic route whose context is a `*Segmenter`.
 pub fn handleRoute(context: *const anyopaque, request: *server.Request, path: []const u8) anyerror!void {
-    const seg: *const Segmenter = @ptrCast(@alignCast(context));
+    const seg: *Segmenter = @ptrCast(@alignCast(@constCast(context)));
     const tail = path[url_prefix.len..];
 
     if (std.mem.eql(u8, tail, master_name)) return respondPlaylist(seg, request, Segmenter.writeMaster);
@@ -181,7 +218,9 @@ pub fn handleRoute(context: *const anyopaque, request: *server.Request, path: []
         const end: ?f64 = if (index + 1 < seg.starts.len) seg.starts[index + 1] else null;
         var buffer: [64 * 1024]u8 = undefined;
         var body = try server.beginStream(request, &buffer, segment_content_type);
-        pipeline.remuxWindow(seg.gpa, seg.path, start, end, .mpegts, &body.writer) catch |err| {
+        const in = try seg.acquireInput();
+        defer seg.releaseInput(in);
+        pipeline.remuxWindow(in, start, end, .mpegts, &body.writer) catch |err| {
             log.debug("segment {d} aborted: {s}", .{ index, @errorName(err) });
             return; // connection torn down by the caller
         };
@@ -215,7 +254,7 @@ test "boundaries group keyframes by target" {
 test "master playlist declares codecs and resolution" {
     const gpa = std.testing.allocator;
     const starts = try gpa.dupe(f64, &.{0});
-    var seg: Segmenter = .{ .gpa = gpa, .path = "", .starts = starts, .duration = 5, .width = 1920, .height = 818, .codecs = "avc1.640028,mp4a.40.2", .bandwidth = 6000000 };
+    var seg: Segmenter = .{ .gpa = gpa, .io = std.testing.io, .path = "", .starts = starts, .duration = 5, .width = 1920, .height = 818, .codecs = "avc1.640028,mp4a.40.2", .bandwidth = 6000000 };
     defer gpa.free(seg.starts);
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -230,7 +269,7 @@ test "master playlist declares codecs and resolution" {
 test "playlist renders a VOD list" {
     const gpa = std.testing.allocator;
     const starts = try gpa.dupe(f64, &.{ 0, 6, 12 });
-    var seg: Segmenter = .{ .gpa = gpa, .path = "", .starts = starts, .duration = 15, .width = 1920, .height = 818, .codecs = "avc1.640028,mp4a.40.2", .bandwidth = 6000000 };
+    var seg: Segmenter = .{ .gpa = gpa, .io = std.testing.io, .path = "", .starts = starts, .duration = 15, .width = 1920, .height = 818, .codecs = "avc1.640028,mp4a.40.2", .bandwidth = 6000000 };
     defer gpa.free(seg.starts);
 
     var aw: Io.Writer.Allocating = .init(gpa);

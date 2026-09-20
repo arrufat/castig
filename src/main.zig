@@ -72,6 +72,7 @@ fn run(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
+    const env: commands.Env = .{ .io = io, .arena = arena, .gpa = init.gpa, .out = out };
 
     if (args.len < 2) fail(usage);
     debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
@@ -91,7 +92,7 @@ fn run(init: std.process.Init) !void {
                     timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch fail("--timeout expects a number of milliseconds\n");
                 } else fail(usage);
             }
-            try discovery.run(io, arena, out, timeout_ms);
+            try discovery.run(io, init.gpa, out, timeout_ms);
         },
         .probe => {
             if (args.len != 3) fail(usage);
@@ -100,17 +101,17 @@ fn run(init: std.process.Init) !void {
         .status, .stop, .pause, .play => {
             if (args.len != 3) fail(usage);
             switch (cmd) {
-                inline .status, .stop, .pause, .play => |c| try @field(commands, @tagName(c))(io, arena, out, args[2]),
+                inline .status, .stop, .pause, .play => |c| try @field(commands, @tagName(c))(env, args[2]),
                 else => unreachable,
             }
         },
         .seek => {
             if (args.len != 4) fail(usage);
-            try commands.seek(io, arena, out, args[2], args[3]);
+            try commands.seek(env, args[2], args[3]);
         },
         .rate => {
             if (args.len != 4) fail(usage);
-            try commands.rate(io, arena, out, args[2], args[3]);
+            try commands.rate(env, args[2], args[3]);
         },
         .cast => {
             if (args.len < 4) fail(usage);
@@ -130,7 +131,7 @@ fn run(init: std.process.Init) !void {
                     opts.remux = std.meta.stringToEnum(commands.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
                 } else fail(usage);
             }
-            try commands.cast(io, arena, out, args[2], opts);
+            try commands.cast(env, args[2], opts);
         },
         .help => try out.writeAll(usage),
     }

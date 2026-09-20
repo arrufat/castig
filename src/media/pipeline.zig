@@ -6,11 +6,11 @@
 //!   video unplayable                  -> caller falls back to direct; software
 //!                                        video transcode is not implemented yet
 //!
-//! `remuxWindow(gpa, path, start, end, container, w)` transcodes the window
-//! [start, end) into `container`, copying video and encoding audio to AAC,
-//! written through a custom `av.IOContext` into an `std.Io.Writer` so nothing
-//! hits disk. For MPEG-TS the copied H.264/HEVC is passed through the Annex-B
-//! bitstream filter (in-band SPS/PPS). Audio is downmixed to stereo.
+//! A remux copies video and encodes audio to AAC into `Container`, written
+//! through a custom `av.IOContext` into an `std.Io.Writer` so nothing hits
+//! disk. The demuxer and audio decoder (`Input`) are reusable across windows,
+//! since opening and probing a file per HLS segment cost more than the segment
+//! itself; the muxer and encoder (`Output`) are per window.
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,13 +37,16 @@ pub const Plan = struct {
     audio_codec: []const u8,
     /// Text subtitle streams we can offer as WebVTT tracks (bitmap subs skipped).
     subtitles: []const SubtitleStream,
+    /// The probed demuxer, for the delivery that needs it; the caller closes
+    /// it otherwise.
+    ic: *av.FormatContext,
 };
 
 /// Inspects `path` once: how to deliver it, and which text subtitle streams it
 /// carries. `gpa` owns the returned subtitle strings.
 pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     const ic = try extra.openInput(gpa, path);
-    defer ic.close_input();
+    errdefer ic.close_input();
 
     var video_codec: []const u8 = "";
     var audio_codec: []const u8 = "";
@@ -86,25 +89,24 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
         .video_codec = video_codec,
         .audio_codec = audio_codec,
         .subtitles = try subs.toOwnedSlice(gpa),
+        .ic = ic,
     };
 }
 
-/// Demuxes subtitle stream `stream_index` from `path` and returns it as WebVTT.
-/// Reads the whole container (subtitle packets are interleaved), so callers
-/// should do this lazily, only when the receiver requests the track.
-pub fn extractSubtitle(gpa: std.mem.Allocator, path: []const u8, stream_index: usize) ![]u8 {
+/// Demuxes the subtitle streams `indices` from `path` in one pass (their
+/// packets are interleaved) and returns each as WebVTT, in the same order.
+/// Callers do this lazily, when the receiver first requests a track.
+pub fn extractSubtitles(gpa: std.mem.Allocator, path: []const u8, indices: []const usize) ![]const []u8 {
     const ic = try extra.openInput(gpa, path);
     defer ic.close_input();
-    if (stream_index >= ic.nb_streams) return error.NoSuchStream;
-    extra.discardOthers(ic, &.{stream_index});
+    for (indices) |i| if (i >= ic.nb_streams) return error.NoSuchStream;
+    extra.discardOthers(ic, indices);
 
-    const st = ic.streams[stream_index];
-    const tb = st.time_base;
-    const codec = extra.codecName(extra.codecId(st.codecpar));
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try subtitles.writeVttHeader(gpa, &out);
+    const outs = try gpa.alloc(std.ArrayList(u8), indices.len);
+    defer gpa.free(outs);
+    @memset(outs, .empty);
+    errdefer for (outs) |*out| out.deinit(gpa);
+    for (outs) |*out| try subtitles.writeVttHeader(gpa, out);
 
     const pkt = try av.Packet.alloc();
     defer pkt.free();
@@ -114,15 +116,20 @@ pub fn extractSubtitle(gpa: std.mem.Allocator, path: []const u8, stream_index: u
             else => return err,
         };
         defer pkt.unref();
-        if (pkt.stream_index != @as(c_int, @intCast(stream_index))) continue;
         if (pkt.pts == av.NOPTS_VALUE) continue;
+        const slot = std.mem.findScalar(usize, indices, @intCast(pkt.stream_index)) orelse continue;
 
-        const start_ms = extra.av_rescale_q(pkt.pts, tb, extra.millis);
-        const end_ms = if (pkt.duration > 0) extra.av_rescale_q(pkt.pts + pkt.duration, tb, extra.millis) else start_ms + 2000;
-        const data = pkt.data[0..@intCast(pkt.size)];
-        try subtitles.writeVttCue(gpa, &out, start_ms, end_ms, codec, data);
+        const st = ic.streams[@intCast(pkt.stream_index)];
+        const codec = extra.codecName(extra.codecId(st.codecpar));
+        const start_ms = extra.av_rescale_q(pkt.pts, st.time_base, extra.millis);
+        const end_ms = if (pkt.duration > 0) extra.av_rescale_q(pkt.pts + pkt.duration, st.time_base, extra.millis) else start_ms + 2000;
+        try subtitles.writeVttCue(gpa, &outs[slot], start_ms, end_ms, codec, pkt.data[0..@intCast(pkt.size)]);
     }
-    return out.toOwnedSlice(gpa);
+
+    const result = try gpa.alloc([]u8, indices.len);
+    errdefer gpa.free(result);
+    for (outs, 0..) |*out, i| result[i] = try out.toOwnedSlice(gpa);
+    return result;
 }
 
 // --- AVIO bridge ------------------------------------------------------------
@@ -138,35 +145,73 @@ const Sink = struct {
     }
 };
 
-// --- audio transcoder setup -------------------------------------------------
+// --- codecs -----------------------------------------------------------------
 
-/// A decoder for the input audio and an AAC encoder that downmixes to stereo.
-/// Shared by the remux `Session` and the on-the-fly MP4 assembler so their
-/// encoder parameters (bitrate, stereo policy, global header) never diverge.
-pub const AacTranscode = struct { dec: *av.Codec.Context, enc: *av.Codec.Context };
-
-pub fn openStereoAac(par: *av.Codec.Parameters) !AacTranscode {
-    const dec_codec = try av.Codec.find_decoder(par.codec_id);
-    const dec = try av.Codec.Context.alloc(dec_codec);
+pub fn openDecoder(par: *av.Codec.Parameters) !*av.Codec.Context {
+    const codec = try av.Codec.find_decoder(par.codec_id);
+    const dec = try av.Codec.Context.alloc(codec);
     errdefer dec.free();
     try dec.parameters_to_context(par);
-    try dec.open(dec_codec, null);
+    try dec.open(codec, null);
+    return dec;
+}
 
-    const enc_codec = try av.Codec.find_encoder_by_name("aac");
-    const enc = try av.Codec.Context.alloc(enc_codec);
+/// An AAC encoder at the decoder's sample rate. Stereo, since many receivers
+/// reject multichannel AAC in an HLS stream. Shared by the remux `Output` and
+/// the on-the-fly MP4 assembler so their parameters never diverge.
+pub fn openStereoAacEncoder(dec: *const av.Codec.Context) !*av.Codec.Context {
+    const codec = try av.Codec.find_encoder_by_name("aac");
+    const enc = try av.Codec.Context.alloc(codec);
     errdefer enc.free();
     enc.sample_rate = dec.sample_rate;
-    // Stereo: many receivers reject multichannel AAC in an HLS stream.
     extra.av_channel_layout_default(&enc.ch_layout, 2);
     enc.sample_fmt = .FLTP;
     enc.bit_rate = aac_bitrate;
     enc.time_base = .{ .num = 1, .den = dec.sample_rate };
     enc.flags |= extra.CODEC_FLAG_GLOBAL_HEADER;
-    try enc.open(enc_codec, null);
-    return .{ .dec = dec, .enc = enc };
+    try enc.open(codec, null);
+    return enc;
 }
 
-// --- session ----------------------------------------------------------------
+// --- input ------------------------------------------------------------------
+
+/// A demuxer and its audio decoder, reusable across windows: each window
+/// seeks the demuxer and flushes the decoder.
+pub const Input = struct {
+    gpa: std.mem.Allocator,
+    ic: *av.FormatContext,
+    video_index: ?usize,
+    audio_index: usize,
+    dec: *av.Codec.Context,
+
+    pub fn open(gpa: std.mem.Allocator, path: []const u8) !*Input {
+        const ic = try extra.openInput(gpa, path);
+        errdefer ic.close_input();
+        return adopt(gpa, ic);
+    }
+
+    /// Takes ownership of an already probed `ic`.
+    pub fn adopt(gpa: std.mem.Allocator, ic: *av.FormatContext) !*Input {
+        const video_index: ?usize = if (ic.find_best_stream(.VIDEO, -1, -1)) |v| @intCast(v[0]) else |_| null;
+        const audio_index: usize = if (ic.find_best_stream(.AUDIO, -1, -1)) |a| @intCast(a[0]) else |_| return error.NoAudioStream;
+        if (video_index) |vi| extra.discardOthers(ic, &.{ vi, audio_index }) else extra.discardOthers(ic, &.{audio_index});
+
+        const dec = try openDecoder(ic.streams[audio_index].codecpar);
+        errdefer dec.free();
+
+        const in = try gpa.create(Input);
+        in.* = .{ .gpa = gpa, .ic = ic, .video_index = video_index, .audio_index = audio_index, .dec = dec };
+        return in;
+    }
+
+    pub fn deinit(in: *Input) void {
+        in.dec.free();
+        in.ic.close_input();
+        in.gpa.destroy(in);
+    }
+};
+
+// --- output -----------------------------------------------------------------
 
 /// The output container of a remux, and what each one needs from the muxer.
 pub const Container = enum {
@@ -215,32 +260,18 @@ const VideoCopy = struct {
     }
 };
 
-/// Everything libav needs to remux one file into one output, minus the header
-/// write and the packet loop, which the callers drive differently. Output goes
-/// to a streaming `Sink` (a custom AVIO writing to an `Io.Writer`).
-const Session = struct {
+/// One window's muxer, AAC encoder and sink.
+const Output = struct {
     sink: *Sink,
-    ic: *av.FormatContext,
-    audio_index: usize,
-    dec: *av.Codec.Context,
     enc: *av.Codec.Context,
     oc: *av.FormatContext,
     avio: *av.IOContext,
     video: ?VideoCopy,
     out_audio_index: c_int,
 
-    fn open(gpa: std.mem.Allocator, path: []const u8, container: Container, sink: *Sink) !Session {
-        const ic = try extra.openInput(gpa, path);
-        errdefer ic.close_input();
-
-        const video_index: ?usize = if (ic.find_best_stream(.VIDEO, -1, -1)) |v| @intCast(v[0]) else |_| null;
-        const audio_index: usize = if (ic.find_best_stream(.AUDIO, -1, -1)) |a| @intCast(a[0]) else |_| return error.NoAudioStream;
-        if (video_index) |vi| extra.discardOthers(ic, &.{ vi, audio_index }) else extra.discardOthers(ic, &.{audio_index});
-        const in_audio = ic.streams[audio_index];
-
-        const at = try openStereoAac(in_audio.codecpar);
-        errdefer at.dec.free();
-        errdefer at.enc.free();
+    fn open(in: *const Input, container: Container, sink: *Sink) !Output {
+        const enc = try openStereoAacEncoder(in.dec);
+        errdefer enc.free();
 
         const oc = try extra.allocOutputContext(container.muxerName());
         errdefer av.avformat_free_context(oc);
@@ -251,8 +282,8 @@ const Session = struct {
 
         var video: ?VideoCopy = null;
         errdefer if (video) |*v| v.deinit();
-        if (video_index) |vi| {
-            const in_video = ic.streams[vi];
+        if (in.video_index) |vi| {
+            const in_video = in.ic.streams[vi];
             var bsf: ?*extra.BSFContext = null;
             const vcodec = extra.codecName(extra.codecId(in_video.codecpar));
             if (container.annexb()) if (extra.annexbFilterName(vcodec)) |filter_name| {
@@ -270,14 +301,11 @@ const Session = struct {
             video = .{ .in_index = vi, .out_index = out_video.index, .bsf = bsf };
         }
 
-        const out_audio = try extra.addEncodedStream(oc, at.enc);
+        const out_audio = try extra.addEncodedStream(oc, enc);
 
         return .{
             .sink = sink,
-            .ic = ic,
-            .audio_index = audio_index,
-            .dec = at.dec,
-            .enc = at.enc,
+            .enc = enc,
             .oc = oc,
             .avio = avio,
             .video = video,
@@ -285,31 +313,30 @@ const Session = struct {
         };
     }
 
-    fn deinit(s: *Session) void {
-        if (s.video) |*v| v.deinit();
-        av.IOContext.free(s.avio);
-        av.avformat_free_context(s.oc);
-        s.enc.free();
-        s.dec.free();
-        s.ic.close_input();
+    fn deinit(o: *Output) void {
+        if (o.video) |*v| v.deinit();
+        av.IOContext.free(o.avio);
+        av.avformat_free_context(o.oc);
+        o.enc.free();
     }
 
-    fn writeHeader(s: *Session, container: Container) !void {
-        if (container.keepAbsoluteTs()) s.oc.avoid_negative_ts = extra.AVFMT_AVOID_NEG_TS_DISABLED;
+    fn writeHeader(o: *Output, container: Container) !void {
+        if (container.keepAbsoluteTs()) o.oc.avoid_negative_ts = extra.AVFMT_AVOID_NEG_TS_DISABLED;
         var opts: av.Dictionary.Mutable = .empty;
         defer opts.free();
         if (container.movflags()) |f| try opts.set("movflags", f, .{});
-        try extra.writeHeader(s.oc, &opts);
+        try extra.writeHeader(o.oc, &opts);
     }
 
     /// Copies video and transcodes audio for [start_time, end_time) into the
     /// already-headered output. `end_time` null runs to end of file.
-    fn runWindow(s: *Session, start_time: f64, end_time: ?f64) !void {
-        if (start_time > 0) try s.ic.seek_frame(-1, @intFromFloat(start_time * extra.TIME_BASE), extra.AVSEEK_FLAG_BACKWARD);
+    fn run(o: *Output, in: *Input, start_time: f64, end_time: ?f64) !void {
+        try in.ic.seek_frame(-1, @intFromFloat(start_time * extra.TIME_BASE), extra.AVSEEK_FLAG_BACKWARD);
+        in.dec.flush_buffers();
 
-        const in_audio = s.ic.streams[s.audio_index];
-        var mux: MuxEmit = .{ .oc = s.oc, .out_index = s.out_audio_index, .enc = s.enc, .sink = s.sink };
-        var ctx = try AudioCtx.init(s.dec, s.enc, in_audio.time_base, start_time, MuxEmit.emit, &mux);
+        const in_audio = in.ic.streams[in.audio_index];
+        var mux: MuxEmit = .{ .oc = o.oc, .out_index = o.out_audio_index, .enc = o.enc, .sink = o.sink };
+        var ctx = try AudioCtx.init(in.dec, o.enc, in_audio.time_base, start_time, MuxEmit.emit, &mux);
         defer ctx.deinit();
 
         const pkt = try av.Packet.alloc();
@@ -318,17 +345,17 @@ const Session = struct {
         defer vpkt.free();
 
         while (true) {
-            s.ic.read_frame(pkt) catch |err| switch (err) {
+            in.ic.read_frame(pkt) catch |err| switch (err) {
                 error.EndOfFile => break,
                 else => return err,
             };
             defer pkt.unref();
-            if (s.sink.failed) return error.WriteFailed;
+            if (o.sink.failed) return error.WriteFailed;
 
-            if (s.video != null and pkt.stream_index == @as(c_int, @intCast(s.video.?.in_index))) {
-                const v = s.video.?;
-                const in_tb = s.ic.streams[v.in_index].time_base;
-                const out_tb = s.oc.streams[@intCast(v.out_index)].time_base;
+            if (o.video != null and pkt.stream_index == @as(c_int, @intCast(o.video.?.in_index))) {
+                const v = o.video.?;
+                const in_tb = in.ic.streams[v.in_index].time_base;
+                const out_tb = o.oc.streams[@intCast(v.out_index)].time_base;
                 if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE and extra.toSeconds(pkt.pts, in_tb) >= end) break;
                 if (v.bsf) |b| {
                     try extra.bsfSend(b, pkt);
@@ -339,17 +366,17 @@ const Session = struct {
                         };
                         extra.av_packet_rescale_ts(vpkt, in_tb, out_tb);
                         vpkt.stream_index = v.out_index;
-                        try extra.writeFrame(s.oc, vpkt);
+                        try extra.writeFrame(o.oc, vpkt);
                         vpkt.unref();
                     }
                 } else {
                     extra.av_packet_rescale_ts(pkt, in_tb, out_tb);
                     pkt.stream_index = v.out_index;
-                    try extra.writeFrame(s.oc, pkt);
+                    try extra.writeFrame(o.oc, pkt);
                 }
-            } else if (pkt.stream_index == @as(c_int, @intCast(s.audio_index))) {
+            } else if (pkt.stream_index == @as(c_int, @intCast(in.audio_index))) {
                 // Without video the audio timestamps bound the window.
-                if (s.video == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
+                if (o.video == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
                     if (extra.toSeconds(pkt.pts, in_audio.time_base) >= end) break;
                 };
                 try ctx.feed(pkt);
@@ -362,17 +389,23 @@ const Session = struct {
 
 // --- public entry points ----------------------------------------------------
 
-/// Generic remux of a window into `container` streamed to `w`. Writes a full
-/// container: header, body, trailer. Used for MPEG-TS HLS segments, and for
-/// the `--remux stream` fragmented-MP4 live stream.
-pub fn remuxWindow(gpa: std.mem.Allocator, path: []const u8, start_time: f64, end_time: ?f64, container: Container, w: *Io.Writer) !void {
+/// Remuxes [start_time, end_time) of `in` into `container`, streamed to `w`
+/// as a full container: header, body, trailer.
+pub fn remuxWindow(in: *Input, start_time: f64, end_time: ?f64, container: Container, w: *Io.Writer) !void {
     var sink: Sink = .{ .w = w };
-    var s = try Session.open(gpa, path, container, &sink);
-    defer s.deinit();
-    try s.writeHeader(container);
-    try s.runWindow(start_time, end_time);
+    var o = try Output.open(in, container, &sink);
+    defer o.deinit();
+    try o.writeHeader(container);
+    try o.run(in, start_time, end_time);
     if (sink.failed) return error.WriteFailed;
-    try extra.writeTrailer(s.oc);
+    try extra.writeTrailer(o.oc);
+}
+
+/// `remuxWindow` over a freshly opened `path`; for one-off streams.
+pub fn remuxFile(gpa: std.mem.Allocator, path: []const u8, container: Container, w: *Io.Writer) !void {
+    const in = try Input.open(gpa, path);
+    defer in.deinit();
+    try remuxWindow(in, 0, null, container, w);
 }
 
 // --- audio transcoder -------------------------------------------------------
@@ -381,7 +414,7 @@ pub fn remuxWindow(gpa: std.mem.Allocator, path: []const u8, start_time: f64, en
 pub const Emit = *const fn (ctx: *anyopaque, pkt: *av.Packet) anyerror!void;
 
 /// Decodes the source audio, downmixes/resamples through a FIFO, and encodes
-/// AAC. Each finished packet goes to `emit` — the remux `Session` muxes it, the
+/// AAC. Each finished packet goes to `emit` — the remux `Output` muxes it, the
 /// virtual-MP4 assembler stores it. Drive it with `feed` per packet, then
 /// `finish`.
 pub const AudioCtx = struct {
@@ -525,7 +558,7 @@ pub const AudioCtx = struct {
     }
 };
 
-/// Muxes each encoded AAC packet into `oc` (used by the remux `Session`).
+/// Muxes each encoded AAC packet into `oc` (used by the remux `Output`).
 const MuxEmit = struct {
     oc: *av.FormatContext,
     out_index: c_int,

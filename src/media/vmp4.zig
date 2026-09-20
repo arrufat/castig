@@ -309,8 +309,7 @@ pub const UnsuitableError = error{
 
 /// Builds the virtual MP4 for `path`. An `UnsuitableError` means the source
 /// cannot be served this way (no video, unreliable byte positions, ...).
-pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8) !*VMp4 {
-    const ic = try extra.openInput(gpa, path);
+pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8, ic: *av.FormatContext) !*VMp4 {
     var ic_adopted = false; // by the VideoReader, which then owns it
     defer if (!ic_adopted) ic.close_input();
 
@@ -325,11 +324,10 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8) !*VMp4 {
     // containers (Matroska) re-demux at serve time, since pkt.pos is unreliable.
     const is_bmff = extra.matchName("mov", ic.iformat.name);
 
-    const at = try pipeline.openStereoAac(in_audio.codecpar);
-    defer at.dec.free();
-    defer at.enc.free();
-    const dec = at.dec;
-    const enc = at.enc;
+    const dec = try pipeline.openDecoder(in_audio.codecpar);
+    defer dec.free();
+    const enc = try pipeline.openStereoAacEncoder(dec);
+    defer enc.free();
     const enc_tb = enc.time_base;
 
     // --- output muxer over the capturing seekable AVIO -----------------------
@@ -349,6 +347,7 @@ pub fn build(gpa: std.mem.Allocator, io: Io, path: []const u8) !*VMp4 {
     // --- phase A: collect video metadata + encoded audio ---------------------
     var video: std.ArrayList(VideoSample) = .empty;
     defer video.deinit(gpa);
+    video.ensureTotalCapacity(gpa, @intCast(@max(extra.avformat_index_get_entries_count(in_video), 0))) catch {};
     var aac_samples: std.ArrayList(AacSample) = .empty;
     defer aac_samples.deinit(gpa);
     var aac_buf: std.ArrayList(u8) = .empty;
