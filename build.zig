@@ -50,6 +50,27 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run castig");
     run_step.dependOn(&run_cmd.step);
 
+    // Rendered from the library root, so the pages are the API and not the
+    // CLI entry point. Autodoc loads its sources over HTTP: serve zig-out/docs
+    // rather than opening index.html from disk.
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "av", .module = av },
+        },
+    });
+    const docs_obj = b.addObject(.{ .name = "castig", .root_module = lib_mod });
+    const docs_install = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Render the API documentation to zig-out/docs");
+    docs_step.dependOn(&docs_install.step);
+
     const tests = b.addTest(.{ .root_module = exe_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

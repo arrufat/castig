@@ -6,7 +6,6 @@ const discovery = @import("discovery.zig");
 const probe = @import("probe.zig");
 const vmp4 = @import("media/vmp4.zig");
 const subs = @import("subs/subs.zig");
-const subs_config = @import("subs/config.zig");
 
 const usage =
     \\usage: castig <command> [args]
@@ -154,7 +153,7 @@ fn run(init: std.process.Init) !void {
                     opts.auto = true;
                 } else if (std.mem.eql(u8, args[i], "--lang") and i + 1 < args.len) {
                     i += 1;
-                    opts.languages = try subs_config.splitLanguages(arena, args[i]);
+                    opts.languages = try subs.config.splitLanguages(arena, args[i]);
                 } else fail(usage);
             }
             _ = try subs.fetch(env, args[2], opts);
@@ -171,17 +170,5 @@ fn fail(msg: []const u8) noreturn {
 }
 
 test {
-    _ = @import("dns.zig");
-    _ = @import("discovery.zig");
-    _ = @import("probe.zig");
-    _ = @import("commands.zig");
-    _ = @import("media/subtitles.zig");
-    _ = @import("av_extra.zig");
-    _ = @import("cast/proto.zig");
-    _ = @import("cast/channel.zig");
-    _ = @import("http/server.zig");
-    _ = @import("media/pipeline.zig");
-    _ = @import("media/hls.zig");
-    _ = @import("media/vmp4.zig");
-    _ = @import("subs/subs.zig");
+    _ = @import("root.zig");
 }

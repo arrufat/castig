@@ -6,7 +6,8 @@ const std = @import("std");
 const Io = std.Io;
 const commands = @import("../commands.zig");
 const extra = @import("../av_extra.zig");
-const config = @import("config.zig");
+/// Credentials and the language order.
+pub const config = @import("config.zig");
 const release = @import("release.zig");
 const opensubtitles = @import("opensubtitles.zig");
 

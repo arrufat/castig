@@ -117,10 +117,16 @@ up automatically.
 ```sh
 zig build                 # debug build, compiles ffmpeg from source the first time
 zig build test            # unit tests
+zig build docs            # API documentation into zig-out/docs
 zig build run -- ls
 zig build run -- probe movie.mkv
 zig build run -- cast "living room" https://example.com/clip.mp4
 ```
+
+`zig build docs` renders every module reachable from `src/root.zig`. Autodoc
+loads its sources over HTTP, so browse it with a static server, for example
+`python -m http.server -d zig-out/docs`, rather than opening `index.html`
+from disk.
 
 Static release binary:
 
@@ -146,6 +152,7 @@ misbehaves.
 ## Layout
 
 ```
+src/root.zig            library root: re-exports every module, the docs root
 src/main.zig            command-line entry point
 src/probe.zig           `probe`: stream listing and cast verdict
 src/discovery.zig       `ls`: mDNS discovery
