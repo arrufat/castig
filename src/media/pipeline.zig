@@ -105,6 +105,11 @@ pub fn extractSubtitles(gpa: std.mem.Allocator, path: []const u8, indices: []con
     for (indices) |i| if (i >= ic.nb_streams) return error.NoSuchStream;
     extra.discardOthers(ic, indices);
 
+    // Fixed per stream, so the packet loop does not look them up again.
+    const codecs = try gpa.alloc([]const u8, indices.len);
+    defer gpa.free(codecs);
+    for (indices, 0..) |i, slot| codecs[slot] = extra.codecName(extra.codecId(ic.streams[i].codecpar));
+
     const outs = try gpa.alloc(std.ArrayList(u8), indices.len);
     defer gpa.free(outs);
     @memset(outs, .empty);
@@ -123,10 +128,9 @@ pub fn extractSubtitles(gpa: std.mem.Allocator, path: []const u8, indices: []con
         const slot = std.mem.findScalar(usize, indices, @intCast(pkt.stream_index)) orelse continue;
 
         const st = ic.streams[@intCast(pkt.stream_index)];
-        const codec = extra.codecName(extra.codecId(st.codecpar));
         const start_ms = extra.av_rescale_q(pkt.pts, st.time_base, extra.millis);
         const end_ms = if (pkt.duration > 0) extra.av_rescale_q(pkt.pts + pkt.duration, st.time_base, extra.millis) else start_ms + 2000;
-        try webvtt.writeVttCue(gpa, &outs[slot], start_ms, end_ms, codec, pkt.data[0..@intCast(pkt.size)]);
+        try webvtt.writeVttCue(gpa, &outs[slot], start_ms, end_ms, codecs[slot], pkt.data[0..@intCast(pkt.size)]);
     }
 
     const result = try gpa.alloc([]u8, indices.len);
@@ -219,49 +223,44 @@ pub const Input = struct {
 
 /// The output container of a remux, and what each one needs from the muxer.
 pub const Container = enum {
-    /// MPEG-TS, for HLS segments: copied H.264/HEVC goes through the Annex-B
-    /// bitstream filter (start codes, in-band SPS/PPS).
+    /// MPEG-TS, for HLS segments. The muxer puts copied H.264/HEVC through the
+    /// Annex-B filter itself (start codes, in-band SPS/PPS).
     mpegts,
     /// Fragmented MP4 live stream: init is ftyp+moov, each fragment is
     /// moof+mdat, timestamps kept absolute.
     fmp4,
 
-    fn muxerName(c: Container) [*:0]const u8 {
+    const Spec = struct {
+        muxer: [*:0]const u8,
+        movflags: ?[*:0]const u8 = null,
+        /// Whether the muxer must leave negative timestamps alone.
+        absolute_ts: bool = false,
+    };
+
+    fn spec(c: Container) Spec {
         return switch (c) {
-            .mpegts => "mpegts",
-            .fmp4 => "mp4",
+            .mpegts => .{ .muxer = "mpegts" },
+            .fmp4 => .{
+                .muxer = "mp4",
+                .movflags = "frag_keyframe+empty_moov+default_base_moof",
+                .absolute_ts = true,
+            },
         };
-    }
-
-    fn annexb(c: Container) bool {
-        return c == .mpegts;
-    }
-
-    fn movflags(c: Container) ?[*:0]const u8 {
-        return switch (c) {
-            .mpegts => null,
-            .fmp4 => "frag_keyframe+empty_moov+default_base_moof",
-        };
-    }
-
-    fn keepAbsoluteTs(c: Container) bool {
-        return c == .fmp4;
     }
 };
 
-/// Copied video, when the source has any.
+/// Copied video, when the source has any: the stream indices and the time
+/// bases its packets are rescaled with, so the loop looks up neither stream
+/// per packet.
+///
+/// MPEG-TS wants Annex-B NALs, but the muxer inserts `h264_mp4toannexb` (and
+/// its HEVC and VVC siblings) itself: `AVFMT_FLAG_AUTO_BSF` is on by default.
 const VideoCopy = struct {
-    in_index: usize,
+    in_index: c_int,
     out_index: c_int,
-    /// Annex-B filter for MPEG-TS; null when the container takes AVCC as is.
-    bsf: ?*extra.BSFContext,
-
-    fn deinit(v: *VideoCopy) void {
-        if (v.bsf) |b| {
-            var bb: ?*extra.BSFContext = b;
-            extra.av_bsf_free(&bb);
-        }
-    }
+    in_time_base: av.Rational,
+    /// Only valid once `writeHeader` has run: the muxer picks it there.
+    out_time_base: av.Rational = undefined,
 };
 
 /// One window's muxer, AAC encoder and sink.
@@ -277,7 +276,7 @@ const Output = struct {
         const enc = try openStereoAacEncoder(in.dec);
         errdefer enc.free();
 
-        const oc = try extra.allocOutputContext(container.muxerName());
+        const oc = try extra.allocOutputContext(container.spec().muxer);
         errdefer av.avformat_free_context(oc);
 
         const avio = try Sink.Avio.alloc(sink, null);
@@ -285,24 +284,14 @@ const Output = struct {
         oc.pb = avio;
 
         var video: ?VideoCopy = null;
-        errdefer if (video) |*v| v.deinit();
         if (in.video_index) |vi| {
             const in_video = in.ic.streams[vi];
-            var bsf: ?*extra.BSFContext = null;
-            const vcodec = extra.codecName(extra.codecId(in_video.codecpar));
-            if (container.annexb()) if (extra.annexbFilterName(vcodec)) |filter_name| {
-                const filter = extra.av_bsf_get_by_name(filter_name) orelse return error.BsfNotFound;
-                var ctx: ?*extra.BSFContext = null;
-                _ = try av.wrap(extra.av_bsf_alloc(filter, &ctx));
-                const b = ctx.?;
-                try extra.copyParameters(b.par_in, in_video.codecpar);
-                b.time_base_in = in_video.time_base;
-                _ = try av.wrap(extra.av_bsf_init(b));
-                bsf = b;
+            const out_video = try extra.addCopiedStream(oc, in_video.codecpar, in_video.time_base);
+            video = .{
+                .in_index = @intCast(vi),
+                .out_index = out_video.index,
+                .in_time_base = in_video.time_base,
             };
-            const par = if (bsf) |b| b.par_out else in_video.codecpar;
-            const out_video = try extra.addCopiedStream(oc, par, in_video.time_base);
-            video = .{ .in_index = vi, .out_index = out_video.index, .bsf = bsf };
         }
 
         const out_audio = try extra.addEncodedStream(oc, enc);
@@ -318,18 +307,19 @@ const Output = struct {
     }
 
     fn deinit(o: *Output) void {
-        if (o.video) |*v| v.deinit();
         av.IOContext.free(o.avio);
         av.avformat_free_context(o.oc);
         o.enc.free();
     }
 
     fn writeHeader(o: *Output, container: Container) !void {
-        if (container.keepAbsoluteTs()) o.oc.avoid_negative_ts = extra.AVFMT_AVOID_NEG_TS_DISABLED;
+        const spec = container.spec();
+        if (spec.absolute_ts) o.oc.avoid_negative_ts = extra.AVFMT_AVOID_NEG_TS_DISABLED;
         var opts: av.Dictionary.Mutable = .empty;
         defer opts.free();
-        if (container.movflags()) |f| try opts.set("movflags", f, .{});
+        if (spec.movflags) |f| try opts.set("movflags", f, .{});
         try extra.writeHeader(o.oc, &opts);
+        if (o.video) |*v| v.out_time_base = o.oc.streams[@intCast(v.out_index)].time_base;
     }
 
     /// Copies video and transcodes audio for [start_time, end_time) into the
@@ -345,8 +335,7 @@ const Output = struct {
 
         const pkt = try av.Packet.alloc();
         defer pkt.free();
-        const vpkt = try av.Packet.alloc();
-        defer vpkt.free();
+        const audio_index: c_int = @intCast(in.audio_index);
 
         while (true) {
             in.ic.read_frame(pkt) catch |err| switch (err) {
@@ -356,29 +345,14 @@ const Output = struct {
             defer pkt.unref();
             if (o.sink.failed) return error.WriteFailed;
 
-            if (o.video != null and pkt.stream_index == @as(c_int, @intCast(o.video.?.in_index))) {
-                const v = o.video.?;
-                const in_tb = in.ic.streams[v.in_index].time_base;
-                const out_tb = o.oc.streams[@intCast(v.out_index)].time_base;
-                if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE and extra.toSeconds(pkt.pts, in_tb) >= end) break;
-                if (v.bsf) |b| {
-                    try extra.bsfSend(b, pkt);
-                    while (true) {
-                        extra.bsfReceive(b, vpkt) catch |err| switch (err) {
-                            error.WouldBlock, error.EndOfFile => break,
-                            else => return err,
-                        };
-                        extra.av_packet_rescale_ts(vpkt, in_tb, out_tb);
-                        vpkt.stream_index = v.out_index;
-                        try extra.writeFrame(o.oc, vpkt);
-                        vpkt.unref();
-                    }
-                } else {
-                    extra.av_packet_rescale_ts(pkt, in_tb, out_tb);
-                    pkt.stream_index = v.out_index;
-                    try extra.writeFrame(o.oc, pkt);
-                }
-            } else if (pkt.stream_index == @as(c_int, @intCast(in.audio_index))) {
+            if (o.video) |v| if (pkt.stream_index == v.in_index) {
+                if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE and extra.toSeconds(pkt.pts, v.in_time_base) >= end) break;
+                extra.av_packet_rescale_ts(pkt, v.in_time_base, v.out_time_base);
+                pkt.stream_index = v.out_index;
+                try extra.writeFrame(o.oc, pkt);
+                continue;
+            };
+            if (pkt.stream_index == audio_index) {
                 // Without video the audio timestamps bound the window.
                 if (o.video == null) if (end_time) |end| if (pkt.pts != av.NOPTS_VALUE) {
                     if (extra.toSeconds(pkt.pts, in_audio.time_base) >= end) break;

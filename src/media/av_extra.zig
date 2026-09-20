@@ -126,7 +126,6 @@ pub fn avioTell(s: *av.IOContext) u64 {
 }
 
 /// `AVFormatContext.avoid_negative_ts`.
-pub const AVFMT_AVOID_NEG_TS_AUTO: c_int = -1;
 pub const AVFMT_AVOID_NEG_TS_DISABLED: c_int = 0;
 
 /// `seek_frame` flags.
@@ -301,45 +300,6 @@ pub const IndexEntry = extern struct {
 
 pub extern fn avformat_index_get_entries_count(st: *const av.Stream) c_int;
 pub extern fn avformat_index_get_entry(st: *av.Stream, idx: c_int) ?*const IndexEntry;
-
-// --- bitstream filters (libavcodec) ----------------------------------------
-//
-// Copying H.264/HEVC from MP4/MKV (length-prefixed NALs, parameter sets in
-// extradata) into MPEG-TS needs the `*_mp4toannexb` filter to emit start codes
-// and repeat SPS/PPS in-band before each keyframe. The muxer API does not
-// apply it automatically the way the ffmpeg CLI does.
-
-pub const BSFContext = extern struct {
-    av_class: ?*const anyopaque,
-    filter: ?*const anyopaque,
-    priv_data: ?*anyopaque,
-    par_in: *av.Codec.Parameters,
-    par_out: *av.Codec.Parameters,
-    time_base_in: av.Rational,
-    time_base_out: av.Rational,
-};
-
-pub extern fn av_bsf_get_by_name(name: [*:0]const u8) ?*const anyopaque;
-pub extern fn av_bsf_alloc(filter: *const anyopaque, ctx: *?*BSFContext) c_int;
-pub extern fn av_bsf_init(ctx: *BSFContext) c_int;
-pub extern fn av_bsf_send_packet(ctx: *BSFContext, pkt: ?*av.Packet) c_int;
-pub extern fn av_bsf_receive_packet(ctx: *BSFContext, pkt: *av.Packet) c_int;
-pub extern fn av_bsf_free(ctx: *?*BSFContext) void;
-
-/// The Annex-B filter for a codec, or null if none is needed.
-pub fn annexbFilterName(codec: []const u8) ?[*:0]const u8 {
-    if (std.mem.eql(u8, codec, "h264")) return "h264_mp4toannexb";
-    if (std.mem.eql(u8, codec, "hevc")) return "hevc_mp4toannexb";
-    return null;
-}
-
-pub fn bsfSend(ctx: *BSFContext, pkt: ?*av.Packet) av.Error!void {
-    _ = try av.wrap(av_bsf_send_packet(ctx, pkt));
-}
-
-pub fn bsfReceive(ctx: *BSFContext, pkt: *av.Packet) av.Error!void {
-    _ = try av.wrap(av_bsf_receive_packet(ctx, pkt));
-}
 
 // --- channel layout default (libavutil) ------------------------------------
 pub extern fn av_channel_layout_default(ch_layout: *av.ChannelLayout, nb_channels: c_int) void;
