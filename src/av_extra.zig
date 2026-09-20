@@ -37,6 +37,20 @@ pub fn durationSeconds(ic: *const av.FormatContext) ?f64 {
     return @as(f64, @floatFromInt(ic.duration)) / TIME_BASE;
 }
 
+/// A stream's average frame rate, or null when the demuxer does not know it.
+pub fn streamFps(st: *const av.Stream) ?f64 {
+    if (st.avg_frame_rate.den == 0 or st.avg_frame_rate.num == 0) return null;
+    return st.avg_frame_rate.q2d();
+}
+
+/// Frame rate of the first video stream, or null.
+pub fn videoFps(ic: *const av.FormatContext) ?f64 {
+    for (ic.streams[0..ic.nb_streams]) |st| {
+        if (st.codecpar.codec_type == .VIDEO) return streamFps(st);
+    }
+    return null;
+}
+
 /// A timestamp in `tb` units as seconds, for display and window bounds.
 pub fn toSeconds(ts: i64, tb: av.Rational) f64 {
     return @as(f64, @floatFromInt(ts)) * tb.q2d();

@@ -13,6 +13,7 @@ const pipeline = @import("media/pipeline.zig");
 const hls = @import("media/hls.zig");
 const vmp4 = @import("media/vmp4.zig");
 const extra = @import("av_extra.zig");
+const subs_mod = @import("subs/subs.zig");
 
 const log = std.log.scoped(.cast);
 
@@ -24,6 +25,8 @@ pub const Env = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     out: *Io.Writer,
+    /// The process environment, for XDG directories and credential overrides.
+    environ: *const std.process.Environ.Map,
 };
 
 pub fn status(env: Env, device: []const u8) !void {
@@ -73,13 +76,22 @@ pub const Remux = enum {
     stream,
 };
 
+/// Where the side-loaded subtitle track comes from.
+pub const Subtitles = union(enum) {
+    /// No `--subs`: a sidecar next to the video, when there is one.
+    sidecar,
+    /// `--subs auto`: the sidecar, else an OpenSubtitles hash match.
+    download,
+    /// A WebVTT URL, or a local .srt/.vtt castig converts and serves.
+    source: []const u8,
+};
+
 pub const CastOptions = struct {
     /// http(s) URL the receiver fetches itself, or a local path castig serves.
     source: []const u8,
     title: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
-    /// WebVTT URL, or a local .srt/.vtt file castig converts and serves.
-    subtitles: ?[]const u8 = null,
+    subtitles: Subtitles = .sidecar,
     remux: Remux = .auto,
 };
 
@@ -221,20 +233,39 @@ const Serving = struct {
         return .{ .path = hls.url_prefix ++ hls.master_name, .content_type = hls.cast_content_type, .hls = true };
     }
 
+    /// The `--subs` / sidecar / downloaded track, enabled from the start.
+    fn addSideloaded(s: *Serving, sub: []const u8, tracks: *std.ArrayList(Channel.TextTrack), active: *std.ArrayList(u32)) !void {
+        const arena = s.env.arena;
+        const url = if (isUrl(sub)) sub else blk: {
+            const srt = Io.Dir.cwd().readFileAlloc(s.env.io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
+                std.debug.print("cannot read {s}: {s}\n", .{ sub, @errorName(err) });
+                return error.SourceUnreadable;
+            };
+            try s.routes.append(arena, .{
+                .path = "/sub.vtt",
+                .body = .{ .bytes = .{ .content_type = "text/vtt", .data = try subtitles.srtToVtt(arena, srt) } },
+            });
+            break :blk "/sub.vtt";
+        };
+        const id: u32 = @intCast(tracks.items.len + 1);
+        try tracks.append(arena, .{ .id = id, .url = url, .name = "Subtitles" });
+        try active.append(arena, id);
+    }
+
     /// One route per embedded text subtitle stream, all extracted together.
     fn addEmbeddedSubtitles(s: *Serving, streams: []const pipeline.SubtitleStream, tracks: *std.ArrayList(Channel.TextTrack)) !void {
         if (streams.len == 0) return;
         const arena = s.env.arena;
         const indices = try arena.alloc(usize, streams.len);
         for (streams, 0..) |e, i| indices[i] = e.index;
-        const subs = try arena.create(EmbeddedSubtitles);
-        subs.* = .{ .gpa = s.env.gpa, .io = s.env.io, .path = s.source, .indices = indices };
-        s.embedded = subs;
+        const embedded = try arena.create(EmbeddedSubtitles);
+        embedded.* = .{ .gpa = s.env.gpa, .io = s.env.io, .path = s.source, .indices = indices };
+        s.embedded = embedded;
 
         for (streams, 0..) |e, slot| {
             const path = try arena.print("/embsub{d}.vtt", .{e.index});
             const route = try arena.create(EmbeddedSubtitleRoute);
-            route.* = .{ .subs = subs, .slot = slot };
+            route.* = .{ .subs = embedded, .slot = slot };
             try s.addRoute(path, route, embSubHandle);
             const name = if (e.title.len > 0)
                 e.title
@@ -293,6 +324,14 @@ pub fn cast(env: Env, device: []const u8, opts: CastOptions) !void {
 
     var serving: Serving = .{ .env = env, .source = opts.source };
     defer serving.deinit();
+    var sub_source: ?[]const u8 = switch (opts.subtitles) {
+        .source => |s| s,
+        .sidecar, .download => null,
+    };
+    const want_download = switch (opts.subtitles) {
+        .download => true,
+        else => false,
+    };
     var text_tracks: std.ArrayList(Channel.TextTrack) = .empty;
     var active_tracks: std.ArrayList(u32) = .empty;
     var duration: ?f64 = null;
@@ -340,24 +379,12 @@ pub fn cast(env: Env, device: []const u8, opts: CastOptions) !void {
             },
         }
         try serving.addEmbeddedSubtitles(p.subtitles, &text_tracks);
+        if (sub_source == null) sub_source = try subs_mod.resolve(env, opts.source, want_download, p.fps);
+    } else if (want_download) {
+        std.debug.print("--subs auto needs a local file\n", .{});
     }
-    // The --subs track starts enabled; embedded tracks are advertised off.
-    if (opts.subtitles) |sub| {
-        const url = if (isUrl(sub)) sub else blk: {
-            const srt = Io.Dir.cwd().readFileAlloc(io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
-                std.debug.print("cannot read {s}: {s}\n", .{ sub, @errorName(err) });
-                return error.SourceUnreadable;
-            };
-            try serving.routes.append(arena, .{
-                .path = "/sub.vtt",
-                .body = .{ .bytes = .{ .content_type = "text/vtt", .data = try subtitles.srtToVtt(arena, srt) } },
-            });
-            break :blk "/sub.vtt";
-        };
-        const id: u32 = @intCast(text_tracks.items.len + 1);
-        try text_tracks.append(arena, .{ .id = id, .url = url, .name = "Subtitles" });
-        try active_tracks.append(arena, id);
-    }
+    // The side-loaded track starts enabled; embedded tracks are advertised off.
+    if (sub_source) |sub| try serving.addSideloaded(sub, &text_tracks, &active_tracks);
 
     resolved = true;
     const address = try resolving.await(io);

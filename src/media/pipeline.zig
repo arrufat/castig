@@ -33,6 +33,8 @@ pub const Plan = struct {
     direct: bool,
     video_unsupported: bool,
     duration: ?f64,
+    /// First video stream's average frame rate, when the demuxer knows it.
+    fps: ?f64,
     video_codec: []const u8,
     audio_codec: []const u8,
     /// Text subtitle streams we can offer as WebVTT tracks (bitmap subs skipped).
@@ -86,6 +88,7 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
         .direct = video_ok and audio_ok,
         .video_unsupported = have_video and !video_ok,
         .duration = extra.durationSeconds(ic),
+        .fps = extra.videoFps(ic),
         .video_codec = video_codec,
         .audio_codec = audio_codec,
         .subtitles = try subs.toOwnedSlice(gpa),

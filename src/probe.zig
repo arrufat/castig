@@ -73,7 +73,7 @@ pub fn run(gpa: std.mem.Allocator, out: *Io.Writer, path: []const u8) !void {
 
         switch (par.codec_type) {
             .VIDEO => {
-                const fps = if (st.avg_frame_rate.den != 0) st.avg_frame_rate.q2d() else 0;
+                const fps = extra.streamFps(st) orelse 0;
                 try out.print(" {d}x{d} {d:.3} fps", .{ par.width, par.height, fps });
                 const s = videoSupport(codec);
                 try out.print(" -> {s}", .{s.label()});
