@@ -30,6 +30,8 @@ pub const playback = @import("device/playback.zig");
 pub const player = @import("device/player.zig");
 /// Receiver discovery over mDNS.
 pub const discovery = @import("device/discovery.zig");
+/// What a device needs of the bytes we serve it.
+pub const traits = @import("device/traits.zig");
 /// DNS wire format: query builder, record parser.
 pub const dns = @import("device/dns.zig");
 /// XML: element scanner, text and attribute lookup, escaping.
@@ -76,6 +78,7 @@ test {
     _ = playback;
     _ = player;
     _ = discovery;
+    _ = traits;
     _ = dns;
     _ = xml;
     _ = sweep;

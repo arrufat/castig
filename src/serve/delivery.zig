@@ -13,7 +13,7 @@ const av = @import("av");
 const Env = @import("../env.zig").Env;
 const language = @import("../language.zig");
 const playback = @import("../device/playback.zig");
-const didl = @import("../device/dlna/didl.zig");
+const Traits = @import("../device/traits.zig").Traits;
 const http = @import("server.zig");
 const hls = @import("../media/hls.zig");
 const pipeline = @import("../media/pipeline.zig");
@@ -133,9 +133,8 @@ pub const Routes = struct {
     env: Env,
     source: []const u8,
     list: std.ArrayList(http.Route) = .empty,
-    /// Whether the device is a renderer, which has to be told what it may
-    /// do with a response before it will seek in one.
-    dlna: bool = false,
+    /// What the device needs of what we serve it.
+    traits: Traits = .cast,
     tracks: std.ArrayList(playback.TextTrack) = .empty,
     active: std.ArrayList(u32) = .empty,
     segmenter: ?*hls.Segmenter = null,
@@ -152,12 +151,12 @@ pub const Routes = struct {
         if (s.embedded) |e| e.deinit();
     }
 
-    /// What a route says it is. A renderer needs the DLNA flags; a Cast
-    /// receiver ignores them, so they are left off entirely.
+    /// What a route says it is, including whatever the device has to be
+    /// told before it will do anything clever with the body.
     fn media(s: *const Routes, content_type: []const u8, seekable: bool) http.Media {
         return .{
             .content_type = content_type,
-            .features = if (s.dlna) didl.contentFeatures(seekable) else null,
+            .features = s.traits.featuresFor(seekable),
         };
     }
 
@@ -228,12 +227,10 @@ pub const Routes = struct {
                 log.warn("cannot read {s}: {s}", .{ sub, @errorName(err) });
                 return error.SourceUnreadable;
             };
-            // A renderer is handed SubRip, which is what the conventions for
-            // side-loading one all assume; Cast is handed WebVTT, which is the
-            // only thing it reads. SubRip is only served as it is: converting
-            // WebVTT back is not worth it for the few renderers that take it.
+            // SubRip is only served as it is: converting WebVTT back is not
+            // worth it for the few devices that would then take it.
             const is_srt = std.ascii.endsWithIgnoreCase(sub, ".srt");
-            const serve: playback.TextTrack.Format = if (s.dlna and is_srt) .srt else .vtt;
+            const serve: playback.TextTrack.Format = if (is_srt and s.traits.subtitle_format == .srt) .srt else .vtt;
             const body = if (serve == .srt) text else try webvtt.srtToVtt(arena, text);
             // The language goes in the name, the way a sidecar carries it.
             // None of the ways of naming a subtitle to a renderer has a
@@ -250,7 +247,7 @@ pub const Routes = struct {
                 .path = url,
                 .body = .{ .bytes = .{ .media = m, .data = body } },
             });
-            if (s.dlna and serve != .srt) {
+            if (s.traits.subtitle_format == .srt and serve != .srt) {
                 log.warn("this subtitle is WebVTT; most renderers only take SubRip", .{});
             }
         }

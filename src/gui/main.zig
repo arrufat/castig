@@ -104,9 +104,9 @@ const remux_labels: std.EnumArray(castig.delivery.Remux, []const u8) = .init(.{
     .stream = "stream (instant, no seek)",
 });
 
-/// The same choices as a renderer sees them: it does not play HLS, so what
-/// `auto` means differs and asking for HLS gets the mp4 anyway.
-const renderer_remux_labels: std.EnumArray(castig.delivery.Remux, []const u8) = .init(.{
+/// The same choices for a device that does not play HLS: what `auto` means
+/// differs, and asking for HLS gets the mp4 anyway.
+const no_hls_remux_labels: std.EnumArray(castig.delivery.Remux, []const u8) = .init(.{
     .auto = "auto (mp4)",
     .hls = "hls (renderers cannot, sends mp4)",
     .mp4 = "mp4 (seekable, prepares)",
@@ -381,12 +381,12 @@ fn describeCandidates(arena: std.mem.Allocator, l: castig.subs.Lookup) ![]const 
     return rows;
 }
 
-/// What the chosen device speaks, when one is chosen. Several controls
-/// only make sense for one of the two.
-fn selectedProtocol() ?castig.discovery.Protocol {
+/// What the chosen device needs of what we serve it, when one is chosen.
+/// Several controls only make sense where the device can take them.
+fn selectedTraits() ?castig.traits.Traits {
     const index = app.device orelse return null;
     if (index >= app.devices.len) return null;
-    return app.devices[index].protocol;
+    return .of(app.devices[index].protocol);
 }
 
 fn selectDevice(index: usize) void {
@@ -522,7 +522,8 @@ fn sourcePanel() !void {
 
         dvui.label(@src(), "Remux", .{}, .{ .gravity_y = 0.5 });
         var mode: usize = @intFromEnum(app.remux);
-        const labels = if (selectedProtocol() == .dlna) &renderer_remux_labels.values else &remux_labels.values;
+        const plays_hls = if (selectedTraits()) |t| t.plays_hls else true;
+        const labels = if (plays_hls) &remux_labels.values else &no_hls_remux_labels.values;
         if (dvui.dropdown(@src(), labels, .{ .choice = &mode }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
             app.remux = @enumFromInt(mode);
         }
@@ -606,8 +607,9 @@ fn playbackPanel() !void {
         if (dvui.button(@src(), "+10", .{}, .{})) try dispatch(runSeek, .{"+10"});
 
         // Nothing worth having implements a speed other than 1 over UPnP
-        // AV, so the renderers say no and the control says so first.
-        if (selectedProtocol() == .dlna) {
+        // AV, so the device says no and the control says so first.
+        const variable_rate = if (selectedTraits()) |t| t.variable_rate else true;
+        if (!variable_rate) {
             dvui.label(@src(), "x1 only", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 90 } });
         } else {
             // The receiver's rate only when nobody is dragging: it would undo

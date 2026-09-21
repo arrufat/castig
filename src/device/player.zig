@@ -156,13 +156,6 @@ pub const Player = union(enum) {
         };
     }
 
-    pub fn protocol(p: Player) discovery.Protocol {
-        return switch (p) {
-            .cast => .cast,
-            .dlna => .dlna,
-        };
-    }
-
     /// The last thing the device said, without asking it again.
     pub fn current(p: Player) playback.Playback {
         return switch (p) {

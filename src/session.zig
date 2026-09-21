@@ -15,6 +15,7 @@ const Env = @import("env.zig").Env;
 const Player = @import("device/player.zig").Player;
 const discovery = @import("device/discovery.zig");
 const playback = @import("device/playback.zig");
+const Traits = @import("device/traits.zig").Traits;
 const extra = @import("media/av_extra.zig");
 const pipeline = @import("media/pipeline.zig");
 const support = @import("media/support.zig");
@@ -61,15 +62,15 @@ pub const Event = union(enum) {
     closed,
 };
 
-/// Which delivery a device can actually take. Renderers do not play HLS,
-/// so `auto` means the seekable mp4 there, and asking for HLS outright
-/// gets the nearest thing that works rather than a load that fails.
-fn deliveryFor(want: delivery.Remux, protocol: discovery.Protocol) delivery.Remux {
-    if (protocol == .cast) return want;
+/// Which delivery a device can actually take. Without HLS, `auto` means
+/// the seekable mp4, and asking for HLS outright gets the nearest thing
+/// that works rather than a load that fails.
+fn deliveryFor(want: delivery.Remux, traits: Traits) delivery.Remux {
+    if (traits.plays_hls) return want;
     return switch (want) {
         .auto, .mp4 => .mp4,
         .hls => blk: {
-            log.warn("DLNA renderers do not play HLS; serving a seekable mp4 instead", .{});
+            log.warn("this device does not play HLS; serving a seekable mp4 instead", .{});
             break :blk .mp4;
         },
         .stream => blk: {
@@ -164,17 +165,18 @@ pub const Session = struct {
         // so it has to be known before the routes are built.
         resolved = true;
         s.endpoint = try resolving.await(io);
-        const protocol = s.endpoint.protocol();
-        s.routes.dlna = protocol == .dlna;
+        const traits: Traits = .of(s.endpoint.protocol());
+        s.routes.traits = traits;
 
-        // A renderer is asked what it accepts before the delivery is
-        // chosen, since that answer decides whether the file needs touching
-        // at all, and asking is a couple of HTTP requests. A Cast receiver
-        // is left until after the heavy work: it drops a channel whose
-        // heartbeat PINGs go unanswered during a long mp4 build.
+        // A device whose abilities are its own claim is asked before the
+        // delivery is chosen, since that answer decides whether the file
+        // needs touching at all, and asking is a couple of HTTP requests.
+        // One with a fixed list is left until after the heavy work: a Cast
+        // channel drops when its heartbeat PINGs go unanswered during a
+        // long mp4 build.
         var connected = false;
         errdefer if (connected) s.player.deinit();
-        if (protocol == .dlna) {
+        if (traits.profile_is_claimed) {
             s.player = try Player.connect(env, s.endpoint);
             connected = true;
         }
@@ -187,7 +189,7 @@ pub const Session = struct {
             }
             if (verdict.direct or verdict.video_unsupported) {
                 s.target = try s.routes.addFile(content_type);
-            } else switch (deliveryFor(opts.remux, protocol)) {
+            } else switch (deliveryFor(opts.remux, traits)) {
                 .auto, .hls => {
                     log.info("remuxing {s} audio to aac (hls)", .{p.audio_codec});
                     probed = null;
@@ -203,11 +205,11 @@ pub const Session = struct {
                     s.target = try s.routes.addMp4(p.ic);
                 },
             }
-            // Cast takes extra tracks as separate WebVTT routes and puts
-            // them in its own menu. UPnP AV has no verb for choosing a
-            // track at all, so what a renderer does with the ones inside
-            // the file is its own business, and often not changeable.
-            if (protocol == .cast) {
+            // A device with a subtitle menu takes the extra tracks as
+            // routes of their own. Without one there is no verb for
+            // choosing a track, so what it does with the ones inside the
+            // file is its own business, and often not changeable.
+            if (traits.subtitle_menu) {
                 try s.routes.addEmbeddedSubtitles(p.subtitles);
             } else if (p.subtitles.len > 0) {
                 if (verdict.direct) {
@@ -298,8 +300,6 @@ pub const Session = struct {
     /// before it ever played, and the seekable mp4 is the fallback. The build
     /// takes a while, so the idle connection is reopened afterwards.
     fn fallBack(s: *Session) !bool {
-        // Retrying as an mp4 is a Cast thing: a renderer is never sent HLS.
-        if (s.player.protocol() != .cast) return false;
         const failed = if (s.media.ended) |e| e == .failed else false;
         if (s.played or !failed) return false;
         if (s.opts.remux != .auto or !s.target.isHls() or !s.local) return false;
