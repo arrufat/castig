@@ -10,36 +10,23 @@ const usage =
     \\usage: castig <command> [args]
     \\
     \\commands:
-    \\  ls [--timeout <ms>]   discover cast devices on the local network (default 2000 ms)
-    \\  probe <file>          print the streams of a media file and whether it can be cast directly
-    \\  status <device>       show what the receiver is doing
-    \\  cast <device> <file|url> [--title <t>] [--type <mime>] [--subs <file|url|auto>] [--remux <mode>]
-    \\                        play a local file or a URL and follow playback.
-    \\                        --subs adds a .srt or .vtt track (on by default);
-    \\                        without it a sidecar <name>.srt / <name>.<lang>.srt
-    \\                        next to the file is used, and `--subs auto` downloads
-    \\                        a hash match from OpenSubtitles when there is none.
-    \\                        Embedded text subtitles are offered too, pick one
-    \\                        from the receiver's subtitle menu. When audio must
-    \\                        be remuxed, --remux picks how: auto (default: hls,
-    \\                        falling back to mp4 if the receiver refuses it),
-    \\                        hls (seekable, instant), mp4 (seekable, no temp
-    \\                        file, brief startup), or stream (instant, no seek)
-    \\  pause <device>        pause the current item
-    \\  play <device>         resume the current item
-    \\  seek <device> <pos>   jump to <pos>: seconds, m:ss, h:mm:ss, or +N / -N relative
-    \\  rate <device> <x>     set playback speed, 0.5 to 2.0
-    \\  stop <device>         stop whatever app is running on the receiver
-    \\  ui                    open the window (runs castigui, built by `zig build gui`)
-    \\  subs <file> [--lang en,ko] [--auto]
-    \\                        download a subtitle from OpenSubtitles.com next to
-    \\                        the file: pick from a ranked list, or with --auto
-    \\                        take a trusted hash match only. Needs an API key
-    \\                        and login in ~/.config/castig/config (see README)
-    \\  version               print the version
-    \\  help                  show this message
+    \\  ls        discover cast devices on the local network
+    \\  probe     print a file's streams and whether it can be cast directly
+    \\  status    show what the receiver is doing
+    \\  cast      play a local file or a URL and follow playback
+    \\  pause     pause the current item
+    \\  play      resume the current item
+    \\  seek      jump to a position
+    \\  rate      set playback speed
+    \\  stop      stop whatever app is running on the receiver
+    \\  ui        open the window
+    \\  subs      download a subtitle next to a video
+    \\  version   print the version
+    \\  help      show this message
     \\
     \\<device> is an IP, IP:port, or part of a name shown by `ls`.
+    \\
+    \\Run `castig help <command>` for what a command takes.
     \\
 ;
 
@@ -124,6 +111,13 @@ fn run(init: std.process.Init) !void {
     else
         std.meta.stringToEnum(Command, args[1]) orelse fail(usage);
 
+    // `castig help <command>` and `castig <command> --help` print one page.
+    if (helpTopic(cmd, args)) |topic| {
+        try out.writeAll(help(topic));
+        try out.flush();
+        return;
+    }
+
     switch (cmd) {
         .ls => {
             var timeout_ms: u32 = castig.discovery.default_timeout_ms;
@@ -132,7 +126,7 @@ fn run(init: std.process.Init) !void {
                 if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
                     i += 1;
                     timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch fail("--timeout expects a number of milliseconds\n");
-                } else fail(usage);
+                } else fail(help(cmd));
             }
             const found = try castig.discovery.discover(io, init.gpa, timeout_ms, null);
             defer init.gpa.free(found);
@@ -140,7 +134,7 @@ fn run(init: std.process.Init) !void {
             try render.devices(out, found, timeout_ms);
         },
         .probe => {
-            if (args.len != 3) fail(usage);
+            if (args.len != 3) fail(help(cmd));
             const r = castig.probe.inspect(arena, args[2]) catch |err| {
                 std.debug.print("cannot open {s}: {s}\n", .{ args[2], @errorName(err) });
                 return error.SourceUnreadable;
@@ -148,23 +142,23 @@ fn run(init: std.process.Init) !void {
             try render.report(out, r);
         },
         .status => {
-            if (args.len != 3) fail(usage);
+            if (args.len != 3) fail(help(cmd));
             try render.status(out, try castig.control.status(env, args[2]));
         },
         .stop => {
-            if (args.len != 3) fail(usage);
+            if (args.len != 3) fail(help(cmd));
             try render.stopped(out, try castig.control.stop(env, args[2]));
         },
         .pause, .play => {
-            if (args.len != 3) fail(usage);
+            if (args.len != 3) fail(help(cmd));
             try render.media(out, try castig.control.command(env, args[2], if (cmd == .pause) "PAUSE" else "PLAY"));
         },
         .seek => {
-            if (args.len != 4) fail(usage);
+            if (args.len != 4) fail(help(cmd));
             try render.media(out, try castig.control.seek(env, args[2], args[3]));
         },
         .rate => {
-            if (args.len != 4) fail(usage);
+            if (args.len != 4) fail(help(cmd));
             const value = std.fmt.parseFloat(f64, args[3]) catch {
                 std.debug.print("rate must be a number\n", .{});
                 return error.InvalidRate;
@@ -172,12 +166,12 @@ fn run(init: std.process.Init) !void {
             try render.media(out, try castig.control.rate(env, args[2], value));
         },
         .cast => {
-            if (args.len < 4) fail(usage);
+            if (args.len < 4) fail(help(cmd));
             var opts: castig.session.Options = .{ .source = args[3] };
             var i: usize = 4;
             while (i < args.len) : (i += 1) {
                 const flag = args[i];
-                if (i + 1 >= args.len) fail(usage);
+                if (i + 1 >= args.len) fail(help(cmd));
                 i += 1;
                 if (std.mem.eql(u8, flag, "--title")) {
                     opts.title = args[i];
@@ -187,14 +181,14 @@ fn run(init: std.process.Init) !void {
                     opts.subtitles = if (std.mem.eql(u8, args[i], "auto")) .download else .{ .source = args[i] };
                 } else if (std.mem.eql(u8, flag, "--remux")) {
                     opts.remux = std.meta.stringToEnum(castig.delivery.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
-                } else fail(usage);
+                } else fail(help(cmd));
             }
             const session = try castig.session.Session.start(env, args[2], opts);
             defer session.deinit();
             while (try session.next()) |e| try render.event(out, e);
         },
         .subs => {
-            if (args.len < 3) fail(usage);
+            if (args.len < 3) fail(help(cmd));
             var opts: castig.subs.Options = .{};
             var auto = false;
             var i: usize = 3;
@@ -204,7 +198,7 @@ fn run(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, args[i], "--lang") and i + 1 < args.len) {
                     i += 1;
                     opts.languages = try castig.subs.config.splitLanguages(arena, args[i]);
-                } else fail(usage);
+                } else fail(help(cmd));
             }
             if (!auto and !prompt.interactive(io)) {
                 std.debug.print("stdin is not a terminal, picking automatically\n", .{});
@@ -224,7 +218,7 @@ fn run(init: std.process.Init) !void {
             try out.writeAll("\n");
         },
         .ui => {
-            if (args.len != 2) fail(usage);
+            if (args.len != 2) fail(help(cmd));
             try out.flush();
             return openWindow(env);
         },
@@ -233,6 +227,123 @@ fn run(init: std.process.Init) !void {
     }
 
     try out.flush();
+}
+
+/// The command a help request is about, or null when this is real work.
+fn helpTopic(cmd: Command, args: []const []const u8) ?Command {
+    if (cmd == .help) {
+        if (args.len < 3) return null;
+        return std.meta.stringToEnum(Command, args[2]) orelse fail(usage);
+    }
+    for (args[2..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return cmd;
+    }
+    return null;
+}
+
+/// What a command takes. The index in `usage` stays one line per command, so
+/// everything a command needs explaining goes here.
+fn help(cmd: Command) []const u8 {
+    return switch (cmd) {
+        .ls =>
+        \\usage: castig ls [--timeout <ms>]
+        \\
+        \\Discover cast devices on the local network over mDNS.
+        \\
+        \\  --timeout <ms>  how long to listen for replies (default 2000)
+        \\
+        ,
+        .probe =>
+        \\usage: castig probe <file>
+        \\
+        \\Print the streams of a media file, and whether the receiver can play
+        \\it as it is or the audio has to be transcoded.
+        \\
+        ,
+        .status =>
+        \\usage: castig status <device>
+        \\
+        \\Show what the receiver is playing, and where it is in the item.
+        \\
+        ,
+        .cast =>
+        \\usage: castig cast <device> <file|url> [--title <t>] [--type <mime>]
+        \\                                       [--subs <file|url|auto>] [--remux <mode>]
+        \\
+        \\Play a local file or a URL and follow playback until it ends. Local
+        \\files are served from a built-in HTTP server, so seeking works.
+        \\
+        \\  --title <t>     what the receiver shows as the title
+        \\  --type <mime>   override the media type sent to the receiver
+        \\  --subs <arg>    add a .srt or .vtt track. On by default: without it
+        \\                  a sidecar <name>.srt or <name>.<lang>.srt next to
+        \\                  the file is used. `auto` downloads a hash match
+        \\                  from OpenSubtitles when there is none. Embedded
+        \\                  text subtitles are offered too, pick one from the
+        \\                  receiver's subtitle menu.
+        \\  --remux <mode>  how transcoded audio is delivered:
+        \\                    auto    hls, falling back to mp4 if refused
+        \\                    hls     seekable, starts at once
+        \\                    mp4     seekable, no temp file, brief startup
+        \\                    stream  starts at once, no seeking
+        \\
+        ,
+        .pause =>
+        \\usage: castig pause <device>
+        \\
+        \\Pause the current item, whoever started it.
+        \\
+        ,
+        .play =>
+        \\usage: castig play <device>
+        \\
+        \\Resume the current item, whoever started it.
+        \\
+        ,
+        .seek =>
+        \\usage: castig seek <device> <pos>
+        \\
+        \\Jump to <pos>: seconds, m:ss or h:mm:ss, or +N / -N to move relative
+        \\to where playback is now.
+        \\
+        ,
+        .rate =>
+        \\usage: castig rate <device> <x>
+        \\
+        \\Set playback speed, between 0.5 and 2.0.
+        \\
+        ,
+        .stop =>
+        \\usage: castig stop <device>
+        \\
+        \\Stop whatever app is running on the receiver.
+        \\
+        ,
+        .subs =>
+        \\usage: castig subs <file> [--lang en,ko] [--auto]
+        \\
+        \\Download a subtitle from OpenSubtitles.com next to the file. Needs an
+        \\API key and login in ~/.config/castig/config (see the README).
+        \\
+        \\  --lang <list>   comma separated languages to look for
+        \\  --auto          take a trusted hash match only, without asking
+        \\
+        ,
+        .ui =>
+        \\usage: castig ui
+        \\
+        \\Open the window. Runs castigui, which `zig build gui` builds.
+        \\
+        ,
+        .version =>
+        \\usage: castig version
+        \\
+        \\Print the version: the tag on a release, otherwise a dev version
+        \\carrying the commit count and hash.
+        \\
+        ,
+        .help => usage,
+    };
 }
 
 const gui_exe = "castigui";
