@@ -3,31 +3,21 @@
 const std = @import("std");
 const Io = std.Io;
 const castig = @import("castig");
-const render = @import("render.zig");
 
 /// A numbered list with the best match last, so it sits right above the
 /// prompt. Enter takes it, `q` or end of input declines.
 pub fn pick(io: Io, out: *Io.Writer, l: castig.subs.Lookup) !?usize {
     const cands = l.candidates;
-    var first_feature: ?u64 = null;
-    var multi_feature = false;
-    for (cands) |c| {
-        if (c.feature_id == null) continue;
-        if (first_feature == null) first_feature = c.feature_id else if (first_feature != c.feature_id) multi_feature = true;
-    }
+    const multi_feature = l.manyFeatures();
 
     try out.print("subtitles for {s}", .{Io.Dir.path.basename(l.video)});
-    if (l.fps) |f| {
-        try out.writeAll(" (video ");
-        try render.fps(out, f);
-        try out.writeAll(" fps)");
-    }
+    if (l.fps) |f| try out.print(" (video {f} fps)", .{castig.subs.fmtFps(f)});
     try out.writeAll("\n");
     var i = cands.len;
     while (i > 0) {
         i -= 1;
         try out.print("{d:>3}) ", .{i + 1});
-        try render.candidate(out, cands[i], multi_feature);
+        try cands[i].write(out, multi_feature);
         try out.writeAll("\n");
     }
 

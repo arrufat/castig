@@ -17,6 +17,8 @@ const opensubtitles = @import("opensubtitles.zig");
 const log = std.log.scoped(.subs);
 
 pub const Candidate = opensubtitles.Candidate;
+/// A frame rate for `{f}`, the way both front ends print one.
+pub const fmtFps = opensubtitles.fmtFps;
 /// The language an explicit subtitle path claims, e.g. `Movie.en.srt`.
 pub const languageOf = release.languageOf;
 
@@ -107,6 +109,19 @@ pub const Lookup = struct {
     pub fn confident(l: Lookup) ?usize {
         for (l.candidates, 0..) |c, i| if (c.hash == .voted and !c.fps_mismatch) return i;
         return null;
+    }
+
+    /// Whether the candidates disagree about which film or episode they are
+    /// for, so a row is only worth naming its feature then.
+    pub fn manyFeatures(l: Lookup) bool {
+        var first: ?u64 = null;
+        for (l.candidates) |c| {
+            const id = c.feature_id orelse continue;
+            if (first) |f| {
+                if (f != id) return true;
+            } else first = id;
+        }
+        return false;
     }
 
     /// Why `confident` found nothing, for a caller that has to explain itself.

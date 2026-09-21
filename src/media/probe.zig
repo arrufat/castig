@@ -25,6 +25,17 @@ pub const Stream = struct {
     audio: ?struct { channels: u32, sample_rate: u32 } = null,
     /// A subtitle stream castig can turn into WebVTT; bitmap subtitles cannot.
     text: bool = false,
+
+    /// The codec and what the receiver will do with it. `index` is the
+    /// caller's to print: a window has no room for it.
+    pub fn format(s: Stream, w: *std.Io.Writer) !void {
+        try w.print("{s} {s}", .{ s.type_name, s.codec });
+        if (s.language) |l| try w.print(" [{s}]", .{l});
+        if (s.video) |v| try w.print(" {d}x{d} {d:.3} fps", .{ v.width, v.height, v.fps });
+        if (s.audio) |a| try w.print(" {d} ch {d} Hz", .{ a.channels, a.sample_rate });
+        if (s.support) |sup| try w.print(" -> {s}", .{sup.label()});
+        if (s.kind == .subtitle) try w.writeAll(if (s.text) " -> webvtt" else " -> bitmap, burn-in only");
+    }
 };
 
 pub const Report = struct {
@@ -41,6 +52,18 @@ pub const Report = struct {
 
     pub fn castable(r: Report) bool {
         return r.video != null or r.audio != null;
+    }
+
+    /// The verdict line: what each kind of track costs to deliver.
+    pub fn writeVerdict(r: Report, w: *std.Io.Writer) !void {
+        if (!r.castable()) return w.writeAll("nothing to cast");
+        if (r.video) |v| try w.print("video {s}", .{v.label()});
+        if (r.audio) |a| {
+            if (r.video != null) try w.writeAll(", ");
+            try w.print("audio {s}", .{a.label()});
+        }
+        if (r.text_subs > 0) try w.print(", {d} text subtitle track(s)", .{r.text_subs});
+        if (r.bitmap_subs > 0) try w.print(", {d} bitmap subtitle track(s)", .{r.bitmap_subs});
     }
 };
 

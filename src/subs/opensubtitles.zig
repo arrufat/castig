@@ -36,7 +36,41 @@ pub const Candidate = struct {
     fps: ?f64,
     /// Set by the caller who knows the video's frame rate.
     fps_mismatch: bool = false,
+
+    /// One row: what vouches for the candidate, then what it is. The feature
+    /// is worth naming only when the results disagree about it, which
+    /// `Lookup.manyFeatures` decides.
+    pub fn write(c: Candidate, w: *std.Io.Writer, with_feature: bool) !void {
+        switch (c.hash) {
+            .voted => try w.writeAll("[HASH] "),
+            .match => try w.writeAll("[HASH?] "),
+            .none => {},
+        }
+        try w.print("[{s}]", .{c.lang});
+        if (c.hi) try w.writeAll(" [HI]");
+        if (c.ai) try w.writeAll(" [AI]");
+        try w.print(" {d} dl", .{c.downloads});
+        if (c.fps_mismatch) if (c.fps) |f| try w.print(", {f} fps", .{fmtFps(f)});
+        try w.writeAll(" \u{b7} ");
+        if (with_feature) if (c.feature) |f| try w.print("{s} \u{b7} ", .{f});
+        try w.writeAll(c.release);
+    }
 };
+
+/// A frame rate as two decimals with the trailing zeros dropped: 23.98, 24.
+pub const Fps = struct {
+    value: f64,
+
+    pub fn format(f: Fps, w: *std.Io.Writer) !void {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d:.2}", .{f.value}) catch return;
+        try w.writeAll(std.mem.trimEnd(u8, std.mem.trimEnd(u8, s, "0"), "."));
+    }
+};
+
+pub fn fmtFps(value: f64) Fps {
+    return .{ .value = value };
+}
 
 /// How well the file hash vouches for a candidate, declared worst to best:
 /// `lessThan` sorts on the ordinals.
@@ -489,4 +523,50 @@ test "rank order: language, ai, fps, hi, downloads" {
     for (order, c) |want, got| try std.testing.expectEqual(want, got.file_id);
     rank(&c, .{ .languages = &.{ "ko", "en" }, .prefer_hi = true, .episode = null });
     try std.testing.expectEqual(@as(u64, 5), c[0].file_id);
+}
+
+test "subtitle rows" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var c: Candidate = .{
+        .file_id = 1,
+        .file_name = "",
+        .lang = "en",
+        .release = "rel",
+        .feature_id = 7,
+        .feature = null,
+        .season = null,
+        .episode = null,
+        .downloads = 1200,
+        .hash = .voted,
+        .hi = true,
+        .ai = false,
+        .fps = null,
+    };
+    try c.write(&w, false);
+    try std.testing.expectEqualStrings("[HASH] [en] [HI] 1200 dl \u{b7} rel", w.buffered());
+
+    w = .fixed(&buf);
+    c = .{
+        .file_id = 2,
+        .file_name = "",
+        .lang = "ko",
+        .release = "rel",
+        .feature_id = 9,
+        .feature = "Show S01E02",
+        .season = null,
+        .episode = null,
+        .downloads = 0,
+        .hash = .match,
+        .hi = false,
+        .ai = true,
+        .fps = 25,
+        .fps_mismatch = true,
+    };
+    try c.write(&w, true);
+    try std.testing.expectEqualStrings("[HASH?] [ko] [AI] 0 dl, 25 fps \u{b7} Show S01E02 \u{b7} rel", w.buffered());
+
+    w = .fixed(&buf);
+    try w.print("{f}", .{fmtFps(23.976)});
+    try std.testing.expectEqualStrings("23.98", w.buffered());
 }
