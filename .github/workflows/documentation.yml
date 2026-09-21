@@ -1,0 +1,54 @@
+name: documentation
+
+# The library's own API, for the projects that `@import("castig")`. The
+# binary's documentation is the README and `castig help <command>`.
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A queued deploy is only ever superseded by a newer one.
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      # The tags: the version the docs carry is resolved from them, and a
+      # shallow clone has none.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Grab Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+          cache-size-limit: 4096
+
+      - name: Render the documentation
+        run: zig build docs
+
+      # Autodoc loads its sources over HTTP rather than from disk, which is
+      # what `zig build docs-serve` exists for locally. Pages serves them
+      # the same way.
+      - name: Upload the pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: zig-out/docs
+
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@v5
