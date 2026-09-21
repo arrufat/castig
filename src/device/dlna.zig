@@ -34,6 +34,8 @@ pub const Renderer = struct {
     env: Env,
     http: std.http.Client,
     address: net.Ip4Address,
+    /// Ours on the interface that reaches it, settled once at connect.
+    local_address: net.Ip4Address,
     friendly_name: []const u8,
     /// The AVTransport service type, as advertised.
     service: []const u8,
@@ -87,6 +89,7 @@ pub const Renderer = struct {
             .env = env,
             .http = .{ .allocator = env.gpa, .io = env.io },
             .address = address,
+            .local_address = try ourAddress(env.io, address),
             .friendly_name = "",
             .service = "",
             .control_url = "",
@@ -147,8 +150,11 @@ pub const Renderer = struct {
         return parseSinks(r.env.arena, sink) catch &.{};
     }
 
+    /// Our own address on the interface that reaches the renderer, for URLs
+    /// the renderer must fetch from us. The port is the probe socket's, not
+    /// one to serve on.
     pub fn localAddress(r: *const Renderer) net.Ip4Address {
-        return r.address;
+        return r.local_address;
     }
 
     fn action(r: *Renderer, name: []const u8, args: []const soap.Arg) ![]const u8 {
@@ -409,6 +415,17 @@ const transport_states: std.StaticStringMap(playback.State) = .initComptime(.{
     .{ "STOPPED", .idle },
     .{ "NO_MEDIA_PRESENT", .idle },
 });
+
+/// Which of our addresses `peer` would reach us on. Connecting a datagram
+/// socket sends nothing; it only makes the kernel pick the route, and the
+/// socket's own address is the answer. A Cast channel reads the same thing
+/// off its TLS stream, but `std.http.Client` keeps its sockets to itself.
+fn ourAddress(io: Io, peer: net.Ip4Address) !net.Ip4Address {
+    const ip: net.IpAddress = .{ .ip4 = peer };
+    const probe = try ip.connect(io, .{ .mode = .dgram });
+    defer probe.close(io);
+    return probe.socket.address.ip4;
+}
 
 fn stateOf(transport_state: []const u8) playback.State {
     return transport_states.get(transport_state) orelse .unknown;
