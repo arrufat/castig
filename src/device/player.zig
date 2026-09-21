@@ -17,6 +17,7 @@ const net = Io.net;
 const Env = @import("../env.zig").Env;
 const cast = @import("cast.zig");
 const discovery = @import("discovery.zig");
+const dlna = @import("dlna.zig");
 const playback = @import("playback.zig");
 
 const log = std.log.scoped(.cast);
@@ -27,6 +28,9 @@ pub const Verb = enum { play, pause, stop };
 /// What a device reports about itself, as opposed to about one item.
 pub const DeviceStatus = struct {
     volume: ?Volume = null,
+    /// What it is playing, when the protocol tells us without being asked
+    /// to join a session.
+    playing: ?playback.Playback = null,
     /// The apps the receiver lists. Only Cast has any; a protocol without an
     /// app model leaves this empty and a caller prints nothing for it.
     apps: []const cast.Channel.App = &.{},
@@ -36,6 +40,7 @@ pub const DeviceStatus = struct {
 
 pub const Player = union(enum) {
     cast: Cast,
+    dlna: *dlna.Renderer,
 
     /// A Cast channel plus the app session it is driving.
     pub const Cast = struct {
@@ -70,7 +75,7 @@ pub const Player = union(enum) {
     pub fn connect(env: Env, endpoint: discovery.Endpoint) !Player {
         const address = switch (endpoint) {
             .cast => |a| a,
-            .dlna => return notYet(),
+            .dlna => |d| return .{ .dlna = try dlna.Renderer.connect(env, d.address, d.location) },
         };
         const ch = try cast.Channel.connect(env.io, env.gpa, address);
         errdefer ch.deinit();
@@ -91,7 +96,12 @@ pub const Player = union(enum) {
     pub fn attach(env: Env, endpoint: discovery.Endpoint) !Player {
         const address = switch (endpoint) {
             .cast => |a| a,
-            .dlna => return notYet(),
+            .dlna => |d| {
+                const r = try dlna.Renderer.connect(env, d.address, d.location);
+                errdefer r.deinit();
+                _ = try r.attach();
+                return .{ .dlna = r };
+            },
         };
         const ch = try cast.Channel.connect(env.io, env.gpa, address);
         errdefer ch.deinit();
@@ -122,6 +132,7 @@ pub const Player = union(enum) {
     pub fn protocol(p: Player) discovery.Protocol {
         return switch (p) {
             .cast => .cast,
+            .dlna => .dlna,
         };
     }
 
@@ -129,6 +140,7 @@ pub const Player = union(enum) {
     pub fn current(p: Player) playback.Playback {
         return switch (p) {
             .cast => |c| c.last,
+            .dlna => |r| r.last,
         };
     }
 
@@ -136,6 +148,7 @@ pub const Player = union(enum) {
     pub fn deinit(p: Player) void {
         switch (p) {
             .cast => |c| c.ch.deinit(),
+            .dlna => |r| r.deinit(),
         }
     }
 
@@ -145,6 +158,7 @@ pub const Player = union(enum) {
     pub fn localAddress(p: Player) net.Ip4Address {
         return switch (p) {
             .cast => |c| c.ch.localAddress(),
+            .dlna => |r| r.localAddress(),
         };
     }
 
@@ -157,6 +171,7 @@ pub const Player = union(enum) {
                 if (req.duration) |d| c.duration = d;
                 return c.track(m);
             },
+            .dlna => |r| return r.load(req),
         }
     }
 
@@ -173,6 +188,11 @@ pub const Player = union(enum) {
                     .stop => "STOP",
                 },
             )),
+            .dlna => |r| return switch (verb) {
+                .play => r.play(),
+                .pause => r.pause(),
+                .stop => r.stop(),
+            },
         }
     }
 
@@ -180,6 +200,7 @@ pub const Player = union(enum) {
     pub fn seek(p: *Player, env: Env, seconds: f64) !playback.Playback {
         switch (p.*) {
             .cast => |*c| return c.track(try c.ch.seek(env.arena, c.transport_id, c.media_session_id, seconds)),
+            .dlna => |r| return r.seek(seconds),
         }
     }
 
@@ -187,6 +208,7 @@ pub const Player = union(enum) {
     pub fn setRate(p: *Player, env: Env, value: f64) !playback.Playback {
         switch (p.*) {
             .cast => |*c| return c.track(try c.ch.setPlaybackRate(env.arena, c.transport_id, c.media_session_id, value)),
+            .dlna => |r| return r.setRate(value),
         }
     }
 
@@ -194,13 +216,34 @@ pub const Player = union(enum) {
     pub fn status(p: *Player, env: Env) !playback.Playback {
         switch (p.*) {
             .cast => |*c| return c.track(try c.ch.getMediaStatus(env.arena, c.transport_id)),
+            .dlna => |r| return r.poll(),
         }
     }
 
     /// Blocks until the device reports something new about the item.
-    /// `scratch` backs the reply and is the caller's to reset between calls.
-    pub fn next(p: *Player, scratch: std.mem.Allocator) !playback.Playback {
+    /// `scratch` backs a Cast reply and is the caller's to reset between
+    /// calls; a renderer answers out of its own.
+    pub fn next(p: *Player, env: Env, scratch: std.mem.Allocator) !playback.Playback {
         switch (p.*) {
+            .dlna => |r| {
+                // Nothing is pushed, so a tick is a sleep and two questions.
+                // Quick at first, so that starting to play shows up at once.
+                const wait: Io.Timeout = .{ .duration = .{
+                    .raw = .fromMilliseconds(if (r.polls < 4) 250 else 1000),
+                    .clock = .awake,
+                } };
+                try wait.sleep(env.io);
+                return r.poll() catch |err| switch (err) {
+                    error.RendererUnreachable => {
+                        r.failures += 1;
+                        // A renderer that went to standby should end the
+                        // session rather than be asked forever.
+                        if (r.failures >= 3) return error.ConnectionClosed;
+                        return r.last;
+                    },
+                    else => return err,
+                };
+            },
             .cast => |*c| while (true) {
                 const msg = try c.ch.receive();
                 if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
@@ -216,21 +259,22 @@ pub const Player = union(enum) {
     pub fn endSession(p: *Player, env: Env) void {
         switch (p.*) {
             .cast => |c| c.ch.stopApp(env.arena, c.session_id) catch {},
+            .dlna => |r| _ = r.stop() catch {},
         }
     }
 };
-
-/// Until the DLNA arm lands, every verb refuses the same way.
-fn notYet() error{ProtocolNotSupported} {
-    log.warn("driving a DLNA renderer is not implemented yet", .{});
-    return error.ProtocolNotSupported;
-}
 
 /// What `device` is doing, without joining whatever plays on it.
 pub fn deviceStatus(env: Env, endpoint: discovery.Endpoint) !DeviceStatus {
     const address = switch (endpoint) {
         .cast => |a| a,
-        .dlna => return notYet(),
+        // A renderer has no apps and no volume we read yet, only what it is
+        // doing right now.
+        .dlna => |d| {
+            const r = try dlna.Renderer.connect(env, d.address, d.location);
+            defer r.deinit();
+            return .{ .playing = r.poll() catch null };
+        },
     };
     const ch = try cast.Channel.connect(env.io, env.gpa, address);
     defer ch.deinit();
@@ -245,7 +289,12 @@ pub fn deviceStatus(env: Env, endpoint: discovery.Endpoint) !DeviceStatus {
 pub fn stopAll(env: Env, endpoint: discovery.Endpoint) ![]const []const u8 {
     const address = switch (endpoint) {
         .cast => |a| a,
-        .dlna => return notYet(),
+        .dlna => |d| {
+            const r = try dlna.Renderer.connect(env, d.address, d.location);
+            defer r.deinit();
+            _ = try r.stop();
+            return env.arena.dupe([]const u8, &.{r.friendly_name});
+        },
     };
     const ch = try cast.Channel.connect(env.io, env.gpa, address);
     defer ch.deinit();

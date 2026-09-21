@@ -53,6 +53,9 @@ pub const LoadRequest = struct {
     active_track_ids: []const u32 = &.{},
     /// True when the URL is an HLS playlist with MPEG-TS segments.
     hls: bool = false,
+    /// DLNA `res@protocolInfo`, when the delivery knows one. It has to say
+    /// the same thing as the `contentFeatures.dlna.org` header we serve.
+    protocol_info: ?[]const u8 = null,
 };
 
 test {

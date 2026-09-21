@@ -39,7 +39,9 @@ pub fn status(out: *Io.Writer, s: castig.control.Status) !void {
     if (s.device.volume) |v| {
         try out.print("  volume: {d:.0}%{s}\n", .{ v.level * 100, if (v.muted) " (muted)" else "" });
     }
-    if (s.device.apps.len == 0) try out.writeAll("  no app running\n");
+    // A renderer has no apps: what it is playing is all there is to show.
+    if (s.device.playing) |p| try media(out, p);
+    if (s.device.apps.len == 0 and s.device.playing == null) try out.writeAll("  nothing running\n");
     for (s.device.apps) |a| {
         try out.print("  app: {s} ({s}){s}", .{ a.displayName, a.appId, if (a.isIdleScreen) " idle screen" else "" });
         if (a.statusText.len > 0) try out.print(" - {s}", .{a.statusText});

@@ -209,7 +209,7 @@ pub const Session = struct {
             return .{ .finished = s.media.ended };
         }
         _ = s.scratch.reset(.retain_capacity);
-        s.media = s.player.next(s.scratch.allocator()) catch |err| switch (err) {
+        s.media = s.player.next(s.env, s.scratch.allocator()) catch |err| switch (err) {
             error.ConnectionClosed => {
                 s.done = true;
                 return .closed;
