@@ -37,11 +37,18 @@ jobs:
         with:
           version: master
 
-      # Autodoc reads the declarations in `av.zig`, which are hand-written
-      # externs with no `@cImport`, and an object file is never linked. So
-      # the rendered pages are the same whether ffmpeg is built from source
-      # or named as a system library, and naming it skips building ffmpeg,
-      # zlib, mp3lame, vorbis and ogg for nothing.
+      # Named rather than built: the pages are made of declarations, so
+      # building ffmpeg, zlib, mp3lame, vorbis and ogg from source for them
+      # is most of a release build for nothing. Zig still resolves a system
+      # library it is told to link, even for an object it never links, so
+      # the distribution's own have to be here.
+      - name: The ffmpeg libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libavformat-dev libavcodec-dev libavutil-dev \
+            libavfilter-dev libswresample-dev libswscale-dev
+
       - name: Render the documentation
         run: zig build docs -fsys=ffmpeg
 
