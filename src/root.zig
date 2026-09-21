@@ -39,7 +39,7 @@ pub const sweep = @import("device/sweep.zig");
 /// UPnP AV: SSDP discovery today, SOAP control next.
 pub const dlna = @import("device/dlna.zig");
 
-/// What a receiver can play, by codec name.
+/// What a device can play, by codec name.
 pub const support = @import("media/support.zig");
 /// Stream listing and the cast verdict.
 pub const probe = @import("media/probe.zig");

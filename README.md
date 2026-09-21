@@ -1,17 +1,18 @@
 # castig
 
-Cast a local file or a URL to a Chromecast from the command line, as a single
-static binary. ffmpeg is compiled in, so audio the receiver cannot decode (DTS,
-AC3, TrueHD, ...) is transcoded on the fly and subtitles are handled without any
-runtime dependency.
+Cast a local file or a URL to a Chromecast or a DLNA renderer from the command
+line, as a single static binary. ffmpeg is compiled in, so audio the device
+cannot decode (DTS, AC3, TrueHD, ...) is transcoded on the fly and subtitles are
+handled without any runtime dependency.
 
 ## Commands
 
 ```sh
-castig ls                        # find receivers on the network
+castig ls                        # find devices on the network
 castig probe <file>              # list a file's streams and whether it can be cast
 castig cast <device> <file|url>  # play it, and follow playback until it ends
-castig status <device>           # what the receiver is doing
+castig status <device>           # what the device is doing
+castig watch <device>            # follow what is playing, whoever started it
 castig stop <device>             # stop the running app
 castig pause|play <device>
 castig seek <device> <pos>       # 90, 1:30, 1:02:03, +30, -10
@@ -21,27 +22,60 @@ castig ui                        # open the window (see below)
 castig version                   # print the version
 ```
 
-`<device>` is an IP, `ip:port`, or any part of a name shown by `ls`. The
-playback controls work on whatever is playing, whoever started it.
+`<device>` is an IP, `ip:port`, a renderer's description URL, or any part of a
+name shown by `ls`. The last column of `ls` is always something you can paste
+back. A name matching one device of each kind goes to the Cast receiver; put
+`cast:` or `dlna:` in front to say which you meant. The playback controls work
+on whatever is playing, whoever started it.
 
 Local files are served from a built-in HTTP server, so seeking works. `cast`
-takes `--title`, `--type`, `--subs` and `--remux`; run `castig help cast` for
-what each one does.
+takes `--title`, `--type`, `--subs`, `--remux` and `--protocol`; run
+`castig help cast` for what each one does.
 
-Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
+Set `CASTIG_DEBUG=1` to see every message exchanged with the device, SOAP
+envelopes included.
 
 ## What to expect
 
-Video is copied, never transcoded, so it must already be in a codec the
-receiver decodes, usually H.264, VP8, VP9 or AV1. HEVC and 4K play only on
-receivers that handle them.
+Video is copied, never transcoded, so it must already be in a codec the device
+decodes, usually H.264, VP8, VP9 or AV1. HEVC and 4K play only where the device
+handles them.
+
+A Chromecast's abilities are fixed and known. A renderer is asked what it
+accepts, and is usually more capable than a guess would allow: most take
+Matroska and AC3, so the file goes over untouched, tracks and all. Use
+`castig probe <file> --device <device>` to see the verdict for a particular one
+rather than the Chromecast default.
 
 Receivers differ in what they accept, and a 1080p file whose audio needs
 transcoding can be refused in one delivery mode and play in another. That is
-what `--remux auto` is for.
+what `--remux auto` is for. It means HLS on a Chromecast and a seekable mp4 on
+a renderer, which does not play HLS at all.
 
 Some receivers show an "allow this cast?" prompt on screen. castig waits for
 it and says so.
+
+## DLNA renderers
+
+`ls` finds them over SSDP alongside the Cast receivers, and everything works
+the same way: the file is served from here and the device fetches it.
+
+What is worse than on a Chromecast, and why:
+
+- **Nothing is pushed.** UPnP AV tells nobody anything, so a renderer is asked
+  once a second. What you change with its own remote shows up a second late.
+- **Speed is Chromecast only.** No renderer worth having implements a play
+  speed other than 1, and castig says so instead of doing nothing.
+- **Seeking depends on the renderer.** Each one is asked which seek modes it
+  understands, so a renderer that cannot is a clear refusal rather than a
+  button that does nothing.
+- **Subtitles are device-specific.** There is no standard way to side-load one,
+  so castig names it four ways at once. Kodi takes it; Rygel ignores all four.
+- **Choosing a subtitle track is not possible.** UPnP AV has no verb for it. A
+  file that goes over whole takes its tracks with it and the renderer picks,
+  which for Kodi means its own menu and for a headless renderer means the first
+  one. Narrowing them would mean repackaging the container, which costs the
+  seek bar.
 
 ## Subtitles
 
@@ -86,10 +120,15 @@ of public dotfiles. `OPENSUBTITLES_API_KEY`, `OPENSUBTITLES_USERNAME` and
 
 ## The window
 
-`castig ui` opens a window with the same things in it: the receivers found on
-the network, the file to cast with its stream list and verdict, the subtitle
-and remux choices, and, once it is playing, the position, the transport
-controls and the speed. It is a separate binary, `castigui`, built with
+`castig ui` opens a window with the same things in it: the devices found on
+the network, of either kind, the file to cast with its stream list and verdict,
+the subtitle and remux choices, and, once it is playing, the position, the
+transport controls and the speed.
+
+Choosing a device joins whatever it is already playing, so the controls work
+on a cast started from the terminal or from anywhere else. The remux choices
+say what they mean for a renderer, and the speed control is replaced by what a
+renderer will actually do, which is 1x. It is a separate binary, `castigui`, built with
 `zig build gui`; `castig ui` runs the copy next to it, or one on PATH.
 
 `Find ...` next to the subtitle choice is `castig subs` without the prompt:

@@ -142,8 +142,19 @@ fn run(init: std.process.Init) !void {
             try render.devices(out, found, timeout_ms);
         },
         .probe => {
-            if (args.len != 3) fail(help(cmd));
-            const r = castig.probe.inspect(arena, args[2]) catch |err| {
+            if (args.len < 3) fail(help(cmd));
+            // Without a device named, the answer is the Cast receiver's,
+            // whose abilities are fixed. A renderer has to be asked: what
+            // it plays is what it says it plays.
+            var profile = castig.support.chromecast;
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--device") and i + 1 < args.len) {
+                    i += 1;
+                    profile = try castig.player.profileOf(env, args[i]);
+                } else fail(help(cmd));
+            }
+            const r = castig.probe.inspect(arena, args[2], profile) catch |err| {
                 std.debug.print("cannot open {s}: {s}\n", .{ args[2], @errorName(err) });
                 return error.SourceUnreadable;
             };
@@ -200,6 +211,9 @@ fn run(init: std.process.Init) !void {
                     opts.content_type = args[i];
                 } else if (std.mem.eql(u8, flag, "--subs")) {
                     opts.subtitles = if (std.mem.eql(u8, args[i], "auto")) .download else .{ .source = args[i] };
+                } else if (std.mem.eql(u8, flag, "--protocol")) {
+                    opts.protocol = std.meta.stringToEnum(castig.discovery.Protocol, args[i]) orelse
+                        fail("--protocol expects cast or dlna\n");
                 } else if (std.mem.eql(u8, flag, "--remux")) {
                     opts.remux = std.meta.stringToEnum(castig.delivery.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
                 } else fail(help(cmd));
@@ -289,10 +303,15 @@ fn help(cmd: Command) []const u8 {
         \\
         ,
         .probe =>
-        \\usage: castig probe <file>
+        \\usage: castig probe <file> [--device <device>]
         \\
-        \\Print the streams of a media file, and whether the receiver can play
-        \\it as it is or the audio has to be transcoded.
+        \\Print the streams of a media file, and whether a device can play it
+        \\as it is or the audio has to be transcoded.
+        \\
+        \\  --device <d>  judge it against this device rather than against a
+        \\                Cast receiver. Worth doing for a DLNA renderer,
+        \\                which is asked what it accepts and often accepts
+        \\                more than the default assumes.
         \\
         ,
         .status =>
@@ -304,6 +323,7 @@ fn help(cmd: Command) []const u8 {
         .cast =>
         \\usage: castig cast <device> <file|url> [--title <t>] [--type <mime>]
         \\                                       [--subs <file|url|auto>] [--remux <mode>]
+        \\                                       [--protocol cast|dlna]
         \\
         \\Play a local file or a URL and follow playback until it ends. Local
         \\files are served from a built-in HTTP server, so seeking works.
@@ -316,6 +336,9 @@ fn help(cmd: Command) []const u8 {
         \\                  from OpenSubtitles when there is none. Embedded
         \\                  text subtitles are offered too, pick one from the
         \\                  receiver's subtitle menu.
+        \\  --protocol <p>  which kind of device the name means, when it
+        \\                  matches one of each. A `cast:` or `dlna:` prefix
+        \\                  on <device> says the same thing.
         \\  --remux <mode>  how transcoded audio is delivered:
         \\                    auto    hls, falling back to mp4 if refused
         \\                    hls     seekable, starts at once

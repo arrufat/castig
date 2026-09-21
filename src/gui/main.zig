@@ -104,6 +104,15 @@ const remux_labels: std.EnumArray(castig.delivery.Remux, []const u8) = .init(.{
     .stream = "stream (instant, no seek)",
 });
 
+/// The same choices as a renderer sees them: it does not play HLS, so what
+/// `auto` means differs and asking for HLS gets the mp4 anyway.
+const renderer_remux_labels: std.EnumArray(castig.delivery.Remux, []const u8) = .init(.{
+    .auto = "auto (mp4)",
+    .hls = "hls (renderers cannot, sends mp4)",
+    .mp4 = "mp4 (seekable, prepares)",
+    .stream = "stream (instant, no seek)",
+});
+
 /// "English (en)" per code, laid out at compile time.
 const language_names: [castig.language.codes.len][]const u8 = blk: {
     @setEvalBranchQuota(20000);
@@ -351,6 +360,14 @@ fn describeCandidates(arena: std.mem.Allocator, l: castig.subs.Lookup) ![]const 
     return rows;
 }
 
+/// What the chosen device speaks, when one is chosen. Several controls
+/// only make sense for one of the two.
+fn selectedProtocol() ?castig.discovery.Protocol {
+    const index = app.device orelse return null;
+    if (index >= app.devices.len) return null;
+    return app.devices[index].protocol;
+}
+
 fn selectDevice(index: usize) void {
     var w: Io.Writer = .fixed(&app.device_spec);
     app.devices[index].writeSpec(&w) catch {
@@ -467,7 +484,8 @@ fn sourcePanel() !void {
 
         dvui.label(@src(), "Remux", .{}, .{ .gravity_y = 0.5 });
         var mode: usize = @intFromEnum(app.remux);
-        if (dvui.dropdown(@src(), &remux_labels.values, .{ .choice = &mode }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
+        const labels = if (selectedProtocol() == .dlna) &renderer_remux_labels.values else &remux_labels.values;
+        if (dvui.dropdown(@src(), labels, .{ .choice = &mode }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
             app.remux = @enumFromInt(mode);
         }
 
@@ -549,19 +567,25 @@ fn playbackPanel() !void {
         }
         if (dvui.button(@src(), "+10", .{}, .{})) try dispatch(runSeek, .{"+10"});
 
-        // The receiver's rate only when nobody is dragging: it would undo
-        // the drag on the frame that sends it.
-        if (!app.rate_pending) app.rate = @floatCast(state.rate);
-        if (dvui.sliderEntry(@src(), "x{d:.2}", .{
-            .value = &app.rate,
-            .min = castig.control.rate_min,
-            .max = castig.control.rate_max,
-            .interval = 0.05,
-        }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 90 } })) {
-            app.rate_pending = true;
-        } else if (app.rate_pending) {
-            app.rate_pending = false;
-            try dispatch(runRate, .{@as(f64, app.rate)});
+        // Nothing worth having implements a speed other than 1 over UPnP
+        // AV, so the renderers say no and the control says so first.
+        if (selectedProtocol() == .dlna) {
+            dvui.label(@src(), "x1 only", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 90 } });
+        } else {
+            // The receiver's rate only when nobody is dragging: it would undo
+            // the drag on the frame that sends it.
+            if (!app.rate_pending) app.rate = @floatCast(state.rate);
+            if (dvui.sliderEntry(@src(), "x{d:.2}", .{
+                .value = &app.rate,
+                .min = castig.control.rate_min,
+                .max = castig.control.rate_max,
+                .interval = 0.05,
+            }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 90 } })) {
+                app.rate_pending = true;
+            } else if (app.rate_pending) {
+                app.rate_pending = false;
+                try dispatch(runRate, .{@as(f64, app.rate)});
+            }
         }
 
         if (dvui.button(@src(), "Stop", .{}, .{ .gravity_x = 1 })) try dispatch(runStop, .{});
@@ -751,7 +775,7 @@ fn openFile() !void {
     app.report = "";
     app.readable = false;
     app.fps = null;
-    try app.examine.start(app.io, app.win, castig.probe.inspect, .{ app.examine.allocator(), @as([]const u8, chosen) });
+    try app.examine.start(app.io, app.win, castig.probe.inspect, .{ app.examine.allocator(), @as([]const u8, chosen), castig.support.chromecast });
 }
 
 fn openSubtitle() !void {

@@ -285,6 +285,19 @@ pub const Player = union(enum) {
     }
 };
 
+/// What `device` can play, asking it when asking is what settles it.
+pub fn profileOf(env: Env, device: []const u8) !support.Profile {
+    const endpoint = try discovery.resolve(env, device, null);
+    switch (endpoint) {
+        .cast => return support.chromecast,
+        .dlna => |d| {
+            const r = try dlna.Renderer.connect(env, d.address, d.location);
+            defer r.deinit();
+            return support.dlna.withSinks(try env.arena.dupe([]const u8, r.sinks));
+        },
+    }
+}
+
 /// What `device` is doing, without joining whatever plays on it.
 pub fn deviceStatus(env: Env, endpoint: discovery.Endpoint) !DeviceStatus {
     const address = switch (endpoint) {

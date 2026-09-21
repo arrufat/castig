@@ -71,7 +71,10 @@ pub const Report = struct {
 /// Opens `path`, reads its stream info and describes it. Strings taken from
 /// the container are duped into `gpa`; codec and container names are libav's
 /// own static ones.
-pub fn inspect(gpa: std.mem.Allocator, path: []const u8) !Report {
+/// Lists the streams of `path` and says what `profile` would have to do
+/// with each. Without a device to ask, `support.chromecast` is the sensible
+/// default: it is what castig was for, and its abilities are fixed.
+pub fn inspect(gpa: std.mem.Allocator, path: []const u8, profile: support.Profile) !Report {
     const fc = try extra.openInput(gpa, path);
     defer fc.close_input();
 
@@ -107,7 +110,7 @@ pub fn inspect(gpa: std.mem.Allocator, path: []const u8) !Report {
                     .height = @intCast(par.height),
                     .fps = extra.streamFps(st) orelse 0,
                 };
-                s.support = support.videoSupport(codec);
+                s.support = profile.videoSupport(codec);
                 report.video = worse(report.video, s.support.?);
             },
             .audio => {
@@ -115,7 +118,7 @@ pub fn inspect(gpa: std.mem.Allocator, path: []const u8) !Report {
                     .channels = @intCast(par.ch_layout.nb_channels),
                     .sample_rate = @intCast(par.sample_rate),
                 };
-                s.support = support.audioSupport(codec);
+                s.support = profile.audioSupport(codec);
                 report.audio = worse(report.audio, s.support.?);
             },
             .subtitle => {
