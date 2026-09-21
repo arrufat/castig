@@ -145,6 +145,9 @@ const App = struct {
 
     /// Which language to search in: null takes the config's order.
     language: ?usize = null,
+    /// What to search for, seeded from the file name and editable. The text
+    /// entry keeps it NUL-terminated, so `query` reads it back.
+    query_buf: [160]u8 = @splat(0),
 
     /// An OpenSubtitles search, open until the picker closes: the ranked
     /// candidates and the HTTP client live as long as the `Lookup` does.
@@ -425,10 +428,16 @@ fn sourcePanel() !void {
             app.language = if (choice == 0) null else choice - 1;
         }
 
+        var entry = dvui.textEntry(@src(), .{
+            .text = .{ .buffer = &app.query_buf },
+            .placeholder = "title to search for",
+        }, .{ .expand = .horizontal, .margin = dvui.Rect{ .x = 6, .w = 6 }, .gravity_y = 0.5 });
+        const entered = entry.enter_pressed;
+        entry.deinit();
+
         const searching = app.search.busy() or app.picking;
-        if (dvui.button(@src(), "Find ...", .{ .grayed = searching }, .{ .gravity_x = 1, .gravity_y = 0.5 }) and !searching) {
-            try startSearch();
-        }
+        const find = dvui.button(@src(), "Find ...", .{ .grayed = searching }, .{ .gravity_y = 0.5 });
+        if ((find or entered) and !searching) try startSearch();
     }
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
@@ -554,16 +563,39 @@ fn startSearch() !void {
     if (app.fetch.busy()) return;
     closePicker();
     app.picking = true;
-    try app.search.start(app.io, app.win, castig.subs.Lookup.open, .{
+    // The field stays editable while the search runs, so the title it held
+    // when it started goes along with the call.
+    const arena = app.search.begin();
+    const title = if (query()) |typed| try arena.dupe(u8, typed) else null;
+    try app.search.launch(app.io, app.win, castig.subs.Lookup.open, .{
         castig.Env{
             .io = app.io,
-            .arena = app.search.allocator(),
+            .arena = arena,
             .gpa = app.gpa,
             .environ = app.environ,
         },
         @as([]const u8, path),
-        castig.subs.Options{ .fps = app.fps, .languages = languageOverride() },
+        castig.subs.Options{ .fps = app.fps, .languages = languageOverride(), .title = title },
     });
+}
+
+/// What the field holds, or null when it is empty: an empty field searches
+/// for the title guessed from the file name, the way the CLI does.
+fn query() ?[]const u8 {
+    const typed = std.mem.trim(u8, std.mem.sliceTo(&app.query_buf, 0), " ");
+    return if (typed.len == 0) null else typed;
+}
+
+/// Puts the guess in the field, for the next file to search for. A title too
+/// long for the buffer is left out rather than cut in half.
+fn seedQuery(path: []const u8) void {
+    var scratch: std.heap.ArenaAllocator = .init(app.gpa);
+    defer scratch.deinit();
+
+    app.query_buf = @splat(0);
+    const guess = castig.subs.guessTitle(scratch.allocator(), Io.Dir.path.stem(path)) catch return;
+    if (guess.len >= app.query_buf.len) return;
+    @memcpy(app.query_buf[0..guess.len], guess);
 }
 
 /// The one language to search in, or null to leave the config's order. The
@@ -691,6 +723,7 @@ fn openFile() !void {
 
     if (app.path) |p| app.gpa.free(p);
     app.path = chosen;
+    seedQuery(chosen);
     app.report = "";
     app.readable = false;
     app.fps = null;

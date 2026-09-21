@@ -99,6 +99,11 @@ credentials, and spends the same daily allowance. The language chooser next
 to it searches in one language instead of the configured order, the way
 `--lang` does.
 
+The field beside them holds what the search looks for. It is filled with the
+title guessed from the file name, which is what `castig subs` searches for on
+its own; correct it when the guess is wrong, and press Enter or `Find ...`.
+Emptying it goes back to the guess.
+
 The window is [dvui](https://github.com/david-vanderson/dvui) over SDL3, both
 compiled in, so it stays a single file like the CLI. The library does the
 work on its own thread and the window draws what it reports, which is why a

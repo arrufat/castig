@@ -19,6 +19,8 @@ const log = std.log.scoped(.subs);
 pub const Candidate = opensubtitles.Candidate;
 /// A frame rate for `{f}`, the way both front ends print one.
 pub const fmtFps = opensubtitles.fmtFps;
+/// The title a file name is about, for seeding a search the caller can edit.
+pub const guessTitle = release.guessTitle;
 /// The language an explicit subtitle path claims, e.g. `Movie.en.srt`.
 pub const languageOf = release.languageOf;
 
@@ -28,6 +30,9 @@ pub const Subtitle = struct { path: []const u8, lang: ?[]const u8 };
 pub const Options = struct {
     /// Overrides the configured language order.
     languages: ?[]const []const u8 = null,
+    /// Searches for this instead of the title guessed from the file name,
+    /// for when the guess is wrong and the caller knows better.
+    title: ?[]const u8 = null,
     /// The video's frame rate when the caller already probed it. Candidates
     /// whose frame rate disagrees rank lower and are never taken blind.
     fps: ?f64 = null,
@@ -69,7 +74,7 @@ pub const Lookup = struct {
         }
 
         const stem = Io.Dir.path.stem(video);
-        const title = try release.guessTitle(arena, stem);
+        const title = opts.title orelse try release.guessTitle(arena, stem);
         const episode = release.parseEpisode(stem);
         const hash = release.moviehash(io, video) catch |err| blk: {
             log.debug("no moviehash: {s}", .{@errorName(err)});
