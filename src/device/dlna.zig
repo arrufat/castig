@@ -51,6 +51,8 @@ pub const Renderer = struct {
     polls: u32 = 0,
     /// Consecutive polls that could not reach the renderer at all.
     failures: u8 = 0,
+    /// Said once per renderer, not once per load.
+    warned_subtitles: bool = false,
     /// What the item is worth, once anything has said so.
     duration: ?f64 = null,
     /// The furthest point reached while actually playing. A renderer resets
@@ -146,7 +148,15 @@ pub const Renderer = struct {
             ),
             .title = req.title orelse "castig",
             .duration = req.duration,
+            .subtitle = if (req.text_tracks.len > 0) .{
+                .url = req.text_tracks[0].url,
+                .format = req.text_tracks[0].format.name(),
+            } else null,
         });
+        if (req.text_tracks.len > 0 and !r.warned_subtitles) {
+            r.warned_subtitles = true;
+            log.info("side-loaded subtitles are device-specific; if none appears, {s} does not take one", .{r.friendly_name});
+        }
 
         // A renderer that is still playing refuses the new URI with 701, so
         // clear it first. Failing here is fine: it may already be stopped.

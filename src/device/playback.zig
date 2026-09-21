@@ -38,6 +38,26 @@ pub const TextTrack = struct {
     language: []const u8 = "und",
     /// Shown in the device's subtitle menu, where it has one.
     name: []const u8 = "Subtitles",
+    /// Cast reads WebVTT and nothing else. Most renderers want SubRip and
+    /// ignore WebVTT, so the same sidecar is served in both forms.
+    format: Format = .vtt,
+
+    pub const Format = enum {
+        vtt,
+        srt,
+
+        pub fn mime(f: Format) []const u8 {
+            return switch (f) {
+                .vtt => "text/vtt",
+                .srt => "text/srt",
+            };
+        }
+
+        /// What `sec:type` and `pv:subtitleFileType` call it.
+        pub fn name(f: Format) []const u8 {
+            return @tagName(f);
+        }
+    };
 };
 
 /// What a device is told to play.

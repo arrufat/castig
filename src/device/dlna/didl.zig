@@ -95,6 +95,14 @@ pub const Item = struct {
     title: []const u8,
     /// Gives the renderer a progress bar before it has parsed anything.
     duration: ?f64 = null,
+    /// A side-loaded subtitle, for the renderers that take one.
+    subtitle: ?Subtitle = null,
+
+    pub const Subtitle = struct {
+        url: []const u8,
+        /// "srt" or "vtt", as `sec:type` and `pv:subtitleFileType` spell it.
+        format: []const u8 = "srt",
+    };
 };
 
 const namespaces =
@@ -128,7 +136,39 @@ pub fn write(w: *Io.Writer, item: Item) Io.Writer.Error!void {
     try xml.escape(w, item.url);
     try w.writeAll("</res>");
 
+    if (item.subtitle) |subtitle| try writeSubtitle(w, subtitle);
     try w.writeAll("</item></DIDL-Lite>");
+}
+
+/// Side-loading a subtitle is not in any specification, so every renderer
+/// that manages it reads a different one of these. They sit in separate
+/// namespaces, so one that does not know `sec:` or `pv:` skips them.
+///
+/// The extra `<res>` comes last on purpose: a renderer picks the first
+/// `<res>` it likes as the thing to play, and that has to be the video.
+fn writeSubtitle(w: *Io.Writer, subtitle: Item.Subtitle) Io.Writer.Error!void {
+    // Samsung, which also wants these as headers on the video response.
+    for ([_][]const u8{ "sec:CaptionInfo", "sec:CaptionInfoEx" }) |tag| {
+        try w.print("<{s} sec:type=\"", .{tag});
+        try xml.escape(w, subtitle.format);
+        try w.writeAll("\">");
+        try xml.escape(w, subtitle.url);
+        try w.print("</{s}>", .{tag});
+    }
+
+    // PacketVideo-derived renderers, which includes Kodi.
+    try w.writeAll("<pv:subtitleFileUri>");
+    try xml.escape(w, subtitle.url);
+    try w.writeAll("</pv:subtitleFileUri><pv:subtitleFileType>");
+    try xml.escape(w, subtitle.format);
+    try w.writeAll("</pv:subtitleFileType>");
+
+    // And the plain reading: another resource, of a subtitle type.
+    try w.writeAll("<res protocolInfo=\"http-get:*:text/");
+    try xml.escape(w, subtitle.format);
+    try w.writeAll(":*\">");
+    try xml.escape(w, subtitle.url);
+    try w.writeAll("</res>");
 }
 
 // --- tests -------------------------------------------------------------------
@@ -237,4 +277,44 @@ test "the metadata survives being an argument" {
     const once = try xml.unescape(arena.allocator(), argument.written());
     try testing.expectEqualStrings(meta.written(), once);
     try testing.expect(std.mem.find(u8, once, "<dc:title>Q&amp;A &lt;live&gt;</dc:title>") != null);
+}
+
+test "a side-loaded subtitle, said four ways" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try write(&out.writer, .{
+        .url = "http://h:1/media.mp4",
+        .content_type = "video/mp4",
+        .protocol_info = "http-get:*:video/mp4:*",
+        .title = "Sintel",
+        .subtitle = .{ .url = "http://h:1/sub.srt", .format = "srt" },
+    });
+    const didl = out.written();
+
+    try testing.expect(std.mem.find(u8, didl, "<sec:CaptionInfo sec:type=\"srt\">http://h:1/sub.srt</sec:CaptionInfo>") != null);
+    try testing.expect(std.mem.find(u8, didl, "<sec:CaptionInfoEx sec:type=\"srt\">http://h:1/sub.srt</sec:CaptionInfoEx>") != null);
+    try testing.expect(std.mem.find(u8, didl, "<pv:subtitleFileUri>http://h:1/sub.srt</pv:subtitleFileUri>") != null);
+    try testing.expect(std.mem.find(u8, didl, "<pv:subtitleFileType>srt</pv:subtitleFileType>") != null);
+    try testing.expect(std.mem.find(u8, didl, "<res protocolInfo=\"http-get:*:text/srt:*\">http://h:1/sub.srt</res>") != null);
+
+    // The video resource has to come first: a renderer plays the first
+    // <res> it likes the look of.
+    const video = std.mem.find(u8, didl, "media.mp4").?;
+    const subtitle = std.mem.find(u8, didl, "text/srt").?;
+    try testing.expect(video < subtitle);
+}
+
+test "no subtitle means no subtitle elements" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try write(&out.writer, .{
+        .url = "http://h:1/media.mp4",
+        .content_type = "video/mp4",
+        .protocol_info = "http-get:*:video/mp4:*",
+        .title = "Sintel",
+    });
+    try testing.expect(std.mem.find(u8, out.written(), "CaptionInfo") == null);
+    try testing.expect(std.mem.find(u8, out.written(), "pv:") == null);
+    // Only the one resource, so nothing to pick wrongly.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.written(), "<res "));
 }

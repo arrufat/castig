@@ -218,30 +218,49 @@ pub const Routes = struct {
     /// rather than "Subtitles".
     pub fn addSideloaded(s: *Routes, sub: []const u8, lang: ?[]const u8) !void {
         const arena = s.env.arena;
-        const url = if (isUrl(sub)) sub else blk: {
-            const srt = Io.Dir.cwd().readFileAlloc(s.env.io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
+        // A renderer is handed SubRip, which is what the conventions for
+        // side-loading one all assume; Cast is handed WebVTT, which is the
+        // only thing it reads.
+        const want: playback.TextTrack.Format = if (s.dlna) .srt else .vtt;
+
+        var url = sub;
+        var format = want;
+        if (isUrl(sub)) {
+            format = if (std.ascii.endsWithIgnoreCase(sub, ".srt")) .srt else .vtt;
+        } else {
+            const text = Io.Dir.cwd().readFileAlloc(s.env.io, sub, arena, .limited(16 * 1024 * 1024)) catch |err| {
                 log.warn("cannot read {s}: {s}", .{ sub, @errorName(err) });
                 return error.SourceUnreadable;
             };
+            const is_srt = std.ascii.endsWithIgnoreCase(sub, ".srt");
+            // SubRip is only served as it is; converting WebVTT back is not
+            // worth it for the few renderers that would then take it.
+            const serve: playback.TextTrack.Format = if (want == .srt and is_srt) .srt else .vtt;
+            const body = if (serve == .srt) text else try webvtt.srtToVtt(arena, text);
+            url = if (serve == .srt) "/sub.srt" else "/sub.vtt";
+            format = serve;
             try s.list.append(arena, .{
-                .path = "/sub.vtt",
+                .path = url,
                 .body = .{ .bytes = .{
                     .media = .{
-                        .content_type = "text/vtt",
+                        .content_type = serve.mime(),
                         .features = if (s.dlna) didl.contentFeatures(true) else null,
                         .transfer_mode = .interactive,
                     },
-                    .data = try webvtt.srtToVtt(arena, srt),
+                    .data = body,
                 } },
             });
-            break :blk "/sub.vtt";
-        };
+            if (s.dlna and serve != .srt) {
+                log.warn("this subtitle is WebVTT; most renderers only take SubRip", .{});
+            }
+        }
         const id: u32 = @intCast(s.tracks.items.len + 1);
         try s.tracks.append(arena, .{
             .id = id,
             .url = url,
             .language = lang orelse "und",
             .name = language.trackName(lang),
+            .format = format,
         });
         try s.active.append(arena, id);
     }
