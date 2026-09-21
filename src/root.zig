@@ -32,6 +32,8 @@ pub const player = @import("device/player.zig");
 pub const discovery = @import("device/discovery.zig");
 /// DNS wire format: query builder, record parser.
 pub const dns = @import("device/dns.zig");
+/// XML: element scanner, text and attribute lookup, escaping.
+pub const xml = @import("device/xml.zig");
 
 /// What a receiver can play, by codec name.
 pub const support = @import("media/support.zig");
@@ -71,6 +73,7 @@ test {
     _ = player;
     _ = discovery;
     _ = dns;
+    _ = xml;
     _ = support;
     _ = probe;
     _ = pipeline;
