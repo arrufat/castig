@@ -147,10 +147,12 @@ fn run(init: std.process.Init) !void {
             // whose abilities are fixed. A renderer has to be asked: what
             // it plays is what it says it plays.
             var profile = castig.support.cast;
+            var device: ?[]const u8 = null;
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--device") and i + 1 < args.len) {
                     i += 1;
+                    device = args[i];
                     profile = try castig.player.profileOf(env, args[i]);
                 } else fail(help(cmd));
             }
@@ -158,7 +160,7 @@ fn run(init: std.process.Init) !void {
                 std.debug.print("cannot open {s}: {s}\n", .{ args[2], @errorName(err) });
                 return error.SourceUnreadable;
             };
-            try render.report(out, r);
+            try render.report(out, r, device);
         },
         .status => {
             if (args.len != 3) fail(help(cmd));
@@ -309,9 +311,10 @@ fn help(cmd: Command) []const u8 {
         \\as it is or the audio has to be transcoded.
         \\
         \\  --device <d>  judge it against this device rather than against a
-        \\                Cast receiver. Worth doing for a DLNA renderer,
-        \\                which is asked what it accepts and often accepts
-        \\                more than the default assumes.
+        \\                Cast receiver. A Cast receiver answers the same as
+        \\                the default, since that is already its own list.
+        \\                A DLNA renderer is asked what it accepts, and
+        \\                usually accepts more than the default assumes.
         \\
         ,
         .status =>

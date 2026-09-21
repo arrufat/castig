@@ -20,7 +20,9 @@ pub fn devices(out: *Io.Writer, found: []const castig.discovery.Device, timeout_
 }
 
 /// The `probe` report: container, streams, and what casting them needs.
-pub fn report(out: *Io.Writer, r: castig.probe.Report) !void {
+/// `device`, when given, is what the verdict was judged against: the same
+/// file reads differently on a device that decodes more of it.
+pub fn report(out: *Io.Writer, r: castig.probe.Report, device: ?[]const u8) !void {
     try out.print("{s}\n", .{r.path});
     try out.print("  container: {s}", .{r.container});
     if (r.duration) |secs| try out.print(", duration: {d:.1} s", .{secs});
@@ -28,7 +30,9 @@ pub fn report(out: *Io.Writer, r: castig.probe.Report) !void {
 
     for (r.streams) |s| try out.print("  #{d} {f}\n", .{ s.index, s });
 
-    try out.writeAll("  verdict: ");
+    try out.writeAll("  verdict");
+    if (device) |d| try out.print(" (as {s} would play it)", .{d});
+    try out.writeAll(": ");
     try r.writeVerdict(out);
     try out.writeAll("\n");
 }
