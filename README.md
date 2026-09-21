@@ -104,6 +104,17 @@ compiled in, so it stays a single file like the CLI. The library does the
 work on its own thread and the window draws what it reports, which is why a
 long mp4 preparation shows a progress bar instead of freezing.
 
+## Install
+
+Each [release](https://github.com/arrufat/castig/releases) carries an archive
+for Linux, macOS and Windows on x86_64 or Apple Silicon. It holds two files,
+`castig` and `castigui`; put both in the same directory on your PATH, so
+`castig ui` finds the window next to it.
+
+The Linux `castig` is static and runs anywhere. Its `castigui` is not: SDL3
+loads X11 and Wayland at run time, which a static binary cannot do, so the
+window needs glibc 2.29 or newer.
+
 ## Building
 
 The project pins a Zig version in `build.zig.zon`; with

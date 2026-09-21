@@ -1,0 +1,106 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Grab Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Resolve the version
+        id: version
+        run: echo "VERSION=$(zig build version)" >> "$GITHUB_OUTPUT"
+
+      - name: The tag and the version agree
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME builds $VERSION: bump .version in build.zig.zon" >&2
+            exit 1
+          fi
+
+  artifacts:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The window cannot be cross-compiled to macOS: SDL3 needs the Cocoa
+          # frameworks, which ship with Xcode, so that row runs on its own
+          # machine and passes no -Dtarget at all.
+          - platform: linux
+            os: ubuntu-latest
+            slug: linux-x86_64
+            ext: tar.gz
+            cli_flags: -Dtarget=x86_64-linux-musl
+            gui_flags: -Dtarget=x86_64-linux-gnu.2.29
+          - platform: macos
+            os: macos-latest
+            slug: macos-aarch64
+            ext: tar.gz
+            cli_flags: ""
+            gui_flags: ""
+          - platform: windows
+            os: ubuntu-latest
+            slug: windows-x86_64
+            ext: zip
+            cli_flags: -Dtarget=x86_64-windows-gnu
+            gui_flags: -Dtarget=x86_64-windows-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Grab Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      # The CLI is static, the window is not: SDL3 dlopens X11 and Wayland,
+      # and dlopen in a static musl binary always fails.
+      - name: Build the CLI
+        run: zig build -Doptimize=ReleaseFast ${{ matrix.cli_flags }}
+
+      - name: Build the window
+        run: zig build gui -Doptimize=ReleaseFast ${{ matrix.gui_flags }}
+
+      # Both binaries, at the root of the archive: `castig ui` runs the copy
+      # next to it before the one on PATH.
+      - name: Package artifact
+        id: package
+        shell: bash
+        run: |
+          ARCHIVE="castig-${{ needs.test.outputs.version }}-${{ matrix.slug }}.${{ matrix.ext }}"
+          if [ "${{ matrix.ext }}" = zip ]; then
+            (cd zig-out/bin && zip "$GITHUB_WORKSPACE/$ARCHIVE" castig.exe castigui.exe)
+          else
+            tar -C zig-out/bin -czf "$ARCHIVE" castig castigui
+          fi
+          echo "ASSET=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.ASSET }}
