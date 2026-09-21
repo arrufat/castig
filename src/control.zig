@@ -66,6 +66,57 @@ pub fn seek(env: Env, device: []const u8, spec: []const u8) !playback.Playback {
     return p.seek(env, target);
 }
 
+/// Following whatever is already playing, without having started it.
+///
+/// The same reports a session gives about an item, minus the ones about
+/// serving a file: a Cast receiver pushes them, a renderer is polled. This
+/// is what lets something other than the process that started a cast show
+/// and drive it.
+pub const Follow = struct {
+    player: Player,
+    /// Reset per update, so a long watch stays bounded.
+    scratch: std.heap.ArenaAllocator,
+    now: playback.Playback,
+    /// The first answer is what joining already learned, not a new wait.
+    fresh: bool = true,
+    done: bool = false,
+
+    /// Joins what is playing. `error.NothingPlaying` when the device is
+    /// idle, `error.NoMedia` when something is up with nothing loaded.
+    pub fn start(env: Env, device: []const u8) !Follow {
+        const p = try open(env, device);
+        return .{ .player = p, .scratch = .init(env.gpa), .now = p.current() };
+    }
+
+    pub fn deinit(f: *Follow) void {
+        f.player.deinit();
+        f.scratch.deinit();
+    }
+
+    /// What it is doing now, or null once the item ended or the device went
+    /// away.
+    pub fn next(f: *Follow, env: Env) !?playback.Playback {
+        if (f.done) return null;
+        if (f.fresh) {
+            f.fresh = false;
+            return f.now;
+        }
+        if (f.now.isFinished()) {
+            f.done = true;
+            return null;
+        }
+        _ = f.scratch.reset(.retain_capacity);
+        f.now = f.player.next(env, f.scratch.allocator()) catch |err| switch (err) {
+            error.ConnectionClosed => {
+                f.done = true;
+                return null;
+            },
+            else => return err,
+        };
+        return f.now;
+    }
+};
+
 pub const rate_min = 0.5;
 pub const rate_max = 2.0;
 

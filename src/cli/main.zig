@@ -13,6 +13,7 @@ const usage =
     \\  ls        discover cast receivers and DLNA renderers on the network
     \\  probe     print a file's streams and whether it can be cast directly
     \\  status    show what the receiver is doing
+    \\  watch     follow what is playing, whoever started it
     \\  cast      play a local file or a URL and follow playback
     \\  pause     pause the current item
     \\  play      resume the current item
@@ -53,7 +54,7 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     std.debug.print(prefix ++ format ++ "\n", args);
 }
 
-const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, subs, ui, version, help };
+const Command = enum { ls, probe, status, watch, stop, pause, play, seek, rate, cast, subs, ui, version, help };
 
 /// Turns whatever `run` raises into an exit code, explaining it once.
 pub fn main(init: std.process.Init) u8 {
@@ -151,6 +152,19 @@ fn run(init: std.process.Init) !void {
         .status => {
             if (args.len != 3) fail(help(cmd));
             try render.status(out, try castig.control.status(env, args[2]));
+        },
+        .watch => {
+            if (args.len != 3) fail(help(cmd));
+            var following = try castig.control.Follow.start(env, args[2]);
+            defer following.deinit();
+            // Flushed per line: this follows until the item ends, so a
+            // buffer that only empties at the end shows nothing at all.
+            while (try following.next(env)) |now| {
+                try render.media(out, now);
+                try out.flush();
+            }
+            try out.writeAll("nothing playing any more\n");
+            try out.flush();
         },
         .stop => {
             if (args.len != 3) fail(help(cmd));
@@ -264,6 +278,14 @@ fn help(cmd: Command) []const u8 {
         \\
         \\  --timeout <ms>       how long to listen for replies (default 2000)
         \\  --protocol cast|dlna only look for one kind
+        \\
+        ,
+        .watch =>
+        \\usage: castig watch <device>
+        \\
+        \\Follow what the device is playing until it stops, whoever started
+        \\it. A Cast receiver reports as it goes; a DLNA renderer is asked
+        \\once a second, since UPnP AV tells nobody anything by itself.
         \\
         ,
         .probe =>

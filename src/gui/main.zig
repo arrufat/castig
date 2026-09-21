@@ -238,6 +238,9 @@ fn deinit(_: *dvui.Window) void {
 }
 
 fn startScan() !void {
+    // The devices are about to be replaced, so a watch on one of them is
+    // pointing at a row that will not exist.
+    app.cast.stopFollowing(app.io);
     app.devices = &.{};
     app.device_labels = &.{};
     app.device = null;
@@ -358,6 +361,16 @@ fn selectDevice(index: usize) void {
     };
     app.device = index;
     app.device_spec_len = w.buffered().len;
+    followSelected();
+}
+
+/// Joins whatever the chosen device is already playing, so the transport
+/// controls work on a cast this window did not start. A session of our own
+/// outranks it and is left running.
+fn followSelected() void {
+    if (app.cast.busy() and !app.cast.following) return;
+    app.cast.stopFollowing(app.io);
+    app.cast.follow(app.io, app.win, app.gpa, app.environ, app.spec()) catch {};
 }
 
 fn devicePanel() !void {
@@ -458,7 +471,7 @@ fn sourcePanel() !void {
             app.remux = @enumFromInt(mode);
         }
 
-        const ready = app.readable and app.device != null and !app.cast.busy();
+        const ready = app.readable and app.device != null and !app.cast.ours();
         if (dvui.button(@src(), "Cast", .{ .grayed = !ready }, .{ .gravity_x = 1, .gravity_y = 0.5 }) and ready) {
             try startCast();
         }
@@ -468,7 +481,9 @@ fn sourcePanel() !void {
 fn playbackPanel() !void {
     const state = app.cast.snapshot();
     if (state.phase == .idle) {
-        dvui.label(@src(), "nothing playing from here", .{}, .{});
+        // The watch says what it found; without one there is nothing to say.
+        const note = state.note();
+        dvui.label(@src(), "{s}", .{if (note.len > 0) note else "no device chosen"}, .{});
         return;
     }
 
@@ -754,6 +769,8 @@ fn openSubtitle() !void {
 
 fn startCast() !void {
     const path = app.path orelse return;
+    // A cast of our own takes the panel over from whatever it was watching.
+    app.cast.stopFollowing(app.io);
     try app.cast.start(app.io, app.win, app.gpa, app.environ, app.spec(), .{
         .source = path,
         .remux = app.remux,

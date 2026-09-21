@@ -30,17 +30,16 @@ pub fn Task(comptime Result: type) type {
 
         /// Cancels a call still in flight, then frees the task's arena.
         pub fn deinit(self: *Self, io: Io) void {
-            if (self.future) |*f| {
-                // Stored rather than discarded: `Result` may be an error union.
-                var result = f.cancel(io);
-                _ = &result;
-            }
+            // Stored rather than discarded: `Result` may be an error union.
+            var result = self.cancel(io);
+            _ = &result;
             self.arena.deinit();
         }
 
         /// Cancels a call still running and hands back what it returned, so
         /// a result that owns something can be closed.
         pub fn cancel(self: *Self, io: Io) ?Result {
+            self.arrived.store(false, .monotonic);
             if (self.future) |*f| {
                 defer self.future = null;
                 return f.cancel(io);
@@ -127,6 +126,9 @@ pub const Cast = struct {
     mutex: Io.Mutex = .init,
     state: State = .{},
     progress: Progress = .{},
+    /// Whether the panel is showing a cast this window did not start, which
+    /// anything of our own may take over.
+    following: bool = false,
 
     pub const Phase = enum { idle, preparing, playing, over, failed };
 
@@ -201,6 +203,12 @@ pub const Cast = struct {
     }
 
     /// Whether a cast is in flight.
+    /// Whether a session this window started is running, as opposed to a
+    /// watch on one it merely found. Only the former blocks a new cast.
+    pub fn ours(c: *const Cast) bool {
+        return c.task.busy() and !c.following;
+    }
+
     pub fn busy(c: *const Cast) bool {
         return c.task.busy();
     }
@@ -230,6 +238,7 @@ pub const Cast = struct {
         if (opts.title) |t| copy.title = try arena.dupe(u8, t);
         if (opts.subtitles == .source) copy.subtitles = .{ .source = try arena.dupe(u8, opts.subtitles.source) };
 
+        c.following = false;
         {
             Io.Threaded.mutexLock(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
@@ -245,11 +254,86 @@ pub const Cast = struct {
         }, try arena.dupe(u8, device), copy });
     }
 
+    /// Follows whatever is already playing on `device`, so the window can
+    /// show and drive a cast it did not start.
+    pub fn follow(
+        c: *Cast,
+        io: Io,
+        win: *dvui.Window,
+        gpa: std.mem.Allocator,
+        environ: *const std.process.Environ.Map,
+        device: []const u8,
+    ) !void {
+        const arena = c.task.begin();
+        c.following = true;
+        {
+            Io.Threaded.mutexLock(&c.mutex);
+            defer Io.Threaded.mutexUnlock(&c.mutex);
+            c.state = .{ .phase = .preparing };
+            c.say("asking {s} what it is doing", .{device});
+        }
+        try c.task.launch(io, win, watch, .{ c, castig.Env{
+            .io = io,
+            .arena = arena,
+            .gpa = gpa,
+            .environ = environ,
+        }, try arena.dupe(u8, device) });
+    }
+
+    /// Drops whatever is being watched so the slot can be used again. A
+    /// session of our own is left alone: only the caller knows to stop it.
+    pub fn stopFollowing(c: *Cast, io: Io) void {
+        if (!c.following) return;
+        var result = c.task.cancel(io);
+        _ = &result;
+        c.task.release();
+        c.following = false;
+        Io.Threaded.mutexLock(&c.mutex);
+        defer Io.Threaded.mutexUnlock(&c.mutex);
+        c.state = .{};
+    }
+
+    fn watch(c: *Cast, env: castig.Env, device: []const u8) void {
+        var following = castig.control.Follow.start(env, device) catch |err| {
+            Io.Threaded.mutexLock(&c.mutex);
+            defer Io.Threaded.mutexUnlock(&c.mutex);
+            c.state = .{};
+            switch (err) {
+                error.NothingPlaying, error.NoMedia => c.say("nothing playing on {s}", .{device}),
+                else => c.say("{s}", .{@errorName(err)}),
+            }
+            dvui.refresh(c.task.win, @src(), null);
+            return;
+        };
+        defer following.deinit();
+
+        // An error here is the watch ending, not the cast: whatever plays
+        // carries on without us.
+        while (following.next(env) catch null) |now| {
+            Io.Threaded.mutexLock(&c.mutex);
+            c.state.phase = .playing;
+            c.state.player = now.state;
+            c.state.position = now.position;
+            c.state.rate = now.rate;
+            if (now.duration) |d| c.state.duration = d;
+            c.say("playing on {s}, started elsewhere", .{device});
+            Io.Threaded.mutexUnlock(&c.mutex);
+            dvui.refresh(c.task.win, @src(), null);
+        }
+
+        Io.Threaded.mutexLock(&c.mutex);
+        defer Io.Threaded.mutexUnlock(&c.mutex);
+        c.state.phase = .over;
+        c.say("nothing playing on {s} any more", .{device});
+        dvui.refresh(c.task.win, @src(), null);
+    }
+
     /// Reaps the session thread once it has left, so a new cast can start.
     /// Nothing drawn afterwards points into the arena, so it goes back.
     pub fn poll(c: *Cast, io: Io) void {
         if (c.task.collect(io) == null) return;
         c.task.release();
+        c.following = false;
     }
 
     fn run(c: *Cast, env: castig.Env, device: []const u8, opts: castig.session.Options) void {
