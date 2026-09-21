@@ -36,10 +36,14 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: master
-          cache-size-limit: 4096
 
+      # Autodoc reads the declarations in `av.zig`, which are hand-written
+      # externs with no `@cImport`, and an object file is never linked. So
+      # the rendered pages are the same whether ffmpeg is built from source
+      # or named as a system library, and naming it skips building ffmpeg,
+      # zlib, mp3lame, vorbis and ogg for nothing.
       - name: Render the documentation
-        run: zig build docs
+        run: zig build docs -fsys=ffmpeg
 
       # Autodoc loads its sources over HTTP rather than from disk, which is
       # what `zig build docs-serve` exists for locally. Pages serves them
