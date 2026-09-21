@@ -12,7 +12,7 @@ const av = @import("av");
 
 const Env = @import("../env.zig").Env;
 const language = @import("../language.zig");
-const cast = @import("../device/cast.zig");
+const playback = @import("../device/playback.zig");
 const http = @import("server.zig");
 const hls = @import("../media/hls.zig");
 const pipeline = @import("../media/pipeline.zig");
@@ -124,7 +124,7 @@ pub const Routes = struct {
     env: Env,
     source: []const u8,
     list: std.ArrayList(http.Route) = .empty,
-    tracks: std.ArrayList(cast.Channel.TextTrack) = .empty,
+    tracks: std.ArrayList(playback.TextTrack) = .empty,
     active: std.ArrayList(u32) = .empty,
     segmenter: ?*hls.Segmenter = null,
     mp4: ?*vmp4.VMp4 = null,

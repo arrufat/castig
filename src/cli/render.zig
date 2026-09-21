@@ -33,9 +33,11 @@ pub fn report(out: *Io.Writer, r: castig.probe.Report) !void {
 /// The `status` view: volume, the running app, and what it plays.
 pub fn status(out: *Io.Writer, s: castig.control.Status) !void {
     try out.print("{f}\n", .{s.address});
-    try out.print("  volume: {d:.0}%{s}\n", .{ s.receiver.volume.level * 100, if (s.receiver.volume.muted) " (muted)" else "" });
-    if (s.receiver.applications.len == 0) try out.writeAll("  no app running\n");
-    for (s.receiver.applications) |a| {
+    if (s.device.volume) |v| {
+        try out.print("  volume: {d:.0}%{s}\n", .{ v.level * 100, if (v.muted) " (muted)" else "" });
+    }
+    if (s.device.apps.len == 0) try out.writeAll("  no app running\n");
+    for (s.device.apps) |a| {
         try out.print("  app: {s} ({s}){s}", .{ a.displayName, a.appId, if (a.isIdleScreen) " idle screen" else "" });
         if (a.statusText.len > 0) try out.print(" - {s}", .{a.statusText});
         try out.print("\n       session {s}, transport {s}\n", .{ a.sessionId, a.transportId });
@@ -48,12 +50,12 @@ pub fn stopped(out: *Io.Writer, names: []const []const u8) !void {
     if (names.len == 0) try out.writeAll("nothing to stop\n");
 }
 
-/// The playback line: state, position, rate and subtitle track.
-pub fn media(out: *Io.Writer, m: castig.cast.Channel.MediaStatus) !void {
-    try out.print("  {t} at {d:.1} s", .{ m.playerState, m.currentTime });
-    if (m.duration()) |d| try out.print(" of {d:.1} s", .{d});
-    if (m.playbackRate != 1) try out.print(" x{d:.2}", .{m.playbackRate});
-    if (m.idleReason) |r| try out.print(" ({t})", .{r});
+/// The playback line: state, position, rate and why it ended.
+pub fn media(out: *Io.Writer, p: castig.playback.Playback) !void {
+    try out.print("  {t} at {d:.1} s", .{ p.state, p.position });
+    if (p.duration) |d| try out.print(" of {d:.1} s", .{d});
+    if (p.rate != 1) try out.print(" x{d:.2}", .{p.rate});
+    if (p.ended) |r| try out.print(" ({t})", .{r});
     try out.writeAll("\n");
 }
 
@@ -63,7 +65,7 @@ pub fn event(out: *Io.Writer, e: castig.session.Event) !void {
     switch (e) {
         .serving => |base| try out.print("serving at {s}\n", .{base}),
         .loaded => |l| try out.print("loaded on {f} as {s}\n", .{ l.address, l.content_type }),
-        .state => |m| try media(out, m),
+        .state => |p| try media(out, p),
         .falling_back => {
             try out.flush();
             std.debug.print("receiver refused HLS; falling back to seekable mp4 ...\n", .{});

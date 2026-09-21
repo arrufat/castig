@@ -12,8 +12,8 @@ const net = Io.net;
 const av = @import("av");
 
 const Env = @import("env.zig").Env;
-const cast = @import("device/cast.zig");
-const Channel = cast.Channel;
+const Player = @import("device/player.zig").Player;
+const playback = @import("device/playback.zig");
 const discovery = @import("device/discovery.zig");
 const extra = @import("media/av_extra.zig");
 const pipeline = @import("media/pipeline.zig");
@@ -48,11 +48,11 @@ pub const Event = union(enum) {
     /// The receiver accepted the LOAD.
     loaded: struct { address: net.Ip4Address, content_type: []const u8 },
     /// A status update from the receiver.
-    state: Channel.MediaStatus,
+    state: playback.Playback,
     /// The receiver refused this delivery; retrying as a seekable mp4.
     falling_back,
     /// The item ended.
-    finished: ?Channel.IdleReason,
+    finished: ?playback.EndReason,
     /// The receiver hung up mid-session.
     closed,
 };
@@ -62,7 +62,7 @@ pub const Session = struct {
     opts: Options,
     local: bool,
     address: net.Ip4Address,
-    ch: *Channel,
+    player: Player,
     routes: delivery.Routes,
     server: ?*http.Server = null,
     base: []const u8 = "",
@@ -70,8 +70,7 @@ pub const Session = struct {
     /// What the LOAD carries besides the target; the tracks come from `routes`.
     title: ?[]const u8 = null,
     duration: ?f64 = null,
-    app: Channel.App,
-    media: Channel.MediaStatus,
+    media: playback.Playback,
     /// Reset per message, so a long session's memory stays bounded.
     scratch: std.heap.ArenaAllocator,
     played: bool = false,
@@ -103,11 +102,10 @@ pub const Session = struct {
             .opts = opts,
             .local = local,
             .address = undefined,
-            .ch = undefined,
+            .player = undefined,
             .routes = .{ .env = env, .source = opts.source },
             .target = .{ .path = opts.source, .content_type = content_type },
-            .app = undefined,
-            .media = undefined,
+            .media = .{},
             .scratch = std.heap.ArenaAllocator.init(env.gpa),
         };
         errdefer s.scratch.deinit();
@@ -166,13 +164,13 @@ pub const Session = struct {
 
         // Connect after the heavy work: the receiver drops a channel whose
         // heartbeat PINGs go unanswered during a long mp4 build.
-        s.ch = try Channel.connect(io, env.gpa, s.address);
-        errdefer s.ch.deinit();
+        s.player = try Player.connect(env, s.address);
+        errdefer s.player.deinit();
 
         if (s.routes.list.items.len > 0) {
             const server = try http.Server.start(io, env.gpa, s.routes.list.items);
             s.server = server;
-            var served_at = s.ch.localAddress();
+            var served_at = s.player.localAddress();
             served_at.port = server.port;
             s.base = try arena.print("http://{f}", .{served_at});
             try s.routes.absolutise(s.base, &s.target, local);
@@ -185,10 +183,10 @@ pub const Session = struct {
         return s;
     }
 
-    /// Stops the server, closes the channel and frees the session.
+    /// Stops the server, closes the connection and frees the session.
     pub fn deinit(s: *Session) void {
         if (s.server) |server| server.stop();
-        s.ch.deinit();
+        s.player.deinit();
         s.routes.deinit();
         s.scratch.deinit();
         s.env.gpa.destroy(s);
@@ -201,37 +199,27 @@ pub const Session = struct {
         if (s.pop()) |e| return e;
         if (s.done) return null;
 
-        while (true) {
-            if (s.media.isFinished()) {
-                if (try s.fallBack()) return s.pop().?;
-                s.done = true;
-                // Leave the receiver as we found it, not parked on the idle screen.
-                s.ch.stopApp(s.env.arena, s.app.sessionId) catch {};
-                return .{ .finished = s.media.idleReason };
-            }
-            const msg = s.ch.receive() catch |err| switch (err) {
-                error.ConnectionClosed => {
-                    s.done = true;
-                    return .closed;
-                },
-                else => return err,
-            };
-            if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
-            _ = s.scratch.reset(.retain_capacity);
-            const reply = Channel.parseReply(s.scratch.allocator(), msg) orelse continue;
-            s.media = Channel.mediaStatusFrom(s.scratch.allocator(), reply) orelse continue;
-            if (s.media.playerState == .PLAYING) s.played = true;
-            return .{ .state = s.media };
+        if (s.media.isFinished()) {
+            if (try s.fallBack()) return s.pop().?;
+            s.done = true;
+            s.player.endSession(s.env);
+            return .{ .finished = s.media.ended };
         }
+        _ = s.scratch.reset(.retain_capacity);
+        s.media = s.player.next(s.scratch.allocator()) catch |err| switch (err) {
+            error.ConnectionClosed => {
+                s.done = true;
+                return .closed;
+            },
+            else => return err,
+        };
+        if (s.media.state == .playing) s.played = true;
+        return .{ .state = s.media };
     }
 
-    /// Launches (or joins) the default media receiver and loads the target.
+    /// Hands the connected device the target to play.
     fn load(s: *Session) !void {
-        const arena = s.env.arena;
-        const st = try s.ch.getStatus(arena);
-        s.app = st.find(cast.default_media_receiver) orelse try s.ch.launch(arena, cast.default_media_receiver);
-        try s.ch.connectTransport(s.app.transportId);
-        s.media = try s.ch.load(arena, s.app.transportId, .{
+        s.media = try s.player.load(s.env, .{
             .url = s.target.path,
             .content_type = s.target.content_type,
             .title = s.title,
@@ -244,19 +232,20 @@ pub const Session = struct {
         s.push(.{ .state = s.media });
     }
 
-    /// In auto mode a refused HLS load fails asynchronously (idleReason ERROR)
-    /// before ever playing, and the seekable mp4 is the fallback. The build
-    /// takes a while, so the idle channel is reopened afterwards.
+    /// In auto mode a refused HLS load fails asynchronously, ending the item
+    /// before it ever played, and the seekable mp4 is the fallback. The build
+    /// takes a while, so the idle connection is reopened afterwards.
     fn fallBack(s: *Session) !bool {
-        if (s.played or s.media.idleReason != .ERROR) return false;
+        const failed = if (s.media.ended) |e| e == .failed else false;
+        if (s.played or !failed) return false;
         if (s.opts.remux != .auto or !s.target.isHls() or !s.local) return false;
 
         s.push(.falling_back);
-        s.ch.deinit();
+        s.player.deinit();
         s.target = try s.routes.addMp4(try extra.openInput(s.env.gpa, s.opts.source));
         try s.routes.absolutise(s.base, &s.target, s.local);
         if (s.server) |server| server.setRoutes(s.routes.list.items);
-        s.ch = try Channel.connect(s.env.io, s.env.gpa, s.address);
+        s.player = try Player.connect(s.env, s.address);
         try s.load();
         return true;
     }

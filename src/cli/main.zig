@@ -152,7 +152,7 @@ fn run(init: std.process.Init) !void {
         },
         .pause, .play => {
             if (args.len != 3) fail(help(cmd));
-            try render.media(out, try castig.control.command(env, args[2], if (cmd == .pause) "PAUSE" else "PLAY"));
+            try render.media(out, try castig.control.command(env, args[2], if (cmd == .pause) .pause else .play));
         },
         .seek => {
             if (args.len != 4) fail(help(cmd));

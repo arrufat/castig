@@ -9,7 +9,6 @@ const Io = std.Io;
 const dvui = @import("dvui");
 const castig = @import("castig");
 
-const Channel = castig.cast.Channel;
 
 /// One call in flight, returning `Result`. Its result comes from `arena` and
 /// stays valid until the task is started again.
@@ -133,7 +132,7 @@ pub const Cast = struct {
 
     pub const State = struct {
         phase: Phase = .idle,
-        player: Channel.PlayerState = .UNKNOWN,
+        player: castig.playback.State = .unknown,
         position: f64 = 0,
         duration: ?f64 = null,
         rate: f64 = 1,
@@ -279,10 +278,10 @@ pub const Cast = struct {
                     c.say("loaded on {f} as {s}", .{ l.address, l.content_type });
                 },
                 .state => |m| {
-                    c.state.player = m.playerState;
-                    c.state.position = m.currentTime;
-                    c.state.rate = m.playbackRate;
-                    if (m.duration()) |d| c.state.duration = d;
+                    c.state.player = m.state;
+                    c.state.position = m.position;
+                    c.state.rate = m.rate;
+                    if (m.duration) |d| c.state.duration = d;
                 },
                 .falling_back => {
                     c.state.phase = .preparing;
@@ -290,7 +289,7 @@ pub const Cast = struct {
                 },
                 .finished => |reason| {
                     c.state.phase = .over;
-                    c.say("finished ({t})", .{reason orelse .UNKNOWN});
+                    c.say("finished ({t})", .{reason orelse .unknown});
                 },
                 .closed => {
                     c.state.phase = .over;

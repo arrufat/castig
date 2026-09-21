@@ -519,9 +519,9 @@ fn playbackPanel() !void {
         defer row.deinit();
 
         if (dvui.button(@src(), "-10", .{}, .{})) try dispatch(runSeek, .{"-10"});
-        const paused = state.player == .PAUSED;
+        const paused = state.player == .paused;
         if (dvui.button(@src(), if (paused) "Play" else "Pause", .{}, .{ .min_size_content = .{ .w = 60 } })) {
-            try dispatch(runCommand, .{if (paused) "PLAY" else "PAUSE"});
+            try dispatch(runCommand, .{if (paused) castig.control.Verb.play else .pause});
         }
         if (dvui.button(@src(), "+10", .{}, .{})) try dispatch(runSeek, .{"+10"});
 
@@ -781,7 +781,7 @@ fn controlEnv() castig.Env {
 }
 
 // The session reports what these change, so only the failures matter here.
-fn runCommand(env: castig.Env, device: []const u8, verb: []const u8) anyerror!void {
+fn runCommand(env: castig.Env, device: []const u8, verb: castig.control.Verb) anyerror!void {
     _ = try castig.control.command(env, device, verb);
 }
 

@@ -24,6 +24,10 @@ pub const language = @import("language.zig");
 /// Google Cast v2 over TLS: the receiver and media namespaces, and the
 /// protobuf framing underneath them (`cast.proto`).
 pub const cast = @import("device/cast.zig");
+/// What a device is doing, in words no protocol owns.
+pub const playback = @import("device/playback.zig");
+/// One device under control, whichever protocol it speaks.
+pub const player = @import("device/player.zig");
 /// Receiver discovery over mDNS.
 pub const discovery = @import("device/discovery.zig");
 /// DNS wire format: query builder, record parser.
@@ -63,6 +67,8 @@ test {
     _ = language;
     _ = cast;
     _ = cast.proto;
+    _ = playback;
+    _ = player;
     _ = discovery;
     _ = dns;
     _ = support;

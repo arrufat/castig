@@ -24,6 +24,7 @@ const net = Io.net;
 const tls = std.crypto.tls;
 /// Cast channel framing: a length prefix around a protobuf CastMessage.
 pub const proto = @import("cast/proto.zig");
+const playback = @import("playback.zig");
 
 /// Every message exchanged with the receiver, at debug level.
 const log = std.log.scoped(.cast);
@@ -342,35 +343,35 @@ pub const Channel = struct {
                 .INTERRUPTED, .UNKNOWN => false,
             };
         }
+
+        /// This status in the vocabulary the rest of castig speaks.
+        pub fn toPlayback(m: MediaStatus) playback.Playback {
+            return .{
+                .state = switch (m.playerState) {
+                    .PLAYING => .playing,
+                    .PAUSED => .paused,
+                    .BUFFERING => .buffering,
+                    .IDLE => .idle,
+                    .UNKNOWN => .unknown,
+                },
+                .position = m.currentTime,
+                .duration = m.duration(),
+                .rate = m.playbackRate,
+                // Only the reasons `isFinished` calls terminal end an item:
+                // INTERRUPTED is what a seek-reload produces.
+                .ended = if (!m.isFinished()) null else switch (m.idleReason.?) {
+                    .FINISHED => .finished,
+                    .CANCELLED => .cancelled,
+                    .ERROR => .failed,
+                    .INTERRUPTED, .UNKNOWN => null,
+                },
+            };
+        }
     };
 
-    /// A side-loaded WebVTT track offered to the receiver.
-    pub const TextTrack = struct {
-        id: u32,
-        /// WebVTT URL the receiver fetches.
-        url: []const u8,
-        language: []const u8 = "und",
-        /// Shown in the receiver's subtitle menu.
-        name: []const u8 = "Subtitles",
-    };
-
-    pub const LoadOptions = struct {
-        url: []const u8,
-        content_type: []const u8,
-        title: ?[]const u8 = null,
-        /// Sidecar subtitle tracks, each WebVTT and reachable by the receiver.
-        text_tracks: []const TextTrack = &.{},
-        /// Which track ids start enabled; empty means subtitles off.
-        active_track_ids: []const u32 = &.{},
-        /// Total length in seconds, shown by the receiver's progress bar.
-        duration: ?f64 = null,
-        /// True when the URL is an HLS playlist with MPEG-TS segments; the
-        /// receiver must be told, or it assumes fMP4 and fails to load.
-        hls: bool = false,
-    };
-
-    /// Hands the app a URL to play, with its subtitle tracks.
-    pub fn load(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, opts: LoadOptions) !MediaStatus {
+    /// Hands the app a URL to play, with its subtitle tracks. The tracks
+    /// must be WebVTT, which is the only sidecar format a receiver reads.
+    pub fn load(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, opts: playback.LoadRequest) !MediaStatus {
         const tracks = try arena.alloc(Load.Track, opts.text_tracks.len);
         for (opts.text_tracks, 0..) |t, i| tracks[i] = .{
             .trackId = t.id,
@@ -385,6 +386,7 @@ pub const Channel = struct {
                 .contentType = opts.content_type,
                 .duration = opts.duration,
                 .metadata = if (opts.title) |t| .{ .title = t } else null,
+                // Without these the receiver assumes fMP4 and fails to load.
                 .hlsSegmentFormat = if (opts.hls) "ts" else null,
                 .hlsVideoSegmentFormat = if (opts.hls) "MPEG2_TS" else null,
             },

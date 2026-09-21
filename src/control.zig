@@ -1,117 +1,80 @@
-//! Controlling whatever is playing on a receiver, whoever started it.
+//! Controlling whatever is playing on a device, whoever started it.
 //!
-//! Each call opens a connection, finds the app that speaks the media
-//! namespace, sends one command and returns the receiver's answer.
+//! Each call opens a connection, joins what is playing, sends one command and
+//! returns what the device answered.
 
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 
 const Env = @import("env.zig").Env;
-const cast = @import("device/cast.zig");
-const Channel = cast.Channel;
 const discovery = @import("device/discovery.zig");
+const player = @import("device/player.zig");
+const Player = player.Player;
+const playback = @import("device/playback.zig");
 
 const log = std.log.scoped(.cast);
 
+/// A transport command that takes no argument.
+pub const Verb = player.Verb;
+
 pub const Status = struct {
     address: net.Ip4Address,
-    receiver: Channel.Status,
+    device: player.DeviceStatus,
 };
 
-/// What `device` is doing: its volume, its app, and what it plays.
+/// What `device` is doing: its volume, and on Cast the apps it runs.
 pub fn status(env: Env, device: []const u8) !Status {
     const address = try discovery.resolve(env.io, env.gpa, device);
-    const ch = try Channel.connect(env.io, env.gpa, address);
-    defer ch.deinit();
-    return .{ .address = address, .receiver = try ch.getStatus(env.arena) };
+    return .{ .address = address, .device = try player.deviceStatus(env, address) };
 }
 
-/// Stops every app that is not the idle screen, and names the ones it stopped.
+/// Stops everything that is playing, and names what it stopped.
 pub fn stop(env: Env, device: []const u8) ![]const []const u8 {
     const address = try discovery.resolve(env.io, env.gpa, device);
-    const ch = try Channel.connect(env.io, env.gpa, address);
-    defer ch.deinit();
-
-    const st = try ch.getStatus(env.arena);
-    var stopped: std.ArrayList([]const u8) = .empty;
-    for (st.applications) |a| {
-        if (a.isIdleScreen) continue;
-        try ch.stopApp(env.arena, a.sessionId);
-        try stopped.append(env.arena, a.displayName);
-    }
-    return stopped.toOwnedSlice(env.arena);
+    return player.stopAll(env, address);
 }
 
-const Playing = struct {
-    ch: *Channel,
-    transport_id: []const u8,
-    media: Channel.MediaStatus,
-
-    /// Replies to commands carry no `media` object, so the duration learned
-    /// when the session was opened is kept.
-    fn withMedia(p: Playing, reply: Channel.MediaStatus) Channel.MediaStatus {
-        var m = reply;
-        if (m.media == null) m.media = p.media.media;
-        return m;
-    }
-};
-
-/// Connects to the app that is playing on the device and fetches its status.
-fn open(env: Env, device: []const u8) !Playing {
+/// Connects to whatever is playing on the device.
+fn open(env: Env, device: []const u8) !Player {
     const address = try discovery.resolve(env.io, env.gpa, device);
-    const ch = try Channel.connect(env.io, env.gpa, address);
-    errdefer ch.deinit();
-
-    const st = try ch.getStatus(env.arena);
-    const app = st.mediaApp() orelse {
-        log.warn("nothing is playing on {f}", .{address});
-        return error.NothingPlaying;
-    };
-    try ch.connectTransport(app.transportId);
-    const media = ch.getMediaStatus(env.arena, app.transportId) catch |err| switch (err) {
-        error.NoMedia => {
-            log.warn("{s} has no media loaded", .{app.displayName});
-            return err;
-        },
-        else => return err,
-    };
-    return .{ .ch = ch, .transport_id = app.transportId, .media = media };
+    return Player.attach(env, address);
 }
 
-/// One media namespace verb ("PAUSE", "PLAY") for whatever is playing.
-pub fn command(env: Env, device: []const u8, kind: []const u8) !Channel.MediaStatus {
-    const p = try open(env, device);
-    defer p.ch.deinit();
-    return p.withMedia(try p.ch.mediaCommand(env.arena, p.transport_id, p.media.mediaSessionId, kind));
+/// One transport command for whatever is playing.
+pub fn command(env: Env, device: []const u8, verb: Verb) !playback.Playback {
+    var p = try open(env, device);
+    defer p.deinit();
+    return p.command(env, verb);
 }
 
 /// `spec` is absolute ("90", "1:30", "1:02:03") or relative ("+30", "-10"),
-/// so it is resolved against the position the receiver reports.
-pub fn seek(env: Env, device: []const u8, spec: []const u8) !Channel.MediaStatus {
-    const p = try open(env, device);
-    defer p.ch.deinit();
+/// so it is resolved against the position the device reports.
+pub fn seek(env: Env, device: []const u8, spec: []const u8) !playback.Playback {
+    var p = try open(env, device);
+    defer p.deinit();
 
-    var target = parseSeek(spec, p.media.currentTime) catch {
+    const now = p.current();
+    var target = parseSeek(spec, now.position) catch {
         log.warn("cannot parse position {s}", .{spec});
         return error.InvalidSeek;
     };
-    target = std.math.clamp(target, 0, p.media.duration() orelse std.math.inf(f64));
-    return p.withMedia(try p.ch.seek(env.arena, p.transport_id, p.media.mediaSessionId, target));
+    target = std.math.clamp(target, 0, now.duration orelse std.math.inf(f64));
+    return p.seek(env, target);
 }
 
 pub const rate_min = 0.5;
 pub const rate_max = 2.0;
 
 /// The Default Media Receiver accepts 0.5 to 2.0 and ignores anything else.
-pub fn rate(env: Env, device: []const u8, value: f64) !Channel.MediaStatus {
+pub fn rate(env: Env, device: []const u8, value: f64) !playback.Playback {
     if (value < rate_min or value > rate_max) {
         log.warn("rate must be between {d:.1} and {d:.1}", .{ rate_min, rate_max });
         return error.InvalidRate;
     }
-    const p = try open(env, device);
-    defer p.ch.deinit();
-    return p.withMedia(try p.ch.setPlaybackRate(env.arena, p.transport_id, p.media.mediaSessionId, value));
+    var p = try open(env, device);
+    defer p.deinit();
+    return p.setRate(env, value);
 }
 
 /// A seek position in seconds. `+N` and `-N` are relative to `current`.
