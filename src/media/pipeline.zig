@@ -676,7 +676,7 @@ test "plan reports the codecs, and a Cast receiver decides what they mean" {
         defer gpa.free(p.subtitles);
 
         try std.testing.expectEqualStrings(std.mem.span(c.codec), p.audio_codec);
-        const verdict = support.judge(support.chromecast, p.video_codec, p.audio_codec, "video/mp4");
+        const verdict = support.judge(support.cast, p.video_codec, p.audio_codec, "video/mp4");
         try std.testing.expectEqual(c.direct, verdict.direct);
         try std.testing.expect(!verdict.video_unsupported);
         try std.testing.expectEqual(@as(usize, 0), p.subtitles.len);

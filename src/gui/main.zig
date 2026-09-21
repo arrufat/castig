@@ -775,7 +775,7 @@ fn openFile() !void {
     app.report = "";
     app.readable = false;
     app.fps = null;
-    try app.examine.start(app.io, app.win, castig.probe.inspect, .{ app.examine.allocator(), @as([]const u8, chosen), castig.support.chromecast });
+    try app.examine.start(app.io, app.win, castig.probe.inspect, .{ app.examine.allocator(), @as([]const u8, chosen), castig.support.cast });
 }
 
 fn openSubtitle() !void {

@@ -72,7 +72,7 @@ pub const Report = struct {
 /// the container are duped into `gpa`; codec and container names are libav's
 /// own static ones.
 /// Lists the streams of `path` and says what `profile` would have to do
-/// with each. Without a device to ask, `support.chromecast` is the sensible
+/// with each. Without a device to ask, `support.cast` is the sensible
 /// default: it is what castig was for, and its abilities are fixed.
 pub fn inspect(gpa: std.mem.Allocator, path: []const u8, profile: support.Profile) !Report {
     const fc = try extra.openInput(gpa, path);

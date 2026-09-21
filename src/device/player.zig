@@ -145,7 +145,7 @@ pub const Player = union(enum) {
     /// renderer's start conservative and widen to what it claims.
     pub fn profile(p: Player) support.Profile {
         return switch (p) {
-            .cast => support.chromecast,
+            .cast => support.cast,
             .dlna => |r| support.dlna.withSinks(r.sinks),
         };
     }
@@ -289,7 +289,7 @@ pub const Player = union(enum) {
 pub fn profileOf(env: Env, device: []const u8) !support.Profile {
     const endpoint = try discovery.resolve(env, device, null);
     switch (endpoint) {
-        .cast => return support.chromecast,
+        .cast => return support.cast,
         .dlna => |d| {
             const r = try dlna.Renderer.connect(env, d.address, d.location);
             defer r.deinit();

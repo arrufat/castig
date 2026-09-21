@@ -94,8 +94,12 @@ pub const Profile = struct {
     }
 };
 
-/// Codec names as returned by `avcodec_get_name`.
-pub const chromecast: Profile = .{
+/// What a Cast receiver plays. Named for the protocol rather than for any
+/// one product: a Nest speaker and a television are neither of them a
+/// Chromecast, and all three decode the same list.
+///
+/// Codec names are as `avcodec_get_name` returns them.
+pub const cast: Profile = .{
     .direct_video = .initComptime(.{ .{"h264"}, .{"vp8"}, .{"vp9"}, .{"av1"} }),
     .dependent_video = .initComptime(.{.{"hevc"}}),
     .direct_audio = .initComptime(.{ .{"aac"}, .{"mp3"}, .{"opus"}, .{"vorbis"}, .{"flac"} }),
@@ -161,12 +165,12 @@ pub fn judge(p: Profile, video_codec: []const u8, audio_codec: []const u8, conta
 
 /// Whether a Cast receiver plays this video codec as it is.
 pub fn videoSupport(codec: []const u8) Support {
-    return chromecast.videoSupport(codec);
+    return cast.videoSupport(codec);
 }
 
 /// Whether a Cast receiver plays this audio codec as it is.
 pub fn audioSupport(codec: []const u8) Support {
-    return chromecast.audioSupport(codec);
+    return cast.audioSupport(codec);
 }
 
 /// Whether a libav subtitle codec name is a text format we can turn into
@@ -213,9 +217,9 @@ test "a device's own word widens what it is taken to play" {
     try testing.expect(!v.direct);
 
     // A Cast receiver has fixed abilities; nothing it says changes them.
-    try testing.expectEqual(Support.device_dependent, chromecast.audioSupport("ac3"));
-    try testing.expect(!judge(chromecast, "h264", "ac3", mkv).direct);
-    try testing.expect(judge(chromecast, "h264", "aac", mkv).direct);
+    try testing.expectEqual(Support.device_dependent, cast.audioSupport("ac3"));
+    try testing.expect(!judge(cast, "h264", "ac3", mkv).direct);
+    try testing.expect(judge(cast, "h264", "aac", mkv).direct);
 }
 
 test "support tables" {

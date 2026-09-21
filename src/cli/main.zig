@@ -146,7 +146,7 @@ fn run(init: std.process.Init) !void {
             // Without a device named, the answer is the Cast receiver's,
             // whose abilities are fixed. A renderer has to be asked: what
             // it plays is what it says it plays.
-            var profile = castig.support.chromecast;
+            var profile = castig.support.cast;
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--device") and i + 1 < args.len) {

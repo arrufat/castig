@@ -178,7 +178,7 @@ pub const Session = struct {
             s.player = try Player.connect(env, s.endpoint);
             connected = true;
         }
-        const profile = if (connected) s.player.profile() else support.chromecast;
+        const profile = if (connected) s.player.profile() else support.cast;
 
         if (probe_result) |p| {
             const verdict = support.judge(profile, p.video_codec, p.audio_codec, content_type);
