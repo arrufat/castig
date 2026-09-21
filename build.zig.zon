@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.17.0-dev.2163+89ff10d56",
     .dependencies = .{
         .ffmpeg = .{
-            .url = "git+https://github.com/arrufat/ffmpeg#d041ec2e0a5845957b3470bcb7b5fa2f524b57da",
+            .url = "git+https://github.com/allyourcodebase/ffmpeg#51d347c18f7cfe61c138cd09a5df4f1b6cc63ea5",
             .hash = "ffmpeg-8.1.1-6-zT7QA1H0UQSFjV5BNCN_5tWrZqqNNXoEHjRhTaddLLNs",
         },
         .dvui = .{
