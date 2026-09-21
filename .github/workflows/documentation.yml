@@ -49,6 +49,7 @@ jobs:
             libavformat-dev libavcodec-dev libavutil-dev \
             libavfilter-dev libswresample-dev libswscale-dev
 
+      # The command line at the root, the library API under `api/`.
       - name: Render the documentation
         run: zig build docs -fsys=ffmpeg
 

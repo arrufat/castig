@@ -41,8 +41,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Resolved once: `resolveVersion` declares a build option, and an
+    // option may only be declared once.
+    const version = b.fmt("{f}", .{resolveVersion(b)});
     const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", b.fmt("{f}", .{resolveVersion(b)}));
+    build_options.addOption([]const u8, "version", version);
     castig.addOptions("build_options", build_options);
 
     // The shell. Rooted in src/cli/, so a relative import of a library file is
@@ -72,12 +75,41 @@ pub fn build(b: *std.Build) void {
     // Rendered from the library root, so the pages are the API and not the
     // CLI entry point.
     const docs_obj = b.addObject(.{ .name = "castig", .root_module = castig });
+
+    // The command line, from the strings the binary prints. `help.zig`
+    // imports nothing, so this costs no part of the tool's own build.
+    const cli_reference = b.addExecutable(.{
+        .name = "cli-reference",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/cli_reference.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{.{
+                .name = "help",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("src/cli/help.zig"),
+                    .target = b.graph.host,
+                    .optimize = .debug,
+                }),
+            }},
+        }),
+    });
+    const render_cli = b.addRunArtifact(cli_reference);
+    const cli_page = render_cli.addOutputFileArg("index.html");
+    render_cli.addArg(version);
+
+    // The API pages under `api/`, because the command line is what most
+    // people arrive for and the library is what a few of them stay for.
+    const site = b.addWriteFiles();
+    _ = site.addCopyDirectory(docs_obj.getEmittedDocs(), "api", .{});
+    _ = site.addCopyFile(cli_page, "index.html");
+
     const docs_install = b.addInstallDirectory(.{
-        .source_dir = docs_obj.getEmittedDocs(),
+        .source_dir = site.getDirectory(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });
-    const docs_step = b.step("docs", "Render the API documentation to zig-out/docs");
+    const docs_step = b.step("docs", "Render the documentation to zig-out/docs");
     docs_step.dependOn(&docs_install.step);
 
     // Autodoc loads its sources over HTTP, so the pages cannot be opened from
@@ -93,7 +125,7 @@ pub fn build(b: *std.Build) void {
     });
     const serve_docs = b.addRunArtifact(docs_server);
     serve_docs.step.dependOn(&docs_install.step);
-    serve_docs.addDirectoryArg(docs_obj.getEmittedDocs());
+    serve_docs.addDirectoryArg(site.getDirectory());
     serve_docs.addPassthruArgs(); // `zig build docs-serve -- 8080` pins the port.
     serve_docs.stdio = .inherit;
 

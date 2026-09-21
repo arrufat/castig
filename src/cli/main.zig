@@ -2,35 +2,11 @@ const std = @import("std");
 const Io = std.Io;
 
 const castig = @import("castig");
+const help_text = @import("help.zig");
 const render = @import("render.zig");
 const prompt = @import("prompt.zig");
 const progress = @import("progress.zig");
 
-const usage =
-    \\usage: castig <command> [args]
-    \\
-    \\commands:
-    \\  ls        discover cast receivers and DLNA renderers on the network
-    \\  probe     print a file's streams and whether it can be cast directly
-    \\  status    show what the receiver is doing
-    \\  watch     follow what is playing, whoever started it
-    \\  cast      play a local file or a URL and follow playback
-    \\  pause     pause the current item
-    \\  play      resume the current item
-    \\  seek      jump to a position
-    \\  rate      set playback speed
-    \\  stop      stop whatever app is running on the receiver
-    \\  ui        open the window
-    \\  subs      download a subtitle next to a video
-    \\  version   print the version
-    \\  help      show this message
-    \\
-    \\<device> is an IP, IP:port, a renderer URL, or part of a name shown
-    \\by `ls`. Prefix it with `cast:` or `dlna:` to settle an ambiguous name.
-    \\
-    \\Run `castig help <command>` for what a command takes.
-    \\
-;
 
 /// Debug logs (every cast message, every HTTP request) are printed only with
 /// CASTIG_DEBUG set; the level is decided at runtime in `logFn`.
@@ -55,7 +31,6 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     std.debug.print(prefix ++ format ++ "\n", args);
 }
 
-const Command = enum { ls, probe, status, watch, stop, pause, play, seek, rate, cast, subs, ui, version, help };
 
 /// Turns whatever `run` raises into an exit code, explaining it once.
 pub fn main(init: std.process.Init) u8 {
@@ -106,18 +81,18 @@ fn run(init: std.process.Init) !void {
         .progress = bar.reporter(),
     };
 
-    if (args.len < 2) fail(usage);
+    if (args.len < 2) fail(help_text.usage);
     castig.av_extra.quietLibav();
     debug_enabled = if (init.environ_map.get("CASTIG_DEBUG")) |v| v.len > 0 else false;
 
     const cmd = if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))
-        Command.help
+        help_text.Command.help
     else
-        std.meta.stringToEnum(Command, args[1]) orelse fail(usage);
+        std.meta.stringToEnum(help_text.Command, args[1]) orelse fail(help_text.usage);
 
     // `castig help <command>` and `castig <command> --help` print one page.
     if (helpTopic(cmd, args)) |topic| {
-        try out.writeAll(help(topic));
+        try out.writeAll(help_text.help(topic));
         try out.flush();
         return;
     }
@@ -134,7 +109,7 @@ fn run(init: std.process.Init) !void {
                     i += 1;
                     query.protocol = std.meta.stringToEnum(castig.discovery.Protocol, args[i]) orelse
                         fail("--protocol expects cast or dlna\n");
-                } else fail(help(cmd));
+                } else fail(help_text.help(cmd));
             }
             const timeout_ms = query.timeout_ms;
             const found = try castig.discovery.discover(io, init.gpa, query);
@@ -143,7 +118,7 @@ fn run(init: std.process.Init) !void {
             try render.devices(out, found, timeout_ms);
         },
         .probe => {
-            if (args.len < 3) fail(help(cmd));
+            if (args.len < 3) fail(help_text.help(cmd));
             // Without a device named, the answer is the Cast receiver's,
             // whose abilities are fixed. A renderer has to be asked: what
             // it plays is what it says it plays.
@@ -155,7 +130,7 @@ fn run(init: std.process.Init) !void {
                     i += 1;
                     device = args[i];
                     profile = try castig.player.profileOf(env, args[i]);
-                } else fail(help(cmd));
+                } else fail(help_text.help(cmd));
             }
             var r = castig.probe.inspect(arena, args[2]) catch |err| {
                 std.debug.print("cannot open {s}: {s}\n", .{ args[2], @errorName(err) });
@@ -165,11 +140,11 @@ fn run(init: std.process.Init) !void {
             try render.report(out, r, device);
         },
         .status => {
-            if (args.len != 3) fail(help(cmd));
+            if (args.len != 3) fail(help_text.help(cmd));
             try render.status(out, try castig.control.status(env, args[2]));
         },
         .watch => {
-            if (args.len != 3) fail(help(cmd));
+            if (args.len != 3) fail(help_text.help(cmd));
             // Watching an idle device is answered, not failed: nothing
             // playing is what it is doing.
             var following = castig.control.Follow.start(env, args[2]) catch |err| switch (err) {
@@ -191,19 +166,19 @@ fn run(init: std.process.Init) !void {
             try out.flush();
         },
         .stop => {
-            if (args.len != 3) fail(help(cmd));
+            if (args.len != 3) fail(help_text.help(cmd));
             try render.stopped(out, try castig.control.stop(env, args[2]));
         },
         .pause, .play => {
-            if (args.len != 3) fail(help(cmd));
+            if (args.len != 3) fail(help_text.help(cmd));
             try render.media(out, try castig.control.command(env, args[2], if (cmd == .pause) .pause else .play));
         },
         .seek => {
-            if (args.len != 4) fail(help(cmd));
+            if (args.len != 4) fail(help_text.help(cmd));
             try render.media(out, try castig.control.seek(env, args[2], args[3]));
         },
         .rate => {
-            if (args.len != 4) fail(help(cmd));
+            if (args.len != 4) fail(help_text.help(cmd));
             const value = std.fmt.parseFloat(f64, args[3]) catch {
                 std.debug.print("rate must be a number\n", .{});
                 return error.InvalidRate;
@@ -211,12 +186,12 @@ fn run(init: std.process.Init) !void {
             try render.media(out, try castig.control.rate(env, args[2], value));
         },
         .cast => {
-            if (args.len < 4) fail(help(cmd));
+            if (args.len < 4) fail(help_text.help(cmd));
             var opts: castig.session.Options = .{ .source = args[3] };
             var i: usize = 4;
             while (i < args.len) : (i += 1) {
                 const flag = args[i];
-                if (i + 1 >= args.len) fail(help(cmd));
+                if (i + 1 >= args.len) fail(help_text.help(cmd));
                 i += 1;
                 if (std.mem.eql(u8, flag, "--title")) {
                     opts.title = args[i];
@@ -229,14 +204,14 @@ fn run(init: std.process.Init) !void {
                         fail("--protocol expects cast or dlna\n");
                 } else if (std.mem.eql(u8, flag, "--remux")) {
                     opts.remux = std.meta.stringToEnum(castig.delivery.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
-                } else fail(help(cmd));
+                } else fail(help_text.help(cmd));
             }
             const session = try castig.session.Session.start(env, args[2], opts);
             defer session.deinit();
             while (try session.next()) |e| try render.event(out, e);
         },
         .subs => {
-            if (args.len < 3) fail(help(cmd));
+            if (args.len < 3) fail(help_text.help(cmd));
             var opts: castig.subs.Options = .{};
             var auto = false;
             var i: usize = 3;
@@ -246,7 +221,7 @@ fn run(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, args[i], "--lang") and i + 1 < args.len) {
                     i += 1;
                     opts.languages = try castig.subs.config.splitLanguages(arena, args[i]);
-                } else fail(help(cmd));
+                } else fail(help_text.help(cmd));
             }
             if (!auto and !prompt.interactive(io)) {
                 std.debug.print("stdin is not a terminal, picking automatically\n", .{});
@@ -266,156 +241,27 @@ fn run(init: std.process.Init) !void {
             try out.writeAll("\n");
         },
         .ui => {
-            if (args.len != 2) fail(help(cmd));
+            if (args.len != 2) fail(help_text.help(cmd));
             try out.flush();
             return openWindow(env);
         },
         .version => try out.print("{s}\n", .{castig.version}),
-        .help => try out.writeAll(usage),
+        .help => try out.writeAll(help_text.usage),
     }
 
     try out.flush();
 }
 
 /// The command a help request is about, or null when this is real work.
-fn helpTopic(cmd: Command, args: []const []const u8) ?Command {
+fn helpTopic(cmd: help_text.Command, args: []const []const u8) ?help_text.Command {
     if (cmd == .help) {
         if (args.len < 3) return null;
-        return std.meta.stringToEnum(Command, args[2]) orelse fail(usage);
+        return std.meta.stringToEnum(help_text.Command, args[2]) orelse fail(help_text.usage);
     }
     for (args[2..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return cmd;
     }
     return null;
-}
-
-/// What a command takes. The index in `usage` stays one line per command, so
-/// everything a command needs explaining goes here.
-fn help(cmd: Command) []const u8 {
-    return switch (cmd) {
-        .ls =>
-        \\usage: castig ls [--timeout <ms>] [--protocol cast|dlna]
-        \\
-        \\Find the devices castig can drive: Cast receivers over mDNS and
-        \\UPnP AV renderers over SSDP. Both rounds run at once.
-        \\
-        \\The last column is what to pass as <device>: an id for a Cast
-        \\receiver, a description URL for a renderer. Part of a name works
-        \\too, and `cast:name` or `dlna:name` settles one that matches both.
-        \\
-        \\  --timeout <ms>       how long to listen for replies (default 2000)
-        \\  --protocol cast|dlna only look for one kind
-        \\
-        ,
-        .watch =>
-        \\usage: castig watch <device>
-        \\
-        \\Follow what the device is playing until it stops, whoever started
-        \\it. A Cast receiver reports as it goes; a DLNA renderer is asked
-        \\once a second, since UPnP AV tells nobody anything by itself.
-        \\
-        ,
-        .probe =>
-        \\usage: castig probe <file> [--device <device>]
-        \\
-        \\Print the streams of a media file, and whether a device can play it
-        \\as it is or the audio has to be transcoded.
-        \\
-        \\  --device <d>  judge it against this device rather than against a
-        \\                Cast receiver. A Cast receiver answers the same as
-        \\                the default, since that is already its own list.
-        \\                A DLNA renderer is asked what it accepts, and
-        \\                usually accepts more than the default assumes.
-        \\
-        ,
-        .status =>
-        \\usage: castig status <device>
-        \\
-        \\Show what the receiver is playing, and where it is in the item.
-        \\
-        ,
-        .cast =>
-        \\usage: castig cast <device> <file|url> [--title <t>] [--type <mime>]
-        \\                                       [--subs <file|url|auto>] [--remux <mode>]
-        \\                                       [--protocol cast|dlna]
-        \\
-        \\Play a local file or a URL and follow playback until it ends. Local
-        \\files are served from a built-in HTTP server, so seeking works.
-        \\
-        \\  --title <t>     what the receiver shows as the title
-        \\  --type <mime>   override the media type sent to the receiver
-        \\  --subs <arg>    add a .srt or .vtt track. On by default: without it
-        \\                  a sidecar <name>.srt or <name>.<lang>.srt next to
-        \\                  the file is used. `auto` downloads a hash match
-        \\                  from OpenSubtitles when there is none. Embedded
-        \\                  text subtitles are offered too, pick one from the
-        \\                  receiver's subtitle menu.
-        \\  --protocol <p>  which kind of device the name means, when it
-        \\                  matches one of each. A `cast:` or `dlna:` prefix
-        \\                  on <device> says the same thing.
-        \\  --remux <mode>  how transcoded audio is delivered:
-        \\                    auto    hls, falling back to mp4 if refused
-        \\                    hls     seekable, starts at once
-        \\                    mp4     seekable, no temp file, brief startup
-        \\                    stream  starts at once, no seeking
-        \\
-        ,
-        .pause =>
-        \\usage: castig pause <device>
-        \\
-        \\Pause the current item, whoever started it.
-        \\
-        ,
-        .play =>
-        \\usage: castig play <device>
-        \\
-        \\Resume the current item, whoever started it.
-        \\
-        ,
-        .seek =>
-        \\usage: castig seek <device> <pos>
-        \\
-        \\Jump to <pos>: seconds, m:ss or h:mm:ss, or +N / -N to move relative
-        \\to where playback is now.
-        \\
-        ,
-        .rate =>
-        \\usage: castig rate <device> <x>
-        \\
-        \\Set playback speed, between 0.5 and 2.0.
-        \\
-        ,
-        .stop =>
-        \\usage: castig stop <device>
-        \\
-        \\Stop whatever app is running on the receiver.
-        \\
-        ,
-        .subs =>
-        \\usage: castig subs <file> [--lang en,ko] [--auto]
-        \\
-        \\Download a subtitle from OpenSubtitles.com next to the file. Needs an
-        \\API key and login in ~/.config/castig/config (see the README).
-        \\
-        \\  --lang <list>   comma separated languages to look for
-        \\  --auto          take a trusted hash match only, without asking
-        \\
-        ,
-        .ui =>
-        \\usage: castig ui
-        \\
-        \\Open the window. Runs castigui, which `zig build gui` builds.
-        \\
-        ,
-        .version =>
-        \\usage: castig version
-        \\
-        \\Print the version: the tag on a release, otherwise a dev version
-        \\carrying the commit count and hash.
-        \\
-        ,
-        .help => usage,
-    };
 }
 
 const gui_exe = "castigui";
