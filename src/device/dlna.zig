@@ -139,8 +139,11 @@ pub const Renderer = struct {
         try didl.write(&meta.writer, .{
             .url = req.url,
             .content_type = req.content_type,
-            .protocol_info = req.protocol_info orelse
-                try didl.protocolInfo(r.scratch.allocator(), req.content_type, didl.contentFeatures(true)),
+            .protocol_info = try didl.protocolInfo(
+                r.scratch.allocator(),
+                req.content_type,
+                didl.contentFeatures(req.seekable),
+            ),
             .title = req.title orelse "castig",
             .duration = req.duration,
         });

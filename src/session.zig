@@ -60,6 +60,24 @@ pub const Event = union(enum) {
     closed,
 };
 
+/// Which delivery a device can actually take. Renderers do not play HLS,
+/// so `auto` means the seekable mp4 there, and asking for HLS outright
+/// gets the nearest thing that works rather than a load that fails.
+fn deliveryFor(want: delivery.Remux, protocol: discovery.Protocol) delivery.Remux {
+    if (protocol == .cast) return want;
+    return switch (want) {
+        .auto, .mp4 => .mp4,
+        .hls => blk: {
+            log.warn("DLNA renderers do not play HLS; serving a seekable mp4 instead", .{});
+            break :blk .mp4;
+        },
+        .stream => blk: {
+            log.warn("many renderers refuse a body of unknown length, and none can seek one", .{});
+            break :blk .stream;
+        },
+    };
+}
+
 pub const Session = struct {
     env: Env,
     opts: Options,
@@ -124,22 +142,36 @@ pub const Session = struct {
         };
         const want_download = opts.subtitles == .download;
 
+        // Probing is the slow part, and it is what overlaps the discovery
+        // round. The probed demuxer goes to the delivery that can reuse it.
+        var probe_result: ?pipeline.Plan = null;
+        var probed: ?*av.FormatContext = null;
+        defer if (probed) |ic| ic.close_input();
+
         if (local) {
             Io.Dir.cwd().access(io, opts.source, .{}) catch |err| {
                 log.warn("cannot read {s}: {s}", .{ opts.source, @errorName(err) });
                 return error.SourceUnreadable;
             };
             const p = try pipeline.plan(arena, opts.source);
-            // The probed demuxer goes to the delivery that can reuse it.
-            var probed: ?*av.FormatContext = p.ic;
-            defer if (probed) |ic| ic.close_input();
+            probe_result = p;
+            probed = p.ic;
             duration = p.duration;
+        }
+
+        // Which deliveries work depends on which protocol the device speaks,
+        // so it has to be known before the routes are built.
+        resolved = true;
+        s.endpoint = try resolving.await(io);
+        const protocol = s.endpoint.protocol();
+
+        if (probe_result) |p| {
             if (p.video_unsupported) {
                 log.warn("{s} video is not castable and video transcoding is not implemented; trying direct", .{p.video_codec});
             }
             if (p.direct or p.video_unsupported) {
                 s.target = try s.routes.addFile(content_type);
-            } else switch (opts.remux) {
+            } else switch (deliveryFor(opts.remux, protocol)) {
                 .auto, .hls => {
                     log.info("remuxing {s} audio to aac (hls)", .{p.audio_codec});
                     probed = null;
@@ -150,20 +182,23 @@ pub const Session = struct {
                     s.target = try s.routes.addStream();
                 },
                 .mp4 => {
+                    log.info("remuxing {s} audio to aac (seekable mp4)", .{p.audio_codec});
                     probed = null;
                     s.target = try s.routes.addMp4(p.ic);
                 },
             }
-            try s.routes.addEmbeddedSubtitles(p.subtitles);
+            // A renderer has no subtitle menu to offer the extra tracks in.
+            if (protocol == .cast) {
+                try s.routes.addEmbeddedSubtitles(p.subtitles);
+            } else if (p.subtitles.len > 0) {
+                log.info("a renderer has no subtitle menu, so its {d} embedded track(s) are not offered", .{p.subtitles.len});
+            }
             if (sub_source == null) sub_source = try subs.resolve(env, opts.source, want_download, p.fps);
         } else if (want_download) {
             log.warn("--subs auto needs a local file", .{});
         }
         // The side-loaded track starts enabled; embedded tracks are advertised off.
         if (sub_source) |sub| try s.routes.addSideloaded(sub.path, sub.lang);
-
-        resolved = true;
-        s.endpoint = try resolving.await(io);
 
         // Connect after the heavy work: the receiver drops a channel whose
         // heartbeat PINGs go unanswered during a long mp4 build.
@@ -230,6 +265,7 @@ pub const Session = struct {
             .active_track_ids = s.routes.active.items,
             .duration = s.duration,
             .hls = s.target.isHls(),
+            .seekable = s.target.seekable,
         });
         s.push(.{ .loaded = .{ .address = s.endpoint.address(), .content_type = s.target.content_type } });
         s.push(.{ .state = s.media });
@@ -239,6 +275,8 @@ pub const Session = struct {
     /// before it ever played, and the seekable mp4 is the fallback. The build
     /// takes a while, so the idle connection is reopened afterwards.
     fn fallBack(s: *Session) !bool {
+        // Retrying as an mp4 is a Cast thing: a renderer is never sent HLS.
+        if (s.player.protocol() != .cast) return false;
         const failed = if (s.media.ended) |e| e == .failed else false;
         if (s.played or !failed) return false;
         if (s.opts.remux != .auto or !s.target.isHls() or !s.local) return false;

@@ -40,6 +40,9 @@ pub const Remux = enum {
 pub const Target = struct {
     path: []const u8,
     content_type: []const u8,
+    /// Whether the bytes behind it answer a Range request. A renderer is
+    /// told, since it decides whether to draw a seek bar from that.
+    seekable: bool = true,
 
     /// Whether the receiver must be told to expect MPEG-TS segments. Both
     /// spellings of the playlist type carry "mpegurl".
@@ -160,7 +163,7 @@ pub const Routes = struct {
         const c = try s.env.arena.create(StreamCtx);
         c.* = .{ .gpa = s.env.gpa, .path = s.source };
         try s.addRoute(mp4_path, c, streamHandle);
-        return .{ .path = mp4_path, .content_type = mp4_type };
+        return .{ .path = mp4_path, .content_type = mp4_type, .seekable = false };
     }
 
     /// The on-the-fly seekable mp4, or the no-seek stream if the file cannot
