@@ -1,8 +1,8 @@
 # castig
 
-Cast a local video to a Chromecast from the command line, as a single static
-binary. ffmpeg is compiled in, so audio the receiver cannot decode (DTS, AC3,
-TrueHD, ...) is transcoded on the fly and subtitles are handled without any
+Cast a local file or a URL to a Chromecast from the command line, as a single
+static binary. ffmpeg is compiled in, so audio the receiver cannot decode (DTS,
+AC3, TrueHD, ...) is transcoded on the fly and subtitles are handled without any
 runtime dependency.
 
 ## Commands
