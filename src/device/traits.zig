@@ -70,8 +70,8 @@ pub const Traits = struct {
 
     pub fn of(protocol: discovery.Protocol) Traits {
         return switch (protocol) {
-            .cast => Traits.cast,
-            .dlna => Traits.dlna,
+            .cast => .cast,
+            .dlna => .dlna,
         };
     }
 

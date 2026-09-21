@@ -145,9 +145,10 @@ const App = struct {
     /// another device is chosen.
     capabilities: work.Task(anyerror!castig.support.Profile),
     profile: castig.support.Profile = castig.support.cast,
-    /// Set when the verdict on screen was judged against another device and
-    /// the reader was busy, so it is asked again once it is free.
-    reprobe: bool = false,
+    /// The streams of the chosen file, kept so that choosing another device
+    /// re-judges them instead of reading the file again. It lives in the
+    /// reader's arena, so it lasts until the next read starts.
+    streams: ?castig.probe.Report = null,
     /// The probe as the panel shows it, empty when the file cannot be read.
     report: []const u8 = "",
     /// The video's frame rate, which ranks the subtitle candidates.
@@ -308,16 +309,18 @@ fn collect() void {
         app.report = "";
         app.fps = null;
         app.readable = false;
+        app.streams = null;
         if (result) |r| {
             app.readable = true;
             app.fps = videoFps(r);
-            app.report = describeReport(app.examine.allocator(), r) catch "";
+            app.streams = r;
+            describeStreams();
         } else |err| std.log.err("cannot read the file: {s}", .{@errorName(err)});
     }
     if (app.capabilities.collect(app.io)) |result| {
         // A device that will not say keeps the conservative reading.
         app.profile = result catch castig.support.cast;
-        app.reprobe = true;
+        describeStreams();
     }
     if (app.control.collect(app.io)) |result| {
         result catch |err| std.log.err("{s}", .{@errorName(err)});
@@ -334,12 +337,14 @@ fn collect() void {
         outcome catch |err| std.log.err("{s}", .{@errorName(err)});
     }
     app.cast.poll(app.io);
+}
 
-    // Last, so a reader that finished this frame has freed its slot.
-    if (app.reprobe and !app.examine.busy()) {
-        app.reprobe = false;
-        startProbe() catch {};
-    }
+/// The verdict panel, judged against whichever device is chosen now. The
+/// file is not touched: only the labels depend on the device.
+fn describeStreams() void {
+    const r = &(app.streams orelse return);
+    r.judgeAgainst(app.profile);
+    app.report = describeReport(app.examine.allocator(), r.*) catch "";
 }
 
 fn nameDevices(arena: std.mem.Allocator, found: []const castig.discovery.Device) ![]const []const u8 {
@@ -815,14 +820,16 @@ fn openFile() !void {
     try startProbe();
 }
 
-/// Reads the chosen file against the chosen device. Run again when either
-/// changes: what a renderer plays is what it says it plays, so the same
-/// file gets a different verdict on a different device.
+/// Reads the chosen file. Only run when the file changes: choosing another
+/// device re-judges what this found rather than reading it again.
 fn startProbe() !void {
     const path = app.path orelse return;
+    // Whoever picked a second file while the first was still being read
+    // wants the second one, and the reader has only the one slot.
+    app.streams = null;
     if (app.examine.busy()) {
-        app.reprobe = true;
-        return;
+        var dropped = app.examine.cancel(app.io);
+        _ = &dropped;
     }
     app.report = "";
     app.readable = false;
@@ -830,7 +837,6 @@ fn startProbe() !void {
     try app.examine.start(app.io, app.win, castig.probe.inspect, .{
         app.examine.allocator(),
         @as([]const u8, path),
-        app.profile,
     });
 }
 
@@ -838,6 +844,10 @@ fn startProbe() !void {
 /// way to know. A Cast receiver answers from a table without being asked.
 fn startCapabilities() void {
     if (app.capabilities.busy()) return;
+    // `begin` frees what the last answer's sinks point into, so nothing
+    // may go on holding them. The conservative reading stands until the
+    // device answers.
+    app.profile = castig.support.cast;
     const arena = app.capabilities.begin();
     app.capabilities.launch(app.io, app.win, castig.player.profileOf, .{ castig.Env{
         .io = app.io,

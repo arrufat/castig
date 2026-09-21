@@ -19,7 +19,8 @@ pub const Stream = struct {
     codec: []const u8,
     /// From container metadata, usually a three-letter ISO 639-2 code.
     language: ?[]const u8,
-    /// How the receiver copes with this codec; null for `.other`.
+    /// How the device copes with this codec. Null for a track no device
+    /// decodes, and until `Report.judgeAgainst` has said.
     support: ?support.Support = null,
     video: ?struct { width: u32, height: u32, fps: f64 } = null,
     audio: ?struct { channels: u32, sample_rate: u32 } = null,
@@ -42,13 +43,33 @@ pub const Report = struct {
     path: []const u8,
     container: []const u8,
     duration: ?f64,
-    streams: []const Stream,
+    streams: []Stream,
     /// The worst support level across the streams of each kind, so a file
-    /// with one unplayable track is reported by that track.
+    /// with one unplayable track is reported by that track. Both are
+    /// `judgeAgainst`'s to fill.
     video: ?support.Support = null,
     audio: ?support.Support = null,
     text_subs: usize = 0,
     bitmap_subs: usize = 0,
+
+    /// Says what `profile` would have to do with each stream. No I/O: the
+    /// same report answers for another device without the file being read
+    /// again, which is what the window does when the device changes.
+    pub fn judgeAgainst(r: *Report, profile: support.Profile) void {
+        r.video = null;
+        r.audio = null;
+        for (r.streams) |*s| switch (s.kind) {
+            .video => {
+                s.support = profile.videoSupport(s.codec);
+                r.video = worse(r.video, s.support.?);
+            },
+            .audio => {
+                s.support = profile.audioSupport(s.codec);
+                r.audio = worse(r.audio, s.support.?);
+            },
+            .subtitle, .other => {},
+        };
+    }
 
     /// Whether the file has anything a receiver could play.
     pub fn castable(r: Report) bool {
@@ -68,10 +89,11 @@ pub const Report = struct {
     }
 };
 
-/// Lists the streams of `path` and says what `profile` would have to do with
-/// each. Strings taken from the container are duped into `gpa`; codec and
-/// container names are libav's own static ones.
-pub fn inspect(gpa: std.mem.Allocator, path: []const u8, profile: support.Profile) !Report {
+/// Lists the streams of `path`. Strings taken from the container are duped
+/// into `gpa`; codec and container names are libav's own static ones. What
+/// a device would make of them is `Report.judgeAgainst`'s to say, since
+/// that depends on the device and this does not.
+pub fn inspect(gpa: std.mem.Allocator, path: []const u8) !Report {
     const fc = try extra.openInput(gpa, path);
     defer fc.close_input();
 
@@ -107,16 +129,12 @@ pub fn inspect(gpa: std.mem.Allocator, path: []const u8, profile: support.Profil
                     .height = @intCast(par.height),
                     .fps = extra.streamFps(st) orelse 0,
                 };
-                s.support = profile.videoSupport(codec);
-                report.video = worse(report.video, s.support.?);
             },
             .audio => {
                 s.audio = .{
                     .channels = @intCast(par.ch_layout.nb_channels),
                     .sample_rate = @intCast(par.sample_rate),
                 };
-                s.support = profile.audioSupport(codec);
-                report.audio = worse(report.audio, s.support.?);
             },
             .subtitle => {
                 s.text = support.textIsSupported(codec);

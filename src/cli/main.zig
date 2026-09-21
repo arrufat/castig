@@ -157,10 +157,11 @@ fn run(init: std.process.Init) !void {
                     profile = try castig.player.profileOf(env, args[i]);
                 } else fail(help(cmd));
             }
-            const r = castig.probe.inspect(arena, args[2], profile) catch |err| {
+            var r = castig.probe.inspect(arena, args[2]) catch |err| {
                 std.debug.print("cannot open {s}: {s}\n", .{ args[2], @errorName(err) });
                 return error.SourceUnreadable;
             };
+            r.judgeAgainst(profile);
             try render.report(out, r, device);
         },
         .status => {
