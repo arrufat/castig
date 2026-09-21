@@ -105,6 +105,10 @@ pub const Player = union(enum) {
     /// Joins whatever is already playing, whoever started it.
     /// `error.NothingPlaying` when the device is idle, `error.NoMedia` when
     /// something is running with nothing loaded.
+    ///
+    /// Neither is explained here. An idle device is a problem when a verb
+    /// was asked of it and merely the answer when something only looked, and
+    /// only the caller knows which it was.
     pub fn attach(env: Env, endpoint: discovery.Endpoint) !Player {
         const address = switch (endpoint) {
             .cast => |a| a,
@@ -119,18 +123,9 @@ pub const Player = union(enum) {
         errdefer ch.deinit();
 
         const st = try ch.getStatus(env.arena);
-        const app = st.mediaApp() orelse {
-            log.warn("nothing is playing on {f}", .{address});
-            return error.NothingPlaying;
-        };
+        const app = st.mediaApp() orelse return error.NothingPlaying;
         try ch.connectTransport(app.transportId);
-        const media = ch.getMediaStatus(env.arena, app.transportId) catch |err| switch (err) {
-            error.NoMedia => {
-                log.warn("{s} has no media loaded", .{app.displayName});
-                return err;
-            },
-            else => return err,
-        };
+        const media = try ch.getMediaStatus(env.arena, app.transportId);
         var c: Cast = .{
             .ch = ch,
             .transport_id = app.transportId,

@@ -168,7 +168,16 @@ fn run(init: std.process.Init) !void {
         },
         .watch => {
             if (args.len != 3) fail(help(cmd));
-            var following = try castig.control.Follow.start(env, args[2]);
+            // Watching an idle device is answered, not failed: nothing
+            // playing is what it is doing.
+            var following = castig.control.Follow.start(env, args[2]) catch |err| switch (err) {
+                error.NothingPlaying, error.NoMedia => {
+                    try out.print("nothing is playing on {s}\n", .{args[2]});
+                    try out.flush();
+                    return;
+                },
+                else => return err,
+            };
             defer following.deinit();
             // Flushed per line: this follows until the item ends, so a
             // buffer that only empties at the end shows nothing at all.

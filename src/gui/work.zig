@@ -256,6 +256,9 @@ pub const Cast = struct {
 
     /// Follows whatever is already playing on `device`, so the window can
     /// show and drive a cast it did not start.
+    /// `device` is the spec to connect with, which for a renderer is a
+    /// description URL; `name` is what to call it on screen, which is not
+    /// the same thing and is the only one fit to read.
     pub fn follow(
         c: *Cast,
         io: Io,
@@ -263,6 +266,7 @@ pub const Cast = struct {
         gpa: std.mem.Allocator,
         environ: *const std.process.Environ.Map,
         device: []const u8,
+        name: []const u8,
     ) !void {
         const arena = c.task.begin();
         c.following = true;
@@ -270,14 +274,14 @@ pub const Cast = struct {
             Io.Threaded.mutexLock(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             c.state = .{ .phase = .preparing };
-            c.say("asking {s} what it is doing", .{device});
+            c.say("asking {s} what it is doing", .{name});
         }
         try c.task.launch(io, win, watch, .{ c, castig.Env{
             .io = io,
             .arena = arena,
             .gpa = gpa,
             .environ = environ,
-        }, try arena.dupe(u8, device) });
+        }, try arena.dupe(u8, device), try arena.dupe(u8, name) });
     }
 
     /// Drops whatever is being watched so the slot can be used again. A
@@ -293,13 +297,13 @@ pub const Cast = struct {
         c.state = .{};
     }
 
-    fn watch(c: *Cast, env: castig.Env, device: []const u8) void {
+    fn watch(c: *Cast, env: castig.Env, device: []const u8, name: []const u8) void {
         var following = castig.control.Follow.start(env, device) catch |err| {
             Io.Threaded.mutexLock(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             c.state = .{};
             switch (err) {
-                error.NothingPlaying, error.NoMedia => c.say("nothing playing on {s}", .{device}),
+                error.NothingPlaying, error.NoMedia => c.say("nothing playing on {s}", .{name}),
                 else => c.say("{s}", .{@errorName(err)}),
             }
             dvui.refresh(c.task.win, @src(), null);
@@ -316,7 +320,7 @@ pub const Cast = struct {
             c.state.position = now.position;
             c.state.rate = now.rate;
             if (now.duration) |d| c.state.duration = d;
-            c.say("playing on {s}, started elsewhere", .{device});
+            c.say("playing on {s}, started elsewhere", .{name});
             Io.Threaded.mutexUnlock(&c.mutex);
             dvui.refresh(c.task.win, @src(), null);
         }
@@ -324,7 +328,7 @@ pub const Cast = struct {
         Io.Threaded.mutexLock(&c.mutex);
         defer Io.Threaded.mutexUnlock(&c.mutex);
         c.state.phase = .over;
-        c.say("nothing playing on {s} any more", .{device});
+        c.say("nothing playing on {s} any more", .{name});
         dvui.refresh(c.task.win, @src(), null);
     }
 

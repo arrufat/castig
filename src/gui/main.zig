@@ -408,8 +408,17 @@ fn selectDevice(index: usize) void {
 /// outranks it and is left running.
 fn followSelected() void {
     if (app.cast.busy() and !app.cast.following) return;
+    const index = app.device orelse return;
+    if (index >= app.devices.len) return;
     app.cast.stopFollowing(app.io);
-    app.cast.follow(app.io, app.win, app.gpa, app.environ, app.spec()) catch {};
+    app.cast.follow(
+        app.io,
+        app.win,
+        app.gpa,
+        app.environ,
+        app.spec(),
+        app.devices[index].friendly_name,
+    ) catch {};
 }
 
 fn devicePanel() !void {

@@ -39,9 +39,20 @@ pub fn stop(env: Env, device: []const u8) ![]const []const u8 {
     return player.stopAll(env, try discovery.resolve(env, device, null));
 }
 
-/// Connects to whatever is playing on the device.
+/// Connects to whatever is playing on the device, for a verb that needs
+/// something to act on. Finding nothing is a failure here, so it is said.
 fn open(env: Env, device: []const u8) !Player {
-    return Player.attach(env, try discovery.resolve(env, device, null));
+    return Player.attach(env, try discovery.resolve(env, device, null)) catch |err| switch (err) {
+        error.NothingPlaying => {
+            log.warn("nothing is playing on {s}", .{device});
+            return err;
+        },
+        error.NoMedia => {
+            log.warn("{s} has nothing loaded", .{device});
+            return err;
+        },
+        else => return err,
+    };
 }
 
 /// One transport command for whatever is playing.
@@ -83,8 +94,10 @@ pub const Follow = struct {
 
     /// Joins what is playing. `error.NothingPlaying` when the device is
     /// idle, `error.NoMedia` when something is up with nothing loaded.
+    /// Finding nothing is an answer rather than a failure, so it is left
+    /// to the caller to say, or not say, whatever suits where it is shown.
     pub fn start(env: Env, device: []const u8) !Follow {
-        const p = try open(env, device);
+        const p = try Player.attach(env, try discovery.resolve(env, device, null));
         return .{ .player = p, .scratch = .init(env.gpa), .now = p.current() };
     }
 

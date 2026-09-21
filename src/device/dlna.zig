@@ -196,7 +196,10 @@ pub const Renderer = struct {
 
     pub fn play(r: *Renderer) !playback.Playback {
         try r.startPlaying();
-        return r.poll();
+        // Like pause and stop: a poll this soon still describes the state
+        // before it, and reporting "paused" to someone who just pressed
+        // play is worse than reporting a play that is still starting.
+        return r.settled(.{ .state = .playing });
     }
 
     /// A renderer backed by GStreamer changes state in its own time, so a
@@ -295,10 +298,12 @@ pub const Renderer = struct {
         _ = r.scratch.reset(.retain_capacity);
         const transport = try r.action("GetTransportInfo", &.{instance});
         const state = xml.text(transport, "CurrentTransportState") orelse "";
-        if (std.mem.eql(u8, state, "NO_MEDIA_PRESENT")) {
-            log.warn("nothing is loaded on {s}", .{r.friendly_name});
-            return error.NothingPlaying;
-        }
+        // A renderer keeps the last URI after a Stop, so being stopped is
+        // not the same as having nothing, but it is the same to us: the
+        // verbs are all about something in progress, and a Cast receiver
+        // whose app has gone answers the same way.
+        // Not explained here: see `Player.attach`.
+        if (stateOf(state) == .idle) return error.NothingPlaying;
         // It was already going before we arrived, so a stop from here is an
         // ending rather than a load that never started.
         r.played = true;
