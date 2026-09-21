@@ -237,7 +237,14 @@ pub const Routes = struct {
             // worth it for the few renderers that would then take it.
             const serve: playback.TextTrack.Format = if (want == .srt and is_srt) .srt else .vtt;
             const body = if (serve == .srt) text else try webvtt.srtToVtt(arena, text);
-            url = if (serve == .srt) "/sub.srt" else "/sub.vtt";
+            // The language goes in the name, the way a sidecar carries it.
+            // None of the ways of naming a subtitle to a renderer has a
+            // field for it, so the file name is the only place a renderer
+            // can read it, and one without shows up as "Unknown".
+            url = if (lang) |l|
+                try arena.print("/sub.{s}.{s}", .{ l, @tagName(serve) })
+            else
+                try arena.print("/sub.{s}", .{@tagName(serve)});
             format = serve;
             try s.list.append(arena, .{
                 .path = url,

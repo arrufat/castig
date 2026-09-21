@@ -36,6 +36,8 @@ pub const Renderer = struct {
     service: []const u8,
     control_url: []const u8,
     caps: Caps,
+    /// MIME types it said it accepts. Its own word beats any guess of ours.
+    sinks: []const []const u8 = &.{},
     /// Reset at the start of each operation, so a poll a second for the
     /// length of a film stays bounded.
     scratch: std.heap.ArenaAllocator,
@@ -94,7 +96,8 @@ pub const Renderer = struct {
         r.service = description.av_transport.type;
         r.control_url = description.av_transport.control_url;
         r.caps = r.readCaps(description.av_transport.scpd_url);
-        log.debug("{s}: {s} at {s}", .{ r.friendly_name, r.service, r.control_url });
+        r.sinks = r.readSinks(description.connection_manager);
+        log.debug("{s}: {s} at {s}, {d} accepted type(s)", .{ r.friendly_name, r.service, r.control_url, r.sinks.len });
         return r;
     }
 
@@ -120,6 +123,20 @@ pub const Renderer = struct {
         };
         if (res.status != .ok) return .{};
         return parseCaps(body.written());
+    }
+
+    /// What the renderer accepts, from ConnectionManager. One call, and it
+    /// is the difference between remuxing a file and handing it over whole.
+    /// A device that will not answer keeps the conservative defaults.
+    fn readSinks(r: *Renderer, service: ?ssdp.Service) []const []const u8 {
+        const manager = service orelse return &.{};
+        const reply = soap.call(r.env.arena, &r.http, manager.control_url, .{
+            .service = manager.type,
+            .name = "GetProtocolInfo",
+        }) catch return &.{};
+        const raw = xml.text(reply, "Sink") orelse return &.{};
+        const sink = xml.unescape(r.env.arena, raw) catch return &.{};
+        return parseSinks(r.env.arena, sink) catch &.{};
     }
 
     pub fn localAddress(r: *const Renderer) net.Ip4Address {
@@ -363,6 +380,21 @@ fn stateOf(transport_state: []const u8) playback.State {
     if (std.mem.eql(u8, transport_state, "STOPPED")) return .idle;
     if (std.mem.eql(u8, transport_state, "NO_MEDIA_PRESENT")) return .idle;
     return .unknown;
+}
+
+/// A sink list is comma separated `protocol:network:mime:extras`, and the
+/// MIME is the only field worth keeping.
+pub fn parseSinks(arena: std.mem.Allocator, sink: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var entries = std.mem.splitScalar(u8, sink, ',');
+    while (entries.next()) |entry| {
+        var fields = std.mem.splitScalar(u8, std.mem.trim(u8, entry, " \t\r\n"), ':');
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        const mime = fields.next() orelse continue;
+        if (mime.len > 0) try out.append(arena, mime);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// The seek units and play speeds an AVTransport SCPD admits to.

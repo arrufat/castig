@@ -17,6 +17,7 @@ const discovery = @import("device/discovery.zig");
 const playback = @import("device/playback.zig");
 const extra = @import("media/av_extra.zig");
 const pipeline = @import("media/pipeline.zig");
+const support = @import("media/support.zig");
 const http = @import("serve/server.zig");
 const delivery = @import("serve/delivery.zig");
 const subs = @import("subs/lookup.zig");
@@ -166,11 +167,25 @@ pub const Session = struct {
         const protocol = s.endpoint.protocol();
         s.routes.dlna = protocol == .dlna;
 
+        // A renderer is asked what it accepts before the delivery is
+        // chosen, since that answer decides whether the file needs touching
+        // at all, and asking is a couple of HTTP requests. A Cast receiver
+        // is left until after the heavy work: it drops a channel whose
+        // heartbeat PINGs go unanswered during a long mp4 build.
+        var connected = false;
+        errdefer if (connected) s.player.deinit();
+        if (protocol == .dlna) {
+            s.player = try Player.connect(env, s.endpoint);
+            connected = true;
+        }
+        const profile = if (connected) s.player.profile() else support.chromecast;
+
         if (probe_result) |p| {
-            if (p.video_unsupported) {
+            const verdict = support.judge(profile, p.video_codec, p.audio_codec, content_type);
+            if (verdict.video_unsupported) {
                 log.warn("{s} video is not castable and video transcoding is not implemented; trying direct", .{p.video_codec});
             }
-            if (p.direct or p.video_unsupported) {
+            if (verdict.direct or verdict.video_unsupported) {
                 s.target = try s.routes.addFile(content_type);
             } else switch (deliveryFor(opts.remux, protocol)) {
                 .auto, .hls => {
@@ -201,10 +216,10 @@ pub const Session = struct {
         // The side-loaded track starts enabled; embedded tracks are advertised off.
         if (sub_source) |sub| try s.routes.addSideloaded(sub.path, sub.lang);
 
-        // Connect after the heavy work: the receiver drops a channel whose
-        // heartbeat PINGs go unanswered during a long mp4 build.
-        s.player = try Player.connect(env, s.endpoint);
-        errdefer s.player.deinit();
+        if (!connected) {
+            s.player = try Player.connect(env, s.endpoint);
+            connected = true;
+        }
 
         if (s.routes.list.items.len > 0) {
             const server = try http.Server.start(io, env.gpa, s.routes.list.items);

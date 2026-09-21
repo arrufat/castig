@@ -30,8 +30,6 @@ pub const SubtitleStream = struct {
 };
 
 pub const Plan = struct {
-    direct: bool,
-    video_unsupported: bool,
     duration: ?f64,
     /// First video stream's average frame rate, when the demuxer knows it.
     fps: ?f64,
@@ -52,8 +50,6 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
 
     var video_codec: []const u8 = "";
     var audio_codec: []const u8 = "";
-    var video_ok = true;
-    var audio_ok = true;
     var have_video = false;
     var have_audio = false;
     var subs: std.ArrayList(SubtitleStream) = .empty;
@@ -66,12 +62,10 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
             .VIDEO => if (!have_video) {
                 have_video = true;
                 video_codec = name;
-                video_ok = support.videoSupport(name) != .transcode;
             },
             .AUDIO => if (!have_audio) {
                 have_audio = true;
                 audio_codec = name;
-                audio_ok = support.audioSupport(name) == .direct;
             },
             .SUBTITLE => if (support.textIsSupported(name)) {
                 try subs.append(gpa, .{
@@ -85,8 +79,6 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     }
 
     return .{
-        .direct = video_ok and audio_ok,
-        .video_unsupported = have_video and !video_ok,
         .duration = extra.durationSeconds(ic),
         .fps = extra.videoFps(ic),
         .video_codec = video_codec,
@@ -665,7 +657,7 @@ fn fixture(gpa: std.mem.Allocator, dir: *std.testing.TmpDir, name: []const u8, b
     return gpa.print(".zig-cache/tmp/{s}/{s}", .{ dir.sub_path, name });
 }
 
-test "plan: aac plays directly, ac3 has to be remuxed" {
+test "plan reports the codecs, and a Cast receiver decides what they mean" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -684,8 +676,9 @@ test "plan: aac plays directly, ac3 has to be remuxed" {
         defer gpa.free(p.subtitles);
 
         try std.testing.expectEqualStrings(std.mem.span(c.codec), p.audio_codec);
-        try std.testing.expectEqual(c.direct, p.direct);
-        try std.testing.expect(!p.video_unsupported);
+        const verdict = support.judge(support.chromecast, p.video_codec, p.audio_codec, "video/mp4");
+        try std.testing.expectEqual(c.direct, verdict.direct);
+        try std.testing.expect(!verdict.video_unsupported);
         try std.testing.expectEqual(@as(usize, 0), p.subtitles.len);
     }
 }

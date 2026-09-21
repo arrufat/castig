@@ -18,6 +18,7 @@ const Env = @import("../env.zig").Env;
 const cast = @import("cast.zig");
 const discovery = @import("discovery.zig");
 const dlna = @import("dlna.zig");
+const support = @import("../media/support.zig");
 const playback = @import("playback.zig");
 
 const log = std.log.scoped(.cast);
@@ -138,6 +139,15 @@ pub const Player = union(enum) {
         };
         _ = c.track(media);
         return .{ .cast = c };
+    }
+
+    /// What this device can play. A receiver's abilities are fixed; a
+    /// renderer's start conservative and widen to what it claims.
+    pub fn profile(p: Player) support.Profile {
+        return switch (p) {
+            .cast => support.chromecast,
+            .dlna => |r| support.dlna.withSinks(r.sinks),
+        };
     }
 
     pub fn protocol(p: Player) discovery.Protocol {
