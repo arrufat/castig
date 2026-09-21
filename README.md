@@ -24,12 +24,9 @@ castig version                   # print the version
 `<device>` is an IP, `ip:port`, or any part of a name shown by `ls`. The
 playback controls work on whatever is playing, whoever started it.
 
-`cast` takes `--title`, `--type <mime>`, `--subs <file|url|auto>` and
-`--remux <auto|hls|mp4|stream>`. Local files are served from a built-in HTTP
-server, so seeking works. When the audio needs transcoding, `--remux` chooses
-how it is delivered: `auto` starts at once and seeks, changing mode if the
-receiver refuses; `mp4` seeks but waits for a preparation pass; `stream`
-starts at once but cannot seek.
+Local files are served from a built-in HTTP server, so seeking works. `cast`
+takes `--title`, `--type`, `--subs` and `--remux`; run `castig help cast` for
+what each one does.
 
 Set `CASTIG_DEBUG=1` to see every message exchanged with the receiver.
 
@@ -120,6 +117,7 @@ zig build docs            # API documentation into zig-out/docs
 zig build run -- ls
 zig build gui             # the window, into zig-out/bin/castigui
 zig build run-gui
+zig build version         # the version this checkout resolves to
 ```
 
 `zig build` builds the CLI alone; only `gui` compiles SDL3 and the rest of
@@ -128,21 +126,15 @@ the window. Their sources are fetched with the other dependencies.
 ```sh
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl   # static release
 zig build -fsys=ffmpeg                                        # link system ffmpeg
+zig build gui -fsys=sdl3                                      # link system SDL3
 ```
 
 `-fsys=ffmpeg` finds the libav* libraries with pkg-config instead of building
 ffmpeg, which is much faster and gives you hardware codecs, at the cost of a
 dynamic binary. The bindings target ffmpeg 8.1 and work with 9.0.
 
-Autodoc loads its sources over HTTP and cannot be opened from disk, so
-`zig build docs-serve` serves the rendered pages on an ephemeral port and
-opens a browser, like `zig std` does; `zig build docs-serve -- 8080` pins the
-port and it runs until interrupted.
-
-castig is a Zig module as well as a program: `src/root.zig` is the library,
-`src/cli/` the command-line front end and `src/gui/` the window, each a
-module that can only reach the library through `@import("castig")`, so
-another project can depend on castig the same way.
+`zig build docs-serve` opens the rendered documentation in a browser, and
+takes a port: `zig build docs-serve -- 8080`.
 
 ## License
 
