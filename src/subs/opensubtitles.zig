@@ -61,6 +61,7 @@ pub const Candidate = struct {
 pub const Fps = struct {
     value: f64,
 
+    /// Prints the rate without trailing zeros, the way the API expects it.
     pub fn format(f: Fps, w: *std.Io.Writer) !void {
         var buf: [32]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{d:.2}", .{f.value}) catch return;
@@ -68,6 +69,7 @@ pub const Fps = struct {
     }
 };
 
+/// Wraps a frame rate so `{f}` prints it the way the API expects.
 pub fn fmtFps(value: f64) Fps {
     return .{ .value = value };
 }
@@ -136,10 +138,12 @@ pub const Client = struct {
     base: []const u8 = api_default,
     token: ?[]const u8 = null,
 
+    /// A client that talks to OpenSubtitles with `cfg`'s key and login.
     pub fn init(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, cfg: config.Config) Client {
         return .{ .io = io, .arena = arena, .cfg = cfg, .http = .{ .allocator = gpa, .io = io } };
     }
 
+    /// Closes the HTTP connections the client kept.
     pub fn deinit(c: *Client) void {
         c.http.deinit();
     }

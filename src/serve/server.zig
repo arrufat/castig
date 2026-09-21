@@ -51,6 +51,7 @@ pub const Server = struct {
     group: Io.Group = .init,
     port: u16,
 
+    /// Listens on an ephemeral port and serves `routes` until `stop`.
     pub fn start(io: Io, gpa: std.mem.Allocator, routes: []const Route) !*Server {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
@@ -74,6 +75,7 @@ pub const Server = struct {
         s.routes = routes;
     }
 
+    /// Stops accepting, cancels the live connections and frees the server.
     pub fn stop(s: *Server) void {
         // Wake the blocked accept, then cancel the connection tasks.
         const listening: net.Stream = .{ .socket = s.listener.socket };
@@ -180,6 +182,7 @@ const cors_array = [_]http.Header{
 };
 pub const cors: []const http.Header = &cors_array;
 
+/// The 404 a route uses for a path it does not know.
 pub fn respondNotFound(request: *Request) !void {
     try request.respond("not found\n", .{ .status = .not_found, .extra_headers = cors });
 }

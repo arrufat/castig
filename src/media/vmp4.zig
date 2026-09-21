@@ -225,6 +225,7 @@ pub const VMp4 = struct {
     mdat_end: u64,
     total: u64,
 
+    /// Closes the sources the virtual file was assembled from.
     pub fn deinit(vm: *VMp4) void {
         switch (vm.video) {
             .pread => |f| f.close(vm.io),

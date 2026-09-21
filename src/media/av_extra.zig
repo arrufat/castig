@@ -93,10 +93,12 @@ pub fn codecId(par: *const av.Codec.Parameters) CodecId {
     return raw.*;
 }
 
+/// `avcodec_get_name` as a slice.
 pub fn codecName(id: CodecId) []const u8 {
     return std.mem.span(avcodec_get_name(id));
 }
 
+/// `av_get_media_type_string` as a slice, "unknown" when libav has no name.
 pub fn mediaTypeName(media_type: av.MediaType) []const u8 {
     return if (av_get_media_type_string(media_type)) |s| std.mem.span(s) else "unknown";
 }
@@ -135,6 +137,7 @@ pub const AVSEEK_FLAG_BACKWARD: c_int = 1;
 /// demuxer's names, e.g. "mov,mp4,m4a,3gp,3g2,mj2").
 pub extern fn av_match_name(name: [*:0]const u8, names: [*:0]const u8) c_int;
 
+/// `av_match_name` as a bool.
 pub fn matchName(name: [*:0]const u8, names: [*:0]const u8) bool {
     return av_match_name(name, names) != 0;
 }
@@ -189,12 +192,14 @@ pub extern fn av_audio_fifo_drain(af: *AudioFifo, nb_samples: c_int) c_int;
 /// AudioSpecificConfig in the container instead of in the stream.
 pub const CODEC_FLAG_GLOBAL_HEADER: c_int = 1 << 22;
 
+/// A muxer context for `format_name`, such as "mp4" or "hls".
 pub fn allocOutputContext(format_name: [*:0]const u8) av.Error!*av.FormatContext {
     var oc: ?*av.FormatContext = null;
     _ = try av.wrap(avformat_alloc_output_context2(&oc, null, format_name, null));
     return oc.?;
 }
 
+/// An output stream with nothing filled in yet, for the caller to set up.
 pub fn newStream(oc: *av.FormatContext) error{OutOfMemory}!*av.Stream {
     return avformat_new_stream(oc, null) orelse error.OutOfMemory;
 }
@@ -237,6 +242,7 @@ pub fn WriteAvio(comptime T: type, comptime onWrite: fn (*T, []const u8) anyerro
             return size;
         }
 
+        /// Allocates the AVIO. `seek` is null when the output cannot seek.
         pub fn alloc(t: *T, seek: ?*const fn (?*anyopaque, i64, av.SEEK) callconv(.c) i64) !*av.IOContext {
             const buffer = try av.malloc(avio_buffer_len);
             return av.IOContext.alloc(buffer, .writable, t, null, writeCb, seek);
@@ -244,38 +250,47 @@ pub fn WriteAvio(comptime T: type, comptime onWrite: fn (*T, []const u8) anyerro
     };
 }
 
+/// `avcodec_parameters_copy`, returning `av.Error`.
 pub fn copyParameters(dst: *av.Codec.Parameters, src: *const av.Codec.Parameters) av.Error!void {
     _ = try av.wrap(avcodec_parameters_copy(dst, src));
 }
 
+/// `avcodec_parameters_from_context`, returning `av.Error`.
 pub fn parametersFromContext(par: *av.Codec.Parameters, cc: *const av.Codec.Context) av.Error!void {
     _ = try av.wrap(avcodec_parameters_from_context(par, cc));
 }
 
+/// `avformat_write_header`, returning `av.Error`.
 pub fn writeHeader(oc: *av.FormatContext, options: ?*av.Dictionary.Mutable) av.Error!void {
     _ = try av.wrap(avformat_write_header(oc, options));
 }
 
+/// `av_interleaved_write_frame`, returning `av.Error`.
 pub fn writeFrame(oc: *av.FormatContext, pkt: ?*av.Packet) av.Error!void {
     _ = try av.wrap(av_interleaved_write_frame(oc, pkt));
 }
 
+/// `av_write_trailer`, returning `av.Error`.
 pub fn writeTrailer(oc: *av.FormatContext) av.Error!void {
     _ = try av.wrap(av_write_trailer(oc));
 }
 
+/// `avcodec_send_frame`, returning `av.Error`.
 pub fn sendFrame(cc: *av.Codec.Context, frame: ?*const av.Frame) av.Error!void {
     _ = try av.wrap(avcodec_send_frame(cc, frame));
 }
 
+/// `avcodec_receive_packet`, returning `av.Error`.
 pub fn receivePacket(cc: *av.Codec.Context, pkt: *av.Packet) av.Error!void {
     _ = try av.wrap(avcodec_receive_packet(cc, pkt));
 }
 
+/// `av_frame_get_buffer` at libav's own alignment.
 pub fn frameGetBuffer(frame: *av.Frame) av.Error!void {
     _ = try av.wrap(av_frame_get_buffer(frame, 0));
 }
 
+/// `av_channel_layout_copy`, returning `av.Error`.
 pub fn copyChannelLayout(dst: *av.ChannelLayout, src: *const av.ChannelLayout) av.Error!void {
     _ = try av.wrap(av_channel_layout_copy(dst, src));
 }
@@ -293,6 +308,7 @@ pub const IndexEntry = extern struct {
     flags_size: u32,
     min_distance: c_int,
 
+    /// Whether the entry is a keyframe, read out of the packed bitfield.
     pub fn isKeyframe(e: *const IndexEntry) bool {
         return (e.flags_size & @as(u32, @intCast(AVINDEX_KEYFRAME))) != 0;
     }

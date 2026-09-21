@@ -24,10 +24,12 @@ pub fn Task(comptime Result: type) type {
 
         const Self = @This();
 
+        /// An idle task; nothing runs until `start`.
         pub fn init(gpa: std.mem.Allocator) Self {
             return .{ .arena = .init(gpa) };
         }
 
+        /// Cancels a call still in flight, then frees the task's arena.
         pub fn deinit(self: *Self, io: Io) void {
             if (self.future) |*f| {
                 // Stored rather than discarded: `Result` may be an error union.
@@ -47,6 +49,7 @@ pub fn Task(comptime Result: type) type {
             return null;
         }
 
+        /// Whether a call is in flight.
         pub fn busy(self: *const Self) bool {
             return self.future != null;
         }
@@ -138,6 +141,7 @@ pub const Cast = struct {
         note_buf: [192]u8 = @splat(0),
         note_len: usize = 0,
 
+        /// The progress note, as much of it as fits the fixed buffer.
         pub fn note(s: *const State) []const u8 {
             return s.note_buf[0..s.note_len];
         }
@@ -152,6 +156,7 @@ pub const Cast = struct {
         done: std.atomic.Value(u64) = .init(0),
         running: std.atomic.Value(bool) = .init(false),
 
+        /// The library-facing reporter that writes into this progress.
         pub fn reporter(p: *Progress) castig.Reporter {
             return .{ .context = p, .vtable = &vtable };
         }
@@ -186,18 +191,22 @@ pub const Cast = struct {
         }
     };
 
+    /// An idle cast; nothing runs until the window asks for it.
     pub fn init(gpa: std.mem.Allocator) Cast {
         return .{ .task = .init(gpa) };
     }
 
+    /// Cancels the cast if one is running, then frees it.
     pub fn deinit(c: *Cast, io: Io) void {
         c.task.deinit(io);
     }
 
+    /// Whether a cast is in flight.
     pub fn busy(c: *const Cast) bool {
         return c.task.busy();
     }
 
+    /// A copy of the state, taken under the lock so the frame sees one instant.
     pub fn snapshot(c: *Cast) State {
         Io.Threaded.mutexLock(&c.mutex);
         defer Io.Threaded.mutexUnlock(&c.mutex);

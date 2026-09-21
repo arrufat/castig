@@ -55,6 +55,7 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
 
 const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, subs, ui, version, help };
 
+/// Turns whatever `run` raises into an exit code, explaining it once.
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
         // Already explained on stderr by whoever raised them.

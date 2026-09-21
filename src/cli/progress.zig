@@ -9,6 +9,7 @@ pub const Bar = struct {
     root: std.Progress.Node = .none,
     node: std.Progress.Node = .none,
 
+    /// The library-facing reporter that draws into this bar.
     pub fn reporter(self: *Bar) castig.Reporter {
         return .{ .context = self, .vtable = &vtable };
     }

@@ -13,6 +13,7 @@ pub const Support = enum {
     /// Needs transcoding.
     transcode,
 
+    /// The word `probe` prints for this level of support.
     pub fn label(s: Support) []const u8 {
         return switch (s) {
             .direct => "direct",
@@ -29,12 +30,14 @@ const dependent_video = std.StaticStringMap(void).initComptime(.{.{"hevc"}});
 const direct_audio = std.StaticStringMap(void).initComptime(.{ .{"aac"}, .{"mp3"}, .{"opus"}, .{"vorbis"}, .{"flac"} });
 const dependent_audio = std.StaticStringMap(void).initComptime(.{ .{"ac3"}, .{"eac3"} });
 
+/// Whether a receiver plays this video codec as it is.
 pub fn videoSupport(codec: []const u8) Support {
     if (direct_video.has(codec)) return .direct;
     if (dependent_video.has(codec)) return .device_dependent;
     return .transcode;
 }
 
+/// Whether a receiver plays this audio codec as it is.
 pub fn audioSupport(codec: []const u8) Support {
     if (direct_audio.has(codec)) return .direct;
     if (dependent_audio.has(codec)) return .device_dependent;

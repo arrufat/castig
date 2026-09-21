@@ -46,6 +46,7 @@ fn xdgDir(arena: std.mem.Allocator, environ: *const std.process.Environ.Map, nam
     return Io.Dir.path.join(arena, &.{ environ.get("HOME") orelse ".", fallback });
 }
 
+/// Reads `key = value` lines into `cfg`, ignoring blanks and comments.
 pub fn parse(arena: std.mem.Allocator, text: []const u8, cfg: *Config) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {

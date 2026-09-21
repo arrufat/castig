@@ -48,6 +48,7 @@ pub const Target = struct {
     }
 };
 
+/// Whether the source is already a URL, so nothing needs serving.
 pub fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://");
 }
@@ -129,6 +130,7 @@ pub const Routes = struct {
     mp4: ?*vmp4.VMp4 = null,
     embedded: ?*EmbeddedSubtitles = null,
 
+    /// Frees the segmenter and everything the routes were serving.
     pub fn deinit(s: *Routes) void {
         if (s.segmenter) |seg| {
             seg.deinit();

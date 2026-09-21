@@ -185,6 +185,7 @@ pub const Session = struct {
         return s;
     }
 
+    /// Stops the server, closes the channel and frees the session.
     pub fn deinit(s: *Session) void {
         if (s.server) |server| server.stop();
         s.ch.deinit();

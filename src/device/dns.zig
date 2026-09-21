@@ -137,6 +137,7 @@ pub const Parser = struct {
         return .{ .packet = packet, .flags = flags, .pos = pos, .remaining = ancount + nscount + arcount };
     }
 
+    /// Whether this packet answers a query rather than asking one.
     pub fn isResponse(p: *const Parser) bool {
         return p.flags & 0x8000 != 0;
     }
@@ -167,6 +168,7 @@ pub const Parser = struct {
         return rec;
     }
 
+    /// The name a PTR record points at, decoded into `out`.
     pub fn ptrTarget(p: *const Parser, rec: Record, out: []u8) Error![]const u8 {
         return (try readName(p.packet, rec.rdata_pos, out)).name;
     }
@@ -178,6 +180,7 @@ pub const Parser = struct {
         target: []const u8,
     };
 
+    /// An SRV record's port and target host, the target decoded into `out`.
     pub fn srv(p: *const Parser, rec: Record, out: []u8) Error!Srv {
         if (rec.rdata.len < 7) return error.Truncated;
         const target = try readName(p.packet, rec.rdata_pos + 6, out);
@@ -196,6 +199,7 @@ pub const TxtIterator = struct {
 
     pub const Entry = struct { key: []const u8, value: []const u8 };
 
+    /// The next key=value string, or null at the end of the record.
     pub fn next(it: *TxtIterator) ?Entry {
         while (it.pos < it.rdata.len) {
             const len: usize = it.rdata[it.pos];
@@ -211,10 +215,12 @@ pub const TxtIterator = struct {
     }
 };
 
+/// Walks the strings packed into a TXT record.
 pub fn txtIterator(rec: Record) TxtIterator {
     return .{ .rdata = rec.rdata };
 }
 
+/// The IPv4 address an A record carries.
 pub fn aRecord(rec: Record) Error![4]u8 {
     if (rec.rdata.len != 4) return error.Truncated;
     return rec.rdata[0..4].*;

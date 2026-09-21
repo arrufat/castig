@@ -106,6 +106,7 @@ pub const Channel = struct {
         return ch;
     }
 
+    /// Says goodbye to the receiver, then frees everything the channel holds.
     pub fn deinit(ch: *Channel) void {
         ch.sendJson(receiver_id, ns_connection, Close{}) catch {};
         ch.client.end() catch {};
@@ -124,6 +125,7 @@ pub const Channel = struct {
         return ch.stream.socket.address.ip4;
     }
 
+    /// Sends one UTF-8 payload on `namespace` to `destination`.
     pub fn send(ch: *Channel, destination: []const u8, namespace: []const u8, payload_utf8: []const u8) !void {
         log.debug("-> {s} {s}\n   {s}", .{ destination, namespace, payload_utf8 });
         try proto.encode(.{
@@ -136,6 +138,7 @@ pub const Channel = struct {
         try ch.stream_writer.interface.flush();
     }
 
+    /// Serialises `value` and sends it, reusing the channel's JSON buffer.
     pub fn sendJson(ch: *Channel, destination: []const u8, namespace: []const u8, value: anytype) !void {
         ch.json.clearRetainingCapacity();
         try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, &ch.json.writer);
@@ -245,6 +248,7 @@ pub const Channel = struct {
         applications: []const App = &.{},
         volume: struct { level: f64 = 0, muted: bool = false } = .{},
 
+        /// The running app with this id, if the receiver reports one.
         pub fn find(s: Status, app_id: []const u8) ?App {
             for (s.applications) |a| if (std.mem.eql(u8, a.appId, app_id)) return a;
             return null;
@@ -264,17 +268,20 @@ pub const Channel = struct {
         };
     }
 
+    /// Asks the receiver what it is running.
     pub fn getStatus(ch: *Channel, arena: std.mem.Allocator) !Status {
         var req: GetStatus = .{};
         return parseStatus(arena, try ch.request(arena, receiver_id, ns_receiver, &req, "RECEIVER_STATUS"));
     }
 
+    /// Starts an app and waits until the receiver lists it as running.
     pub fn launch(ch: *Channel, arena: std.mem.Allocator, app_id: []const u8) !App {
         var req: Launch = .{ .appId = app_id };
         const status = try parseStatus(arena, try ch.request(arena, receiver_id, ns_receiver, &req, "RECEIVER_STATUS"));
         return status.find(app_id) orelse error.LaunchFailed;
     }
 
+    /// Stops the app holding `session_id`.
     pub fn stopApp(ch: *Channel, arena: std.mem.Allocator, session_id: []const u8) !void {
         var req: StopApp = .{ .sessionId = session_id };
         _ = try ch.request(arena, receiver_id, ns_receiver, &req, "RECEIVER_STATUS");
@@ -321,6 +328,7 @@ pub const Channel = struct {
         /// Absent from replies to commands; only status broadcasts carry it.
         media: ?struct { duration: ?f64 = null } = null,
 
+        /// The item's length in seconds, when the receiver knows it.
         pub fn duration(m: MediaStatus) ?f64 {
             return if (m.media) |x| x.duration else null;
         }
@@ -360,6 +368,7 @@ pub const Channel = struct {
         hls: bool = false,
     };
 
+    /// Hands the app a URL to play, with its subtitle tracks.
     pub fn load(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, opts: LoadOptions) !MediaStatus {
         const tracks = try arena.alloc(Load.Track, opts.text_tracks.len);
         for (opts.text_tracks, 0..) |t, i| tracks[i] = .{
@@ -413,11 +422,13 @@ pub const Channel = struct {
         return ch.mediaRequest(arena, transport_id, &req);
     }
 
+    /// A media command that takes no arguments, such as PAUSE or STOP.
     pub fn mediaCommand(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, kind: []const u8) !MediaStatus {
         var req: MediaCommand = .{ .type = kind, .mediaSessionId = media_session_id };
         return ch.mediaRequest(arena, transport_id, &req);
     }
 
+    /// Jumps to `seconds` within the current item.
     pub fn seek(ch: *Channel, arena: std.mem.Allocator, transport_id: []const u8, media_session_id: i64, seconds: f64) !MediaStatus {
         var req: Seek = .{ .mediaSessionId = media_session_id, .currentTime = seconds };
         return ch.mediaRequest(arena, transport_id, &req);

@@ -154,6 +154,7 @@ const Sink = struct {
 
 // --- codecs -----------------------------------------------------------------
 
+/// An opened decoder for these stream parameters.
 pub fn openDecoder(par: *av.Codec.Parameters) !*av.Codec.Context {
     const codec = try av.Codec.find_decoder(par.codec_id);
     const dec = try av.Codec.Context.alloc(codec);
@@ -192,6 +193,7 @@ pub const Input = struct {
     audio_index: usize,
     dec: *av.Codec.Context,
 
+    /// Opens `path` and picks the stream this input decodes.
     pub fn open(gpa: std.mem.Allocator, path: []const u8) !*Input {
         const ic = try extra.openInput(gpa, path);
         errdefer ic.close_input();
@@ -212,6 +214,7 @@ pub const Input = struct {
         return in;
     }
 
+    /// Closes the decoder and the demuxer, and frees the input.
     pub fn deinit(in: *Input) void {
         in.dec.free();
         in.ic.close_input();
@@ -424,6 +427,7 @@ pub const AudioCtx = struct {
     emit: Emit,
     emit_ctx: *anyopaque,
 
+    /// Sets up resampling and the sample fifo between decoder and encoder.
     pub fn init(dec: *av.Codec.Context, enc: *av.Codec.Context, in_time_base: av.Rational, start_time: f64, emit: Emit, emit_ctx: *anyopaque) !AudioCtx {
         const swr = try av.swr.Context.alloc_set_opts(&enc.ch_layout, enc.sample_fmt, enc.sample_rate, &dec.ch_layout, dec.sample_fmt, dec.sample_rate, 0, null);
         errdefer swr.free();
@@ -451,6 +455,7 @@ pub const AudioCtx = struct {
         };
     }
 
+    /// Frees the resampler, the fifo and the conversion buffers.
     pub fn deinit(ctx: *AudioCtx) void {
         av.freep(@ptrCast(&ctx.converted[0]));
         ctx.swr.free();

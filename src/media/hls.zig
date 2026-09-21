@@ -113,6 +113,7 @@ pub const Segmenter = struct {
         };
     }
 
+    /// Frees the segments and everything they were built from.
     pub fn deinit(s: *Segmenter) void {
         for (s.inputs.items) |in| in.deinit();
         s.inputs.deinit(s.gpa);
@@ -133,6 +134,7 @@ pub const Segmenter = struct {
         s.inputs.append(s.gpa, in) catch in.deinit();
     }
 
+    /// The master playlist, naming the one variant.
     pub fn writeMaster(s: *const Segmenter, w: *Io.Writer) !void {
         try w.writeAll("#EXTM3U\n#EXT-X-VERSION:3\n");
         try w.print("#EXT-X-STREAM-INF:BANDWIDTH={d},RESOLUTION={d}x{d},CODECS=\"{s}\"\n", .{ s.bandwidth, s.width, s.height, s.codecs });
@@ -144,6 +146,7 @@ pub const Segmenter = struct {
         return end - s.starts[index];
     }
 
+    /// The media playlist, one entry per segment.
     pub fn writePlaylist(s: *const Segmenter, w: *Io.Writer) !void {
         var max: f64 = 0;
         for (0..s.starts.len) |i| max = @max(max, s.segmentDuration(i));

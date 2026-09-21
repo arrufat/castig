@@ -50,6 +50,7 @@ pub const Report = struct {
     text_subs: usize = 0,
     bitmap_subs: usize = 0,
 
+    /// Whether the file has anything a receiver could play.
     pub fn castable(r: Report) bool {
         return r.video != null or r.audio != null;
     }

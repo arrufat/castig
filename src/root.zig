@@ -5,6 +5,7 @@
 /// own explanations asks here, so a new module reaches it without an edit.
 pub const log_scopes = [_]@EnumLiteral(){ .cast, .subs, .http, .hls };
 
+/// Whether a log scope is one of the library's own.
 pub fn ownScope(comptime scope: @EnumLiteral()) bool {
     for (log_scopes) |s| if (s == scope) return true;
     return false;

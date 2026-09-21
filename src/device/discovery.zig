@@ -29,6 +29,7 @@ pub const Device = struct {
     model: []const u8,
     address: net.Ip4Address,
 
+    /// Frees the strings the device owns.
     pub fn deinit(d: Device, gpa: std.mem.Allocator) void {
         gpa.free(d.id);
         gpa.free(d.friendly_name);
@@ -83,6 +84,7 @@ pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32, wanted: ?[]cons
     return devices.toOwnedSlice(gpa);
 }
 
+/// Frees each device in a slice; the slice itself is the caller's.
 pub fn freeDevices(gpa: std.mem.Allocator, devices: []const Device) void {
     for (devices) |d| d.deinit(gpa);
 }

@@ -19,6 +19,7 @@ pub const Status = struct {
     receiver: Channel.Status,
 };
 
+/// What `device` is doing: its volume, its app, and what it plays.
 pub fn status(env: Env, device: []const u8) !Status {
     const address = try discovery.resolve(env.io, env.gpa, device);
     const ch = try Channel.connect(env.io, env.gpa, address);
@@ -113,6 +114,7 @@ pub fn rate(env: Env, device: []const u8, value: f64) !Channel.MediaStatus {
     return p.withMedia(try p.ch.setPlaybackRate(env.arena, p.transport_id, p.media.mediaSessionId, value));
 }
 
+/// A seek position in seconds. `+N` and `-N` are relative to `current`.
 pub fn parseSeek(spec: []const u8, current: f64) !f64 {
     if (spec.len == 0) return error.InvalidSeek;
     const relative = spec[0] == '+' or spec[0] == '-';

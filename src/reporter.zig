@@ -14,14 +14,17 @@ pub const Reporter = struct {
         end: *const fn (context: *anyopaque) void,
     };
 
+    /// Announces a new operation of `total` steps, zero when unknown.
     pub fn begin(r: Reporter, label: []const u8, total: u64) void {
         r.vtable.begin(r.context, label, total);
     }
 
+    /// Marks one step done.
     pub fn step(r: Reporter) void {
         r.vtable.step(r.context);
     }
 
+    /// Ends the operation, whether it finished or failed.
     pub fn end(r: Reporter) void {
         r.vtable.end(r.context);
     }

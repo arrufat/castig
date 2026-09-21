@@ -99,6 +99,7 @@ pub const Lookup = struct {
         return l;
     }
 
+    /// Closes the OpenSubtitles client.
     pub fn deinit(l: *Lookup) void {
         l.client.deinit();
     }
