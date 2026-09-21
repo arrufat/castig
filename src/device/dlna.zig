@@ -12,6 +12,7 @@ const net = Io.net;
 
 const Env = @import("../env.zig").Env;
 const playback = @import("playback.zig");
+const sweep = @import("sweep.zig");
 const xml = @import("xml.zig");
 
 /// SSDP discovery and the device description.
@@ -26,18 +27,23 @@ const log = std.log.scoped(.dlna);
 /// Every AVTransport action takes this first.
 const instance: soap.Arg = .{ .name = "InstanceID", .value = "0" };
 
+/// An AVTransport SCPD runs to a few tens of kilobytes; this is room to spare.
+const max_scpd = 512 * 1024;
+
 pub const Renderer = struct {
     env: Env,
-    gpa: std.mem.Allocator,
     http: std.http.Client,
     address: net.Ip4Address,
     friendly_name: []const u8,
     /// The AVTransport service type, as advertised.
     service: []const u8,
     control_url: []const u8,
-    caps: Caps,
-    /// MIME types it said it accepts. Its own word beats any guess of ours.
-    sinks: []const []const u8 = &.{},
+    /// Where the two extra documents live, read on demand: `status`, `stop`
+    /// and the transport verbs need neither.
+    scpd_url: []const u8,
+    connection_manager: ?ssdp.Service,
+    cached_caps: ?Caps = null,
+    cached_sinks: ?[]const []const u8 = null,
     /// Reset at the start of each operation, so a poll a second for the
     /// length of a film stays bounded.
     scratch: std.heap.ArenaAllocator,
@@ -72,20 +78,20 @@ pub const Renderer = struct {
         speeds: bool = false,
     };
 
-    /// Reads the description at `location`, then the AVTransport SCPD for
-    /// what the renderer can actually be asked to do.
+    /// Reads the description at `location`, which is the one document every
+    /// caller needs. `caps` and `sinks` fetch theirs when first asked.
     pub fn connect(env: Env, address: net.Ip4Address, location: []const u8) !*Renderer {
         const r = try env.gpa.create(Renderer);
         errdefer env.gpa.destroy(r);
         r.* = .{
             .env = env,
-            .gpa = env.gpa,
             .http = .{ .allocator = env.gpa, .io = env.io },
             .address = address,
             .friendly_name = "",
             .service = "",
             .control_url = "",
-            .caps = .{},
+            .scpd_url = "",
+            .connection_manager = null,
             .scratch = .init(env.gpa),
         };
         errdefer r.http.deinit();
@@ -95,39 +101,41 @@ pub const Renderer = struct {
         r.friendly_name = description.friendly_name;
         r.service = description.av_transport.type;
         r.control_url = description.av_transport.control_url;
-        r.caps = r.readCaps(description.av_transport.scpd_url);
-        r.sinks = r.readSinks(description.connection_manager);
-        log.debug("{s}: {s} at {s}, {d} accepted type(s)", .{ r.friendly_name, r.service, r.control_url, r.sinks.len });
+        r.scpd_url = description.av_transport.scpd_url;
+        r.connection_manager = description.connection_manager;
+        log.debug("{s}: {s} at {s}", .{ r.friendly_name, r.service, r.control_url });
         return r;
     }
 
     pub fn deinit(r: *Renderer) void {
         r.http.deinit();
         r.scratch.deinit();
-        r.gpa.destroy(r);
+        r.env.gpa.destroy(r);
     }
 
     /// The SCPD lists what each argument accepts. Reading it is one GET, and
     /// it turns "seek silently does nothing" into a refusal we can explain.
-    fn readCaps(r: *Renderer, scpd_url: []const u8) Caps {
-        if (scpd_url.len == 0) return .{};
-        var body: Io.Writer.Allocating = .init(r.scratch.allocator());
-        const res = r.http.fetch(.{
-            .location = .{ .url = scpd_url },
-            .method = .GET,
-            .headers = .{ .user_agent = .{ .override = soap.user_agent } },
-            .response_writer = &body.writer,
-        }) catch |err| {
-            log.debug("no scpd at {s}: {s}", .{ scpd_url, @errorName(err) });
-            return .{};
+    pub fn caps(r: *Renderer) Caps {
+        if (r.cached_caps) |c| return c;
+        const c = if (r.scpd_url.len == 0) Caps{} else read: {
+            const body = soap.get(r.scratch.allocator(), &r.http, r.scpd_url, max_scpd) catch break :read Caps{};
+            break :read parseCaps(body);
         };
-        if (res.status != .ok) return .{};
-        return parseCaps(body.written());
+        r.cached_caps = c;
+        return c;
     }
 
-    /// What the renderer accepts, from ConnectionManager. One call, and it
-    /// is the difference between remuxing a file and handing it over whole.
-    /// A device that will not answer keeps the conservative defaults.
+    /// The MIME types it says it accepts, from ConnectionManager. One call,
+    /// and it is the difference between remuxing a file and handing it over
+    /// whole. A device that will not answer keeps the conservative defaults.
+    pub fn sinks(r: *Renderer) []const []const u8 {
+        if (r.cached_sinks) |s| return s;
+        const s = r.readSinks(r.connection_manager);
+        r.cached_sinks = s;
+        log.debug("{s} accepts {d} type(s)", .{ r.friendly_name, s.len });
+        return s;
+    }
+
     fn readSinks(r: *Renderer, service: ?ssdp.Service) []const []const u8 {
         const manager = service orelse return &.{};
         const reply = soap.call(r.env.arena, &r.http, manager.control_url, .{
@@ -158,11 +166,7 @@ pub const Renderer = struct {
         try didl.write(&meta.writer, .{
             .url = req.url,
             .content_type = req.content_type,
-            .protocol_info = try didl.protocolInfo(
-                r.scratch.allocator(),
-                req.content_type,
-                didl.contentFeatures(req.seekable),
-            ),
+            .protocol_info = try didl.protocolInfo(r.scratch.allocator(), req.content_type, req.seekable),
             .title = req.title orelse "castig",
             .duration = req.duration,
             .subtitle = if (req.text_tracks.len > 0) .{
@@ -211,8 +215,7 @@ pub const Renderer = struct {
             _ = r.action("Play", &.{ instance, .{ .name = "Speed", .value = "1" } }) catch |err| switch (err) {
                 error.TransitionNotAvailable => {
                     if (attempt >= play_attempts) return err;
-                    const settle: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } };
-                    settle.sleep(r.env.io) catch {};
+                    sweep.after(settle_ms).sleep(r.env.io) catch {};
                     continue;
                 },
                 else => return err,
@@ -255,14 +258,13 @@ pub const Renderer = struct {
         var buf: [16]u8 = undefined;
         const target = didl.clock(&buf, seconds);
 
+        const seeks = r.caps();
         const units = [_]struct { ok: bool, name: []const u8 }{
-            .{ .ok = r.caps.rel_time_seek, .name = "REL_TIME" },
-            .{ .ok = r.caps.abs_time_seek, .name = "ABS_TIME" },
+            .{ .ok = seeks.rel_time_seek, .name = "REL_TIME" },
+            .{ .ok = seeks.abs_time_seek, .name = "ABS_TIME" },
         };
-        var offered = false;
         for (units) |unit| {
             if (!unit.ok) continue;
-            offered = true;
             _ = r.action("Seek", &.{
                 instance,
                 .{ .name = "Unit", .value = unit.name },
@@ -276,14 +278,13 @@ pub const Renderer = struct {
             return r.settled(.{ .position = seconds });
         }
         log.warn("{s} does not seek by time", .{r.friendly_name});
-        if (!offered) return error.InvalidSeek;
         return error.InvalidSeek;
     }
 
     /// Nothing worth having implements a speed other than 1.
     pub fn setRate(r: *Renderer, value: f64) !playback.Playback {
         _ = r.scratch.reset(.retain_capacity);
-        if (value != 1 and !r.caps.speeds) {
+        if (value != 1 and !r.caps().speeds) {
             log.warn("{s} plays at 1x only", .{r.friendly_name});
             return error.InvalidRate;
         }
@@ -295,19 +296,32 @@ pub const Renderer = struct {
 
     /// Joins whatever is already loaded, for the one-shot control verbs.
     pub fn attach(r: *Renderer) !playback.Playback {
-        _ = r.scratch.reset(.retain_capacity);
-        const transport = try r.action("GetTransportInfo", &.{instance});
-        const state = xml.text(transport, "CurrentTransportState") orelse "";
+        const now = try r.poll();
         // A renderer keeps the last URI after a Stop, so being stopped is
         // not the same as having nothing, but it is the same to us: the
         // verbs are all about something in progress, and a Cast receiver
         // whose app has gone answers the same way.
-        // Not explained here: see `Player.attach`.
-        if (stateOf(state) == .idle) return error.NothingPlaying;
+        if (now.state == .idle) return error.NothingPlaying;
         // It was already going before we arrived, so a stop from here is an
         // ending rather than a load that never started.
         r.played = true;
-        return r.poll();
+        return now;
+    }
+
+    /// Blocks until there is something new to report. Nothing is pushed, so
+    /// a tick is a sleep and two questions.
+    pub fn next(r: *Renderer, io: Io) !playback.Playback {
+        try sweep.after(if (r.polls < quick_polls) quick_poll_ms else poll_ms).sleep(io);
+        return r.poll() catch |err| switch (err) {
+            error.RendererUnreachable => {
+                r.failures += 1;
+                // A renderer that went to standby should end the session
+                // rather than be asked forever.
+                if (r.failures >= unreachable_polls) return error.ConnectionClosed;
+                return r.last;
+            },
+            else => return err,
+        };
     }
 
     /// One tick: what the transport is doing, and where it has got to.
@@ -371,20 +385,33 @@ pub const Renderer = struct {
 
 /// How many idle polls without ever playing before the load is called dead.
 const silent_failure_polls = 15;
-/// How many times to ask a settling transport to start.
+/// How many times to ask a settling transport to start, and how long to
+/// leave it between attempts.
 const play_attempts = 4;
-/// How near the end counts as having reached it. Polling is a second apart
-/// and a renderer stops a little short of the last frame.
+const settle_ms = 300;
+/// How long between polls. The first few are quick, so that starting to
+/// play shows up at once; the rest are a second apart, which `end_slack`
+/// assumes.
+const quick_polls = 4;
+const quick_poll_ms = 250;
+const poll_ms = 1000;
+/// How many unanswered polls before a renderer counts as gone for good.
+const unreachable_polls = 3;
+/// How near the end counts as having reached it: a renderer stops a little
+/// short of the last frame, and `poll_ms` bounds how short we can see.
 const end_slack = 5;
 
+const transport_states: std.StaticStringMap(playback.State) = .initComptime(.{
+    .{ "PLAYING", .playing },
+    .{ "PAUSED_PLAYBACK", .paused },
+    .{ "PAUSED_RECORDING", .paused },
+    .{ "TRANSITIONING", .buffering },
+    .{ "STOPPED", .idle },
+    .{ "NO_MEDIA_PRESENT", .idle },
+});
+
 fn stateOf(transport_state: []const u8) playback.State {
-    if (std.mem.eql(u8, transport_state, "PLAYING")) return .playing;
-    if (std.mem.eql(u8, transport_state, "PAUSED_PLAYBACK")) return .paused;
-    if (std.mem.eql(u8, transport_state, "PAUSED_RECORDING")) return .paused;
-    if (std.mem.eql(u8, transport_state, "TRANSITIONING")) return .buffering;
-    if (std.mem.eql(u8, transport_state, "STOPPED")) return .idle;
-    if (std.mem.eql(u8, transport_state, "NO_MEDIA_PRESENT")) return .idle;
-    return .unknown;
+    return transport_states.get(transport_state) orelse .unknown;
 }
 
 /// A sink list is comma separated `protocol:network:mime:extras`, and the

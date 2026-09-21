@@ -9,9 +9,9 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 
+const soap = @import("soap.zig");
 const sweep = @import("../sweep.zig");
 const xml = @import("../xml.zig");
-const version = @import("build_options").version;
 
 const log = std.log.scoped(.dlna);
 
@@ -24,7 +24,6 @@ pub const search_target = "urn:schemas-upnp-org:device:MediaRenderer:1";
 /// Service types without their version suffix.
 pub const av_transport = "urn:schemas-upnp-org:service:AVTransport";
 pub const connection_manager = "urn:schemas-upnp-org:service:ConnectionManager";
-pub const rendering_control = "urn:schemas-upnp-org:service:RenderingControl";
 
 /// How many times the M-SEARCH goes out, and how far apart.
 const attempts = 3;
@@ -50,7 +49,6 @@ pub const Description = struct {
     udn: []const u8 = "",
     av_transport: Service,
     connection_manager: ?Service = null,
-    rendering_control: ?Service = null,
 };
 
 /// Whether `advertised` names `kind`, whatever version it carries.
@@ -86,13 +84,11 @@ pub fn resolveUrl(arena: std.mem.Allocator, base: []const u8, ref: []const u8) !
 /// The address a description URL points at, or `fallback` when its host is
 /// not a literal address.
 pub fn addressOf(location: []const u8, fallback: ?net.Ip4Address) ?net.Ip4Address {
-    const origin = originOf(location) orelse return fallback;
-    const scheme = std.mem.find(u8, origin, "://") orelse return fallback;
-    const parsed = net.IpAddress.parseLiteral(origin[scheme + 3 ..]) catch return fallback;
-    return switch (parsed) {
-        .ip4 => |a| a,
-        .ip6 => fallback,
-    };
+    const uri = std.Uri.parse(location) catch return fallback;
+    const host = uri.host orelse return fallback;
+    // A description URL without a port is served from the scheme's own.
+    const port: u16 = uri.port orelse if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80;
+    return net.Ip4Address.parse(host.percent_encoded, port) catch fallback;
 }
 
 /// The value of one header of an M-SEARCH reply. Lines are split on LF and
@@ -124,8 +120,8 @@ pub fn query(buf: []u8, mx: u32) ![]u8 {
         "MAN: \"ssdp:discover\"\r\n" ++
         "MX: {d}\r\n" ++
         "ST: " ++ search_target ++ "\r\n" ++
-        "USER-AGENT: Linux/1.0 UPnP/1.0 castig/{s}\r\n" ++
-        "\r\n", .{ mx, version });
+        "USER-AGENT: " ++ soap.user_agent ++ "\r\n" ++
+        "\r\n", .{mx});
 }
 
 /// The `<service>` of `kind` in a device's `<serviceList>`, with its URLs
@@ -182,7 +178,6 @@ pub fn parseDescription(arena: std.mem.Allocator, location: []const u8, body: []
         .udn = try arena.dupe(u8, xml.text(device, "UDN") orelse ""),
         .av_transport = transport,
         .connection_manager = serviceOf(arena, base, device, connection_manager),
-        .rendering_control = serviceOf(arena, base, device, rendering_control),
     };
 }
 
@@ -192,23 +187,9 @@ fn unescaped(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
 
 /// Fetches and parses the description at `location`.
 pub fn describe(arena: std.mem.Allocator, http: *std.http.Client, location: []const u8) !Description {
-    var body: Io.Writer.Allocating = .init(arena);
-    log.debug("GET {s}", .{location});
-    const res = http.fetch(.{
-        .location = .{ .url = location },
-        .method = .GET,
-        .headers = .{ .user_agent = .{ .override = "Linux/1.0 UPnP/1.0 castig/" ++ version } },
-        .response_writer = &body.writer,
-    }) catch |err| {
-        log.debug("cannot read {s}: {s}", .{ location, @errorName(err) });
+    const body = soap.get(arena, http, location, max_description) catch
         return error.DescriptionUnreachable;
-    };
-    if (res.status != .ok) {
-        log.debug("{s} answered {d}", .{ location, @backingInt(res.status) });
-        return error.DescriptionUnreachable;
-    }
-    if (body.written().len > max_description) return error.DescriptionUnreachable;
-    return parseDescription(arena, location, body.written());
+    return parseDescription(arena, location, body);
 }
 
 /// A renderer that answered, with its description already read.
@@ -241,38 +222,44 @@ pub fn discover(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, timeou
     defer http.deinit();
 
     var out: std.ArrayList(Found) = .empty;
-    for (seen.locations.items, seen.sources.items) |location, from| {
-        const description = describe(arena, &http, location) catch |err| {
-            log.debug("skipping {s}: {s}", .{ location, @errorName(err) });
+    for (seen.answers.items) |answer| {
+        const description = describe(arena, &http, answer.location) catch |err| {
+            log.debug("skipping {s}: {s}", .{ answer.location, @errorName(err) });
             continue;
         };
         try out.append(arena, .{
-            .location = location,
-            .address = addressOf(location, from) orelse continue,
+            .location = answer.location,
+            .address = addressOf(answer.location, answer.from) orelse continue,
             .description = description,
         });
     }
     return out.toOwnedSlice(arena);
 }
 
-/// The LOCATIONs that answered, one per device. A renderer answers each
-/// repeat of the query, and often once per service it exports, so the UDN
-/// is what makes it one entry.
+/// The answers, one per device. A renderer answers each repeat of the
+/// query, and often once per service it exports, so the UDN is what makes
+/// it one entry.
 const Collector = struct {
     arena: std.mem.Allocator,
-    udns: std.ArrayList([]const u8) = .empty,
-    locations: std.ArrayList([]const u8) = .empty,
-    sources: std.ArrayList(?net.Ip4Address) = .empty,
+    answers: std.ArrayList(Answer) = .empty,
+
+    const Answer = struct {
+        udn: []const u8,
+        location: []const u8,
+        from: ?net.Ip4Address,
+    };
 
     /// The packet points into the sweep's buffer, so anything kept is duped.
     fn take(c: *Collector, packet: []const u8, from: ?net.Ip4Address) anyerror!bool {
         const location = header(packet, "location") orelse return false;
         const udn = udnOf(header(packet, "usn") orelse "");
-        for (c.udns.items) |known| if (std.mem.eql(u8, known, udn)) return false;
+        for (c.answers.items) |known| if (std.mem.eql(u8, known.udn, udn)) return false;
 
-        try c.udns.append(c.arena, try c.arena.dupe(u8, udn));
-        try c.locations.append(c.arena, try c.arena.dupe(u8, location));
-        try c.sources.append(c.arena, from);
+        try c.answers.append(c.arena, .{
+            .udn = try c.arena.dupe(u8, udn),
+            .location = try c.arena.dupe(u8, location),
+            .from = from,
+        });
         // Others may still answer; the deadline ends the round.
         return false;
     }
@@ -405,7 +392,6 @@ test "a real renderer's description" {
         "http://192.168.1.37:42675/Control/Playbin/RygelSinkConnectionManager",
         d.connection_manager.?.control_url,
     );
-    try testing.expect(d.rendering_control != null);
 }
 
 test "a renderer nested under another root device" {

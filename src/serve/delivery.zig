@@ -218,13 +218,9 @@ pub const Routes = struct {
     /// rather than "Subtitles".
     pub fn addSideloaded(s: *Routes, sub: []const u8, lang: ?[]const u8) !void {
         const arena = s.env.arena;
-        // A renderer is handed SubRip, which is what the conventions for
-        // side-loading one all assume; Cast is handed WebVTT, which is the
-        // only thing it reads.
-        const want: playback.TextTrack.Format = if (s.dlna) .srt else .vtt;
 
         var url = sub;
-        var format = want;
+        var format: playback.TextTrack.Format = undefined;
         if (isUrl(sub)) {
             format = if (std.ascii.endsWithIgnoreCase(sub, ".srt")) .srt else .vtt;
         } else {
@@ -232,10 +228,12 @@ pub const Routes = struct {
                 log.warn("cannot read {s}: {s}", .{ sub, @errorName(err) });
                 return error.SourceUnreadable;
             };
+            // A renderer is handed SubRip, which is what the conventions for
+            // side-loading one all assume; Cast is handed WebVTT, which is the
+            // only thing it reads. SubRip is only served as it is: converting
+            // WebVTT back is not worth it for the few renderers that take it.
             const is_srt = std.ascii.endsWithIgnoreCase(sub, ".srt");
-            // SubRip is only served as it is; converting WebVTT back is not
-            // worth it for the few renderers that would then take it.
-            const serve: playback.TextTrack.Format = if (want == .srt and is_srt) .srt else .vtt;
+            const serve: playback.TextTrack.Format = if (s.dlna and is_srt) .srt else .vtt;
             const body = if (serve == .srt) text else try webvtt.srtToVtt(arena, text);
             // The language goes in the name, the way a sidecar carries it.
             // None of the ways of naming a subtitle to a renderer has a
@@ -246,16 +244,11 @@ pub const Routes = struct {
             else
                 try arena.print("/sub.{s}", .{@tagName(serve)});
             format = serve;
+            var m = s.media(serve.mime(), true);
+            m.transfer_mode = .interactive;
             try s.list.append(arena, .{
                 .path = url,
-                .body = .{ .bytes = .{
-                    .media = .{
-                        .content_type = serve.mime(),
-                        .features = if (s.dlna) didl.contentFeatures(true) else null,
-                        .transfer_mode = .interactive,
-                    },
-                    .data = body,
-                } },
+                .body = .{ .bytes = .{ .media = m, .data = body } },
             });
             if (s.dlna and serve != .srt) {
                 log.warn("this subtitle is WebVTT; most renderers only take SubRip", .{});

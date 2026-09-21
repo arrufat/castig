@@ -163,16 +163,6 @@ pub fn judge(p: Profile, video_codec: []const u8, audio_codec: []const u8, conta
     };
 }
 
-/// Whether a Cast receiver plays this video codec as it is.
-pub fn videoSupport(codec: []const u8) Support {
-    return cast.videoSupport(codec);
-}
-
-/// Whether a Cast receiver plays this audio codec as it is.
-pub fn audioSupport(codec: []const u8) Support {
-    return cast.audioSupport(codec);
-}
-
 /// Whether a libav subtitle codec name is a text format we can turn into
 /// WebVTT from its packets alone. Bitmap subtitles (PGS, DVB, VOBSUB, DVD)
 /// are images and cannot become text tracks.
@@ -223,13 +213,13 @@ test "a device's own word widens what it is taken to play" {
 }
 
 test "support tables" {
-    try std.testing.expectEqual(Support.direct, videoSupport("h264"));
-    try std.testing.expectEqual(Support.direct, videoSupport("av1"));
-    try std.testing.expectEqual(Support.device_dependent, videoSupport("hevc"));
-    try std.testing.expectEqual(Support.transcode, videoSupport("mpeg4"));
-    try std.testing.expectEqual(Support.direct, audioSupport("aac"));
-    try std.testing.expectEqual(Support.transcode, audioSupport("dts"));
-    try std.testing.expectEqual(Support.transcode, audioSupport("truehd"));
+    try std.testing.expectEqual(Support.direct, cast.videoSupport("h264"));
+    try std.testing.expectEqual(Support.direct, cast.videoSupport("av1"));
+    try std.testing.expectEqual(Support.device_dependent, cast.videoSupport("hevc"));
+    try std.testing.expectEqual(Support.transcode, cast.videoSupport("mpeg4"));
+    try std.testing.expectEqual(Support.direct, cast.audioSupport("aac"));
+    try std.testing.expectEqual(Support.transcode, cast.audioSupport("dts"));
+    try std.testing.expectEqual(Support.transcode, cast.audioSupport("truehd"));
 }
 
 test "text codec detection" {

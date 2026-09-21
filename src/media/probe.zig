@@ -68,12 +68,9 @@ pub const Report = struct {
     }
 };
 
-/// Opens `path`, reads its stream info and describes it. Strings taken from
-/// the container are duped into `gpa`; codec and container names are libav's
-/// own static ones.
-/// Lists the streams of `path` and says what `profile` would have to do
-/// with each. Without a device to ask, `support.cast` is the sensible
-/// default: it is what castig was for, and its abilities are fixed.
+/// Lists the streams of `path` and says what `profile` would have to do with
+/// each. Strings taken from the container are duped into `gpa`; codec and
+/// container names are libav's own static ones.
 pub fn inspect(gpa: std.mem.Allocator, path: []const u8, profile: support.Profile) !Report {
     const fc = try extra.openInput(gpa, path);
     defer fc.close_input();

@@ -106,9 +106,9 @@ pub const Player = union(enum) {
     /// `error.NothingPlaying` when the device is idle, `error.NoMedia` when
     /// something is running with nothing loaded.
     ///
-    /// Neither is explained here. An idle device is a problem when a verb
-    /// was asked of it and merely the answer when something only looked, and
-    /// only the caller knows which it was.
+    /// Neither is logged: an idle device is a problem when a verb was asked
+    /// of it and merely the answer when something only looked, and only the
+    /// caller knows which it was.
     pub fn attach(env: Env, endpoint: discovery.Endpoint) !Player {
         const address = switch (endpoint) {
             .cast => |a| a,
@@ -141,7 +141,7 @@ pub const Player = union(enum) {
     pub fn profile(p: Player) support.Profile {
         return switch (p) {
             .cast => support.cast,
-            .dlna => |r| support.dlna.withSinks(r.sinks),
+            .dlna => |r| support.dlna.withSinks(r.sinks()),
         };
     }
 
@@ -241,25 +241,7 @@ pub const Player = union(enum) {
     /// calls; a renderer answers out of its own.
     pub fn next(p: *Player, env: Env, scratch: std.mem.Allocator) !playback.Playback {
         switch (p.*) {
-            .dlna => |r| {
-                // Nothing is pushed, so a tick is a sleep and two questions.
-                // Quick at first, so that starting to play shows up at once.
-                const wait: Io.Timeout = .{ .duration = .{
-                    .raw = .fromMilliseconds(if (r.polls < 4) 250 else 1000),
-                    .clock = .awake,
-                } };
-                try wait.sleep(env.io);
-                return r.poll() catch |err| switch (err) {
-                    error.RendererUnreachable => {
-                        r.failures += 1;
-                        // A renderer that went to standby should end the
-                        // session rather than be asked forever.
-                        if (r.failures >= 3) return error.ConnectionClosed;
-                        return r.last;
-                    },
-                    else => return err,
-                };
-            },
+            .dlna => |r| return r.next(env.io),
             .cast => |*c| while (true) {
                 const msg = try c.ch.receive();
                 if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
@@ -288,7 +270,7 @@ pub fn profileOf(env: Env, device: []const u8) !support.Profile {
         .dlna => |d| {
             const r = try dlna.Renderer.connect(env, d.address, d.location);
             defer r.deinit();
-            return support.dlna.withSinks(try env.arena.dupe([]const u8, r.sinks));
+            return support.dlna.withSinks(r.sinks());
         },
     }
 }

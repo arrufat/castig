@@ -18,10 +18,8 @@ const xml = @import("../xml.zig");
 /// Range and not `TimeSeekRange.dlna.org`, so byte-seek only, and `00`
 /// where the body has no length to range over.
 pub fn contentFeatures(seekable: bool) []const u8 {
-    return if (seekable)
-        "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-    else
-        "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+    const rest = ";DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+    return if (seekable) "DLNA.ORG_OP=01" ++ rest else "DLNA.ORG_OP=00" ++ rest;
 }
 
 /// `res@protocolInfo`, which must say the same thing as the
@@ -29,8 +27,8 @@ pub fn contentFeatures(seekable: bool) []const u8 {
 ///
 /// Deliberately no `DLNA.ORG_PN=`: naming the wrong profile is worse than
 /// naming none, and we cannot know the right one for an arbitrary file.
-pub fn protocolInfo(arena: std.mem.Allocator, content_type: []const u8, features: []const u8) ![]const u8 {
-    return arena.print("http-get:*:{s}:{s}", .{ content_type, features });
+pub fn protocolInfo(arena: std.mem.Allocator, content_type: []const u8, seekable: bool) ![]const u8 {
+    return arena.print("http-get:*:{s}:{s}", .{ content_type, contentFeatures(seekable) });
 }
 
 /// The `upnp:class` for a content type.
@@ -218,10 +216,9 @@ test "upnp classes" {
 test "protocol info agrees with the response header" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const features = contentFeatures(true);
     try testing.expectEqualStrings(
         "http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000",
-        try protocolInfo(arena.allocator(), "video/mp4", features),
+        try protocolInfo(arena.allocator(), "video/mp4", true),
     );
     // Byte-seek is what Range gives us; a body with no length has neither.
     try testing.expect(std.mem.find(u8, contentFeatures(true), "DLNA.ORG_OP=01") != null);

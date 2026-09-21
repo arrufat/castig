@@ -94,8 +94,7 @@ pub const Follow = struct {
 
     /// Joins what is playing. `error.NothingPlaying` when the device is
     /// idle, `error.NoMedia` when something is up with nothing loaded.
-    /// Finding nothing is an answer rather than a failure, so it is left
-    /// to the caller to say, or not say, whatever suits where it is shown.
+    /// Neither is logged: see `Player.attach`.
     pub fn start(env: Env, device: []const u8) !Follow {
         const p = try Player.attach(env, try discovery.resolve(env, device, null));
         return .{ .player = p, .scratch = .init(env.gpa), .now = p.current() };

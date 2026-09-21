@@ -25,7 +25,8 @@ const usage =
     \\  version   print the version
     \\  help      show this message
     \\
-    \\<device> is an IP, IP:port, a renderer URL, or part of a name shown\n    \\by `ls`. Prefix it with `cast:` or `dlna:` to settle an ambiguous name.
+    \\<device> is an IP, IP:port, a renderer URL, or part of a name shown
+    \\by `ls`. Prefix it with `cast:` or `dlna:` to settle an ambiguous name.
     \\
     \\Run `castig help <command>` for what a command takes.
     \\

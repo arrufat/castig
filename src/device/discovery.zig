@@ -24,15 +24,7 @@ const mdns_group: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 224, 0, 0, 251 }, .po
 
 /// What a device speaks. The spec a user types may name it, `cast:living
 /// room`, when a name alone would be ambiguous.
-pub const Protocol = enum {
-    cast,
-    dlna,
-
-    /// The prefix that forces this protocol, and what `ls` prints.
-    pub fn label(p: Protocol) []const u8 {
-        return @tagName(p);
-    }
-};
+pub const Protocol = enum { cast, dlna };
 
 /// A device to connect to, once its address is known.
 pub const Endpoint = union(enum) {
@@ -96,7 +88,7 @@ pub const Device = struct {
         return w.print("{f}", .{d.address});
     }
 
-    /// How to name this device back to castig, unambiguously.
+    /// Everything a connection needs, without a second discovery round.
     pub fn endpoint(d: Device) Endpoint {
         return switch (d.protocol) {
             .cast => .{ .cast = d.address },
@@ -115,20 +107,16 @@ pub const Query = struct {
 
 /// Every device that answers within `q.timeout_ms`, of either kind.
 pub fn discover(io: Io, gpa: std.mem.Allocator, q: Query) ![]Device {
-    const want_cast = if (q.protocol) |p| p == .cast else true;
-    const want_dlna = if (q.protocol) |p| p == .dlna else true;
-
     var found: std.ArrayList(Device) = .empty;
     // Reverse order: the strings go first, while the list still holds them.
     errdefer found.deinit(gpa);
     errdefer freeDevices(gpa, found.items);
 
-    if (!want_dlna) {
-        try castScan(io, gpa, q, &found);
-        return found.toOwnedSlice(gpa);
-    }
-    if (!want_cast) {
-        try dlnaScan(io, gpa, q, &found);
+    if (q.protocol) |p| {
+        switch (p) {
+            .cast => try castScan(io, gpa, q, &found),
+            .dlna => try dlnaScan(io, gpa, q, &found),
+        }
         return found.toOwnedSlice(gpa);
     }
 
@@ -288,15 +276,15 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
 ///   http://host:port/x.xml   a renderer, named by its description URL
 ///   cast:living room         a name, with the protocol settled
 ///   dlna:living room
-///   living room              a name; on a tie Cast wins, as it did before
-///                            renderers were a thing castig knew about
+///   living room              a name; on a tie a receiver wins
 pub fn resolve(env: Env, spec_in: []const u8, want_in: ?Protocol) !Endpoint {
     var spec = spec_in;
     var want = want_in;
-    inline for (@typeInfo(Protocol).@"enum".field_names) |name| {
-        if (std.mem.startsWith(u8, spec, name ++ ":")) {
-            want = @field(Protocol, name);
-            spec = std.mem.trim(u8, spec[name.len + 1 ..], " ");
+    if (std.mem.cutScalar(u8, spec, ':')) |cut| {
+        const head, const tail = cut;
+        if (std.meta.stringToEnum(Protocol, head)) |p| {
+            want = p;
+            spec = std.mem.trim(u8, tail, " ");
         }
     }
 
@@ -326,8 +314,8 @@ pub fn resolve(env: Env, spec_in: []const u8, want_in: ?Protocol) !Endpoint {
         return error.DeviceNotFound;
     }
 
-    // A name. Cast goes first: it is the quicker round, and it is what this
-    // spec already meant.
+    // A name. Cast goes first: its round stops as soon as the name matches,
+    // where the renderer round always waits out its deadline.
     if (want != .dlna) {
         if (try firstMatching(env, .{ .match = spec, .protocol = .cast }, null)) |d| return d.endpoint();
     }
@@ -359,7 +347,6 @@ fn firstMatching(env: Env, q: Query, address: ?net.Ip4Address) !?Device {
     }
     return null;
 }
-
 
 test "a device names itself in a way resolve understands" {
     var buf: [128]u8 = undefined;

@@ -16,6 +16,33 @@ const log = std.log.scoped(.dlna);
 /// Some renderers answer 500 to a request without one.
 pub const user_agent = "Linux/1.0 UPnP/1.0 castig/" ++ version;
 
+/// A device description or an SCPD, as bytes. `max_bytes` is a guard: a
+/// device that answers with an endless body must not exhaust memory.
+pub fn get(
+    arena: std.mem.Allocator,
+    http: *std.http.Client,
+    url: []const u8,
+    max_bytes: usize,
+) error{Unreadable}![]const u8 {
+    var body: Io.Writer.Allocating = .init(arena);
+    log.debug("GET {s}", .{url});
+    const res = http.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .headers = .{ .user_agent = .{ .override = user_agent } },
+        .response_writer = &body.writer,
+    }) catch |err| {
+        log.debug("cannot read {s}: {s}", .{ url, @errorName(err) });
+        return error.Unreadable;
+    };
+    if (res.status != .ok) {
+        log.debug("{s} answered {d}", .{ url, @backingInt(res.status) });
+        return error.Unreadable;
+    }
+    if (body.written().len > max_bytes) return error.Unreadable;
+    return body.written();
+}
+
 pub const Arg = struct {
     name: []const u8,
     value: []const u8,

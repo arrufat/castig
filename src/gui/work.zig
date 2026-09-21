@@ -202,13 +202,13 @@ pub const Cast = struct {
         c.task.deinit(io);
     }
 
-    /// Whether a cast is in flight.
     /// Whether a session this window started is running, as opposed to a
     /// watch on one it merely found. Only the former blocks a new cast.
     pub fn ours(c: *const Cast) bool {
         return c.task.busy() and !c.following;
     }
 
+    /// Whether a cast is in flight.
     pub fn busy(c: *const Cast) bool {
         return c.task.busy();
     }

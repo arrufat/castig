@@ -407,7 +407,7 @@ fn selectDevice(index: usize) void {
 /// controls work on a cast this window did not start. A session of our own
 /// outranks it and is left running.
 fn followSelected() void {
-    if (app.cast.busy() and !app.cast.following) return;
+    if (app.cast.ours()) return;
     const index = app.device orelse return;
     if (index >= app.devices.len) return;
     app.cast.stopFollowing(app.io);

@@ -17,6 +17,11 @@ const net = Io.net;
 /// message at 9000 bytes, and an SSDP reply is a few hundred.
 pub const max_packet = 9000;
 
+/// A wall-clock timeout `ms` from now.
+pub fn after(ms: u32) Io.Timeout {
+    return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+}
+
 pub const Options = struct {
     group: net.IpAddress,
     /// Sent in order, `gap_ms` apart. SSDP repeats its query, because UDP
@@ -43,16 +48,12 @@ pub fn run(
     const sock = try bind_addr.bind(io, .{ .mode = .dgram });
     defer sock.close(io);
 
-    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(opts.timeout_ms), .clock = .awake } };
-    const deadline = timeout.toDeadline(io);
+    const deadline = after(opts.timeout_ms).toDeadline(io);
 
     // Replies to an earlier query wait in the socket buffer while the rest
     // go out, so spacing them costs nothing but the gap itself.
     for (opts.queries, 0..) |query, i| {
-        if (i > 0 and opts.gap_ms > 0) {
-            const gap: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(opts.gap_ms), .clock = .awake } };
-            gap.sleep(io) catch {};
-        }
+        if (i > 0 and opts.gap_ms > 0) after(opts.gap_ms).sleep(io) catch {};
         try sock.send(io, &opts.group, query);
     }
 

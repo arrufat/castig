@@ -18,8 +18,6 @@ pub const max_depth = 32;
 pub const Element = struct {
     /// As written, prefix included.
     name: []const u8,
-    /// Between the name and the end of the open tag.
-    attrs: []const u8,
     /// Between the tags, still escaped. Empty for a self-closing element,
     /// and the input for a nested `Scanner`.
     body: []const u8,
@@ -72,20 +70,17 @@ pub const Scanner = struct {
                 s.pos = gt + 1;
                 continue;
             }
-            const raw_attrs = s.source[lt + 1 + name.len .. gt];
-            const attrs = std.mem.trim(u8, raw_attrs, " \t\r\n/");
-
-            if (selfClosing(raw_attrs)) {
+            if (selfClosing(s.source[lt + 1 + name.len .. gt])) {
                 s.pos = gt + 1;
-                return .{ .name = name, .attrs = attrs, .body = "" };
+                return .{ .name = name, .body = "" };
             }
             const close = findClose(s.source, gt + 1, name) orelse {
                 // Unclosed: take the rest as the body rather than lose it.
                 s.pos = s.source.len;
-                return .{ .name = name, .attrs = attrs, .body = s.source[gt + 1 ..] };
+                return .{ .name = name, .body = s.source[gt + 1 ..] };
             };
             s.pos = close.after;
-            return .{ .name = name, .attrs = attrs, .body = s.source[gt + 1 .. close.body_end] };
+            return .{ .name = name, .body = s.source[gt + 1 .. close.body_end] };
         }
         return null;
     }
@@ -109,36 +104,6 @@ fn textAt(xml: []const u8, local: []const u8, depth: usize) ?[]const u8 {
     while (it.next()) |el| {
         if (el.is(local)) return el.body;
         if (textAt(el.body, local, depth + 1)) |found| return found;
-    }
-    return null;
-}
-
-/// The value of one attribute, still escaped. Matched on the local name,
-/// since a renderer may or may not put a prefix on it.
-pub fn attr(attrs: []const u8, name: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i < attrs.len) {
-        i = skipSpace(attrs, i);
-        const key_start = i;
-        while (i < attrs.len and attrs[i] != '=' and !isSpace(attrs[i])) i += 1;
-        const key = attrs[key_start..i];
-        i = skipSpace(attrs, i);
-        // A bare word with no value; the next round reads it as a key.
-        if (i >= attrs.len or attrs[i] != '=') continue;
-        i = skipSpace(attrs, i + 1);
-        if (i >= attrs.len) return null;
-
-        const quote = attrs[i];
-        const value = if (quote == '"' or quote == '\'') blk: {
-            const end = std.mem.findScalarPos(u8, attrs, i + 1, quote) orelse return null;
-            defer i = end + 1;
-            break :blk attrs[i + 1 .. end];
-        } else blk: {
-            const start = i;
-            while (i < attrs.len and !isSpace(attrs[i])) i += 1;
-            break :blk attrs[start..i];
-        };
-        if (std.mem.eql(u8, localName(key), name)) return value;
     }
     return null;
 }
@@ -199,16 +164,6 @@ pub fn escape(w: *Io.Writer, raw: []const u8) Io.Writer.Error!void {
 }
 
 // --- internals ---------------------------------------------------------------
-
-fn isSpace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
-}
-
-fn skipSpace(s: []const u8, from: usize) usize {
-    var i = from;
-    while (i < s.len and isSpace(s[i])) i += 1;
-    return i;
-}
 
 /// Just past `needle`, or the end of the text when it is not there.
 fn skipPast(s: []const u8, from: usize, needle: []const u8) usize {
@@ -374,24 +329,10 @@ test "a close tag inside a comment does not end an element" {
     try testing.expectEqualStrings("b", it.next().?.name);
 }
 
-test "attributes" {
-    const el = blk: {
-        var it: Scanner = .init("<res protocolInfo=\"http-get:*:video/mp4:*\" sec:type='srt' bare size=12>u</res>");
-        break :blk it.next().?;
-    };
-    try testing.expectEqualStrings("u", el.body);
-    try testing.expectEqualStrings("http-get:*:video/mp4:*", attr(el.attrs, "protocolInfo").?);
-    // Matched on the local name, so the prefix a renderer adds does not matter.
-    try testing.expectEqualStrings("srt", attr(el.attrs, "type").?);
-    try testing.expectEqualStrings("12", attr(el.attrs, "size").?);
-    try testing.expectEqual(@as(?[]const u8, null), attr(el.attrs, "missing"));
-}
-
 test "a greater-than inside an attribute does not end the tag" {
     var it: Scanner = .init("<a t=\"1 > 0\">body</a>");
     const a = it.next().?;
     try testing.expectEqualStrings("body", a.body);
-    try testing.expectEqualStrings("1 > 0", attr(a.attrs, "t").?);
 }
 
 test "unescape" {
@@ -538,9 +479,6 @@ test "malformed input does not hang or overrun" {
     try testing.expectEqual(@as(?[]const u8, null), text("<a attr=\"unterminated", "a"));
     // An unclosed element keeps what follows rather than losing it.
     try expectText("<a>tail", "a", "tail");
-    try testing.expectEqual(@as(?[]const u8, null), attr("=", "x"));
-    try testing.expectEqual(@as(?[]const u8, null), attr("a b c", "a"));
-
 }
 
 test "nesting past the cap stops instead of recursing" {
