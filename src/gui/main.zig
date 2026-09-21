@@ -312,7 +312,10 @@ fn collect() void {
 fn nameDevices(arena: std.mem.Allocator, found: []const castig.discovery.Device) ![]const []const u8 {
     const entries = try arena.alloc([]const u8, found.len);
     for (found, entries) |d, *entry| {
-        entry.* = try std.fmt.allocPrint(arena, "{s} ({s})", .{ d.friendly_name, d.model });
+        entry.* = switch (d.protocol) {
+            .cast => try std.fmt.allocPrint(arena, "{s} ({s})", .{ d.friendly_name, d.model }),
+            .dlna => try std.fmt.allocPrint(arena, "{s} ({s}, dlna)", .{ d.friendly_name, d.model }),
+        };
     }
     return entries;
 }
@@ -346,9 +349,15 @@ fn describeCandidates(arena: std.mem.Allocator, l: castig.subs.Lookup) ![]const 
 }
 
 fn selectDevice(index: usize) void {
+    var w: Io.Writer = .fixed(&app.device_spec);
+    app.devices[index].writeSpec(&w) catch {
+        // A name that does not fit is a name we cannot use.
+        app.device = null;
+        app.device_spec_len = 0;
+        return;
+    };
     app.device = index;
-    const written = std.fmt.bufPrint(&app.device_spec, "{f}", .{app.devices[index].address}) catch unreachable;
-    app.device_spec_len = written.len;
+    app.device_spec_len = w.buffered().len;
 }
 
 fn devicePanel() !void {

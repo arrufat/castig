@@ -25,6 +25,17 @@ const log = std.log.scoped(.cast);
 /// A transport command that takes no argument.
 pub const Verb = enum { play, pause, stop };
 
+/// Opens a Cast channel, saying something useful when there is nothing on
+/// the other end. An address that is really a renderer ends up here, and
+/// the TLS error it produces explains nothing on its own.
+fn castChannel(env: Env, address: net.Ip4Address) !*cast.Channel {
+    return cast.Channel.connect(env.io, env.gpa, address) catch |err| {
+        log.warn("no Cast receiver at {f} ({s})", .{ address, @errorName(err) });
+        log.warn("a DLNA renderer is named by the URL `castig ls` prints, not by its address", .{});
+        return err;
+    };
+}
+
 /// What a device reports about itself, as opposed to about one item.
 pub const DeviceStatus = struct {
     volume: ?Volume = null,
@@ -77,7 +88,7 @@ pub const Player = union(enum) {
             .cast => |a| a,
             .dlna => |d| return .{ .dlna = try dlna.Renderer.connect(env, d.address, d.location) },
         };
-        const ch = try cast.Channel.connect(env.io, env.gpa, address);
+        const ch = try castChannel(env, address);
         errdefer ch.deinit();
         const st = try ch.getStatus(env.arena);
         const app = st.find(cast.default_media_receiver) orelse
@@ -103,7 +114,7 @@ pub const Player = union(enum) {
                 return .{ .dlna = r };
             },
         };
-        const ch = try cast.Channel.connect(env.io, env.gpa, address);
+        const ch = try castChannel(env, address);
         errdefer ch.deinit();
 
         const st = try ch.getStatus(env.arena);
@@ -276,7 +287,7 @@ pub fn deviceStatus(env: Env, endpoint: discovery.Endpoint) !DeviceStatus {
             return .{ .playing = r.poll() catch null };
         },
     };
-    const ch = try cast.Channel.connect(env.io, env.gpa, address);
+    const ch = try castChannel(env, address);
     defer ch.deinit();
     const st = try ch.getStatus(env.arena);
     return .{
@@ -296,7 +307,7 @@ pub fn stopAll(env: Env, endpoint: discovery.Endpoint) ![]const []const u8 {
             return env.arena.dupe([]const u8, &.{r.friendly_name});
         },
     };
-    const ch = try cast.Channel.connect(env.io, env.gpa, address);
+    const ch = try castChannel(env, address);
     defer ch.deinit();
 
     const st = try ch.getStatus(env.arena);

@@ -87,6 +87,15 @@ pub const Device = struct {
             std.mem.startsWith(u8, d.id, spec);
     }
 
+    /// How to name this device back to castig. A Cast receiver is named by
+    /// its address, which resolves without a discovery round; a renderer is
+    /// named by its description URL, which is the only thing that locates
+    /// it. An address would name the wrong protocol entirely.
+    pub fn writeSpec(d: Device, w: *Io.Writer) Io.Writer.Error!void {
+        if (d.protocol == .dlna and d.location.len > 0) return w.writeAll(d.location);
+        return w.print("{f}", .{d.address});
+    }
+
     /// How to name this device back to castig, unambiguously.
     pub fn endpoint(d: Device) Endpoint {
         return switch (d.protocol) {
@@ -351,6 +360,35 @@ fn firstMatching(env: Env, q: Query, address: ?net.Ip4Address) !?Device {
     return null;
 }
 
+
+test "a device names itself in a way resolve understands" {
+    var buf: [128]u8 = undefined;
+
+    var cast_w: Io.Writer = .fixed(&buf);
+    const receiver: Device = .{
+        .protocol = .cast,
+        .id = "abc",
+        .friendly_name = "Living Room",
+        .model = "Nest Audio",
+        .address = .{ .bytes = .{ 192, 168, 1, 34 }, .port = 8009 },
+    };
+    try receiver.writeSpec(&cast_w);
+    try std.testing.expectEqualStrings("192.168.1.34:8009", cast_w.buffered());
+
+    // A renderer's address would resolve as a Cast receiver and try TLS
+    // against its HTTP port, so it has to name itself by its description.
+    var dlna_w: Io.Writer = .fixed(&buf);
+    const renderer: Device = .{
+        .protocol = .dlna,
+        .id = "uuid:1",
+        .friendly_name = "Kodi",
+        .model = "Kodi",
+        .address = .{ .bytes = .{ 192, 168, 1, 37 }, .port = 1254 },
+        .location = "http://192.168.1.37:1254/",
+    };
+    try renderer.writeSpec(&dlna_w);
+    try std.testing.expectEqualStrings("http://192.168.1.37:1254/", dlna_w.buffered());
+}
 
 test {
     std.testing.refAllDecls(@This());
