@@ -10,6 +10,9 @@ pub fn ownScope(comptime scope: @EnumLiteral()) bool {
     return false;
 }
 
+/// What `castig version` reports: the tag, or a dev version with the commit.
+pub const version = @import("build_options").version;
+
 /// What every operation runs with: the Io, the allocators, the environment.
 pub const Env = @import("env.zig").Env;
 /// Where the library reports the progress of a long operation.

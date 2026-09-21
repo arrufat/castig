@@ -36,6 +36,7 @@ const usage =
     \\                        the file: pick from a ranked list, or with --auto
     \\                        take a trusted hash match only. Needs an API key
     \\                        and login in ~/.config/castig/config (see README)
+    \\  version               print the version
     \\  help                  show this message
     \\
     \\<device> is an IP, IP:port, or part of a name shown by `ls`.
@@ -65,7 +66,7 @@ fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime
     std.debug.print(prefix ++ format ++ "\n", args);
 }
 
-const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, subs, ui, help };
+const Command = enum { ls, probe, status, stop, pause, play, seek, rate, cast, subs, ui, version, help };
 
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| switch (err) {
@@ -227,6 +228,7 @@ fn run(init: std.process.Init) !void {
             try out.flush();
             return openWindow(env);
         },
+        .version => try out.print("{s}\n", .{castig.version}),
         .help => try out.writeAll(usage),
     }
 

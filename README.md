@@ -18,6 +18,7 @@ castig seek <device> <pos>       # 90, 1:30, 1:02:03, +30, -10
 castig rate <device> <x>         # 0.5 to 2.0
 castig subs <file>               # download a subtitle next to the video
 castig ui                        # open the window (see below)
+castig version                   # print the version
 ```
 
 `<device>` is an IP, `ip:port`, or any part of a name shown by `ls`. The

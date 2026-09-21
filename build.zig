@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const castig_version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch unreachable;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -39,6 +41,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", b.fmt("{f}", .{resolveVersion(b)}));
+    castig.addOptions("build_options", build_options);
+
     // The shell. Rooted in src/cli/, so a relative import of a library file is
     // outside its module path and the compiler rejects it: the CLI can only
     // reach the library through `@import("castig")`.
@@ -57,6 +63,11 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run castig");
     run_step.dependOn(&run_cmd.step);
+
+    const version_step = b.step("version", "Print the resolved version");
+    const version_run = b.addRunArtifact(exe);
+    version_run.addArg("version");
+    version_step.dependOn(&version_run.step);
 
     // Rendered from the library root, so the pages are the API and not the
     // CLI entry point.
@@ -121,6 +132,45 @@ pub fn build(b: *std.Build) void {
 
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mod })).step);
     }
+}
+
+/// The version the binary reports: the declared one on a tag, otherwise a dev
+/// version carrying the commit count and hash.
+fn resolveVersion(b: *std.Build) std.SemanticVersion {
+    if (b.option([]const u8, "version-string", "Override the version of this build")) |override| {
+        return std.SemanticVersion.parse(override) catch |err| {
+            std.debug.panic("Expected -Dversion-string={s} to be a semantic version: {}", .{ override, err });
+        };
+    }
+
+    if (castig_version.pre == null and castig_version.build == null) return castig_version;
+    if (runGit(b, &.{ "describe", "--tags", "--exact-match" }) != null) return castig_version;
+
+    const commit_hash = runGit(b, &.{ "rev-parse", "--short", "HEAD" }) orelse return castig_version;
+    const revspec = if (runGit(b, &.{ "describe", "--tags", "--match=*.0", "--abbrev=0" })) |base_tag|
+        b.fmt("{s}..HEAD", .{base_tag})
+    else
+        "HEAD";
+    const commit_count = runGit(b, &.{ "rev-list", "--count", revspec }) orelse return castig_version;
+
+    return .{
+        .major = castig_version.major,
+        .minor = castig_version.minor,
+        .patch = castig_version.patch,
+        .pre = b.fmt("dev.{s}", .{commit_count}),
+        .build = commit_hash,
+    };
+}
+
+/// Git in the repo root, or null on any failure: no git, no repo, no tag.
+fn runGit(b: *std.Build, args: []const []const u8) ?[]const u8 {
+    const dir = b.root.root_dir.path orelse ".";
+    const argv = std.mem.concat(b.allocator, []const u8, &.{ &.{ "git", "-C", dir }, args }) catch return null;
+    defer b.allocator.free(argv);
+    var code: u8 = undefined;
+    const out = b.runAllowFail(argv, &code, .ignore) catch return null;
+    const trimmed = std.mem.trim(u8, out, " \r\n");
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 /// A front end over the library: its own root, and one policy for both.
