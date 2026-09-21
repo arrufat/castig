@@ -126,7 +126,9 @@ the subtitle and remux choices, and, once it is playing, the position, the
 transport controls and the speed.
 
 Choosing a device joins whatever it is already playing, so the controls work
-on a cast started from the terminal or from anywhere else. The remux choices
+on a cast started from the terminal or from anywhere else. It also asks that
+device what it plays, so the file's verdict is the one that device would give,
+the same as `probe --device`. The remux choices
 say what they mean for a renderer, and the speed control is replaced by what a
 renderer will actually do, which is 1x. It is a separate binary, `castigui`, built with
 `zig build gui`; `castig ui` runs the copy next to it, or one on PATH.

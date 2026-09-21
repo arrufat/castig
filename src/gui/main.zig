@@ -140,6 +140,14 @@ const App = struct {
     device: ?usize = null,
 
     examine: work.Task(anyerror!castig.probe.Report),
+    /// What the chosen device can play, asked of the device itself. Its
+    /// strings live in this task's arena, so it outlives every probe until
+    /// another device is chosen.
+    capabilities: work.Task(anyerror!castig.support.Profile),
+    profile: castig.support.Profile = castig.support.cast,
+    /// Set when the verdict on screen was judged against another device and
+    /// the reader was busy, so it is asked again once it is free.
+    reprobe: bool = false,
     /// The probe as the panel shows it, empty when the file cannot be read.
     report: []const u8 = "",
     /// The video's frame rate, which ranks the subtitle candidates.
@@ -201,6 +209,7 @@ fn init(win: *dvui.Window) !void {
         .win = win,
         .scan = .init(process.gpa),
         .examine = .init(process.gpa),
+        .capabilities = .init(process.gpa),
         .cast = .init(process.gpa),
         .control = .init(process.gpa),
         .search = .init(process.gpa),
@@ -238,6 +247,7 @@ fn deinit(_: *dvui.Window) void {
     app.cast.deinit(app.io);
     app.scan.deinit(app.io);
     app.examine.deinit(app.io);
+    app.capabilities.deinit(app.io);
     app.control.deinit(app.io);
     app.fetch.deinit(app.io);
     closeSearch();
@@ -304,6 +314,11 @@ fn collect() void {
             app.report = describeReport(app.examine.allocator(), r) catch "";
         } else |err| std.log.err("cannot read the file: {s}", .{@errorName(err)});
     }
+    if (app.capabilities.collect(app.io)) |result| {
+        // A device that will not say keeps the conservative reading.
+        app.profile = result catch castig.support.cast;
+        app.reprobe = true;
+    }
     if (app.control.collect(app.io)) |result| {
         result catch |err| std.log.err("{s}", .{@errorName(err)});
     }
@@ -319,6 +334,12 @@ fn collect() void {
         outcome catch |err| std.log.err("{s}", .{@errorName(err)});
     }
     app.cast.poll(app.io);
+
+    // Last, so a reader that finished this frame has freed its slot.
+    if (app.reprobe and !app.examine.busy()) {
+        app.reprobe = false;
+        startProbe() catch {};
+    }
 }
 
 fn nameDevices(arena: std.mem.Allocator, found: []const castig.discovery.Device) ![]const []const u8 {
@@ -378,6 +399,7 @@ fn selectDevice(index: usize) void {
     };
     app.device = index;
     app.device_spec_len = w.buffered().len;
+    startCapabilities();
     followSelected();
 }
 
@@ -426,7 +448,7 @@ fn sourcePanel() !void {
         dvui.label(@src(), "{s}", .{name}, .{ .gravity_y = 0.5 });
     }
 
-    if (app.examine.busy()) {
+    if (app.examine.busy() or app.capabilities.busy()) {
         dvui.label(@src(), "reading the file ...", .{}, .{});
         return;
     }
@@ -435,6 +457,13 @@ fn sourcePanel() !void {
     if (!app.readable) {
         dvui.label(@src(), "this file cannot be read", .{}, .{ .style = .err });
         return;
+    }
+    // Whose verdict this is: a renderer often plays what a receiver cannot,
+    // so the same file reads differently depending on what is selected.
+    if (app.device) |index| {
+        if (index < app.devices.len) {
+            dvui.label(@src(), "as {s} would play it:", .{app.devices[index].friendly_name}, .{});
+        }
     }
     {
         var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .margin = dvui.Rect{ .y = 6, .h = 6 } });
@@ -772,10 +801,39 @@ fn openFile() !void {
     if (app.path) |p| app.gpa.free(p);
     app.path = chosen;
     seedQuery(chosen);
+    try startProbe();
+}
+
+/// Reads the chosen file against the chosen device. Run again when either
+/// changes: what a renderer plays is what it says it plays, so the same
+/// file gets a different verdict on a different device.
+fn startProbe() !void {
+    const path = app.path orelse return;
+    if (app.examine.busy()) {
+        app.reprobe = true;
+        return;
+    }
     app.report = "";
     app.readable = false;
     app.fps = null;
-    try app.examine.start(app.io, app.win, castig.probe.inspect, .{ app.examine.allocator(), @as([]const u8, chosen), castig.support.cast });
+    try app.examine.start(app.io, app.win, castig.probe.inspect, .{
+        app.examine.allocator(),
+        @as([]const u8, path),
+        app.profile,
+    });
+}
+
+/// Asks the chosen device what it plays, which for a renderer is the only
+/// way to know. A Cast receiver answers from a table without being asked.
+fn startCapabilities() void {
+    if (app.capabilities.busy()) return;
+    const arena = app.capabilities.begin();
+    app.capabilities.launch(app.io, app.win, castig.player.profileOf, .{ castig.Env{
+        .io = app.io,
+        .arena = arena,
+        .gpa = app.gpa,
+        .environ = app.environ,
+    }, arena.dupe(u8, app.spec()) catch return }) catch {};
 }
 
 fn openSubtitle() !void {
