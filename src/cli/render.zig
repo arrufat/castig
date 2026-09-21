@@ -49,7 +49,7 @@ pub fn stopped(out: *Io.Writer, names: []const []const u8) !void {
 }
 
 /// The playback line: state, position, rate and subtitle track.
-pub fn media(out: *Io.Writer, m: castig.channel.Channel.MediaStatus) !void {
+pub fn media(out: *Io.Writer, m: castig.cast.Channel.MediaStatus) !void {
     try out.print("  {t} at {d:.1} s", .{ m.playerState, m.currentTime });
     if (m.duration()) |d| try out.print(" of {d:.1} s", .{d});
     if (m.playbackRate != 1) try out.print(" x{d:.2}", .{m.playbackRate});

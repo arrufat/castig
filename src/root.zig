@@ -21,10 +21,9 @@ pub const Reporter = @import("reporter.zig").Reporter;
 /// ISO 639 code to a display name, for naming a subtitle track.
 pub const language = @import("language.zig");
 
-/// Cast v2 over TLS: the receiver and media namespaces.
-pub const channel = @import("device/channel.zig");
-/// Cast channel framing: a length prefix around a protobuf CastMessage.
-pub const proto = @import("device/proto.zig");
+/// Google Cast v2 over TLS: the receiver and media namespaces, and the
+/// protobuf framing underneath them (`cast.proto`).
+pub const cast = @import("device/cast.zig");
 /// Receiver discovery over mDNS.
 pub const discovery = @import("device/discovery.zig");
 /// DNS wire format: query builder, record parser.
@@ -62,8 +61,8 @@ test {
     _ = Env;
     _ = Reporter;
     _ = language;
-    _ = channel;
-    _ = proto;
+    _ = cast;
+    _ = cast.proto;
     _ = discovery;
     _ = dns;
     _ = support;

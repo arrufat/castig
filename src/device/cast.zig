@@ -22,7 +22,8 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const tls = std.crypto.tls;
-const proto = @import("proto.zig");
+/// Cast channel framing: a length prefix around a protobuf CastMessage.
+pub const proto = @import("cast/proto.zig");
 
 /// Every message exchanged with the receiver, at debug level.
 const log = std.log.scoped(.cast);

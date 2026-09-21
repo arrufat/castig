@@ -9,7 +9,7 @@ const Io = std.Io;
 const dvui = @import("dvui");
 const castig = @import("castig");
 
-const Channel = castig.channel.Channel;
+const Channel = castig.cast.Channel;
 
 /// One call in flight, returning `Result`. Its result comes from `arena` and
 /// stays valid until the task is started again.

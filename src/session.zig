@@ -12,8 +12,8 @@ const net = Io.net;
 const av = @import("av");
 
 const Env = @import("env.zig").Env;
-const channel = @import("device/channel.zig");
-const Channel = channel.Channel;
+const cast = @import("device/cast.zig");
+const Channel = cast.Channel;
 const discovery = @import("device/discovery.zig");
 const extra = @import("media/av_extra.zig");
 const pipeline = @import("media/pipeline.zig");
@@ -216,7 +216,7 @@ pub const Session = struct {
                 },
                 else => return err,
             };
-            if (!std.mem.eql(u8, msg.namespace, channel.ns_media)) continue;
+            if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
             _ = s.scratch.reset(.retain_capacity);
             const reply = Channel.parseReply(s.scratch.allocator(), msg) orelse continue;
             s.media = Channel.mediaStatusFrom(s.scratch.allocator(), reply) orelse continue;
@@ -229,7 +229,7 @@ pub const Session = struct {
     fn load(s: *Session) !void {
         const arena = s.env.arena;
         const st = try s.ch.getStatus(arena);
-        s.app = st.find(channel.default_media_receiver) orelse try s.ch.launch(arena, channel.default_media_receiver);
+        s.app = st.find(cast.default_media_receiver) orelse try s.ch.launch(arena, cast.default_media_receiver);
         try s.ch.connectTransport(s.app.transportId);
         s.media = try s.ch.load(arena, s.app.transportId, .{
             .url = s.target.path,

@@ -8,8 +8,8 @@ const Io = std.Io;
 const net = Io.net;
 
 const Env = @import("env.zig").Env;
-const channel = @import("device/channel.zig");
-const Channel = channel.Channel;
+const cast = @import("device/cast.zig");
+const Channel = cast.Channel;
 const discovery = @import("device/discovery.zig");
 
 const log = std.log.scoped(.cast);
