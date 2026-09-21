@@ -203,11 +203,18 @@ pub const Session = struct {
                     s.target = try s.routes.addMp4(p.ic);
                 },
             }
-            // A renderer has no subtitle menu to offer the extra tracks in.
+            // Cast takes extra tracks as separate WebVTT routes and puts
+            // them in its own menu. UPnP AV has no verb for choosing a
+            // track at all, so what a renderer does with the ones inside
+            // the file is its own business, and often not changeable.
             if (protocol == .cast) {
                 try s.routes.addEmbeddedSubtitles(p.subtitles);
             } else if (p.subtitles.len > 0) {
-                log.info("a renderer has no subtitle menu, so its {d} embedded track(s) are not offered", .{p.subtitles.len});
+                if (verdict.direct) {
+                    log.info("{d} subtitle track(s) travel inside the file; a renderer picks one itself and may not let you change it", .{p.subtitles.len});
+                } else {
+                    log.info("the remux drops this file's {d} embedded subtitle track(s); only a side-loaded one survives", .{p.subtitles.len});
+                }
             }
             if (sub_source == null) sub_source = try subs.resolve(env, opts.source, want_download, p.fps);
         } else if (want_download) {
