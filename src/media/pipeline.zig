@@ -587,6 +587,10 @@ test {
 /// Encodes a second of silence with `codec_name` into an MPEG-TS buffer.
 /// MPEG-TS needs no seeking, so the muxer can write straight to memory.
 fn synthesise(gpa: std.mem.Allocator, codec_name: [*:0]const u8) ![]u8 {
+    // The encoder and the muxer log to stderr, which the build runner
+    // surfaces as a diagnostic on a step that passed.
+    extra.quietLibav();
+
     const codec = try av.Codec.find_encoder_by_name(codec_name);
     const enc = try av.Codec.Context.alloc(codec);
     defer enc.free();
