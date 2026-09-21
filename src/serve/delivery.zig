@@ -13,6 +13,7 @@ const av = @import("av");
 const Env = @import("../env.zig").Env;
 const language = @import("../language.zig");
 const playback = @import("../device/playback.zig");
+const didl = @import("../device/dlna/didl.zig");
 const http = @import("server.zig");
 const hls = @import("../media/hls.zig");
 const pipeline = @import("../media/pipeline.zig");
@@ -60,13 +61,13 @@ const mp4_path = "/media.mp4";
 const mp4_type = "video/mp4";
 
 /// Streams a fragmented-MP4 (`--remux stream`) as it is muxed.
-const StreamCtx = struct { gpa: std.mem.Allocator, path: []const u8 };
+const StreamCtx = struct { gpa: std.mem.Allocator, path: []const u8, media: http.Media };
 
 fn streamHandle(context: *const anyopaque, request: *http.Request, _: []const u8) anyerror!void {
     const c: *const StreamCtx = @ptrCast(@alignCast(context));
-    if (request.head.method == .HEAD) return http.respondHead(request, mp4_type);
+    if (request.head.method == .HEAD) return http.respondHead(request, c.media);
     var buf: [64 * 1024]u8 = undefined;
-    var body = try http.beginStream(request, &buf, mp4_type);
+    var body = try http.beginStream(request, &buf, c.media);
     pipeline.remuxFile(c.gpa, c.path, .fmp4, &body.writer) catch |err| {
         log.debug("stream aborted: {s}", .{@errorName(err)});
         return;
@@ -79,9 +80,14 @@ fn vmp4ReadFn(ctx: *anyopaque, offset: u64, dest: []u8) anyerror!void {
     try vm.readInto(offset, dest);
 }
 
+/// The assembled mp4 and what to say about it when serving it.
+const Mp4Route = struct { vm: *vmp4.VMp4, media: http.Media };
+
 fn vmp4Handle(context: *const anyopaque, request: *http.Request, _: []const u8) anyerror!void {
-    const vm: *vmp4.VMp4 = @ptrCast(@alignCast(@constCast(context)));
-    try http.respondRanged(request, mp4_type, vm.total, .{ .virtual = .{ .ctx = vm, .read = vmp4ReadFn } });
+    const r: *const Mp4Route = @ptrCast(@alignCast(context));
+    try http.respondRanged(request, r.media, r.vm.total, .{
+        .virtual = .{ .ctx = r.vm, .read = vmp4ReadFn },
+    });
 }
 
 /// The text subtitle streams embedded in the source, all converted to WebVTT
@@ -117,7 +123,7 @@ fn embSubHandle(context: *const anyopaque, request: *http.Request, _: []const u8
         log.debug("subtitle extract failed: {s}", .{@errorName(err)});
         return request.respond("subtitle extract failed\n", .{ .status = .internal_server_error, .extra_headers = http.cors });
     };
-    try http.respondBuffer(request, "text/vtt", body);
+    try http.respondBuffer(request, .{ .content_type = "text/vtt" }, body);
 }
 
 /// The routes of one cast, the text tracks they back, and the gpa-owned state
@@ -127,6 +133,9 @@ pub const Routes = struct {
     env: Env,
     source: []const u8,
     list: std.ArrayList(http.Route) = .empty,
+    /// Whether the device is a renderer, which has to be told what it may
+    /// do with a response before it will seek in one.
+    dlna: bool = false,
     tracks: std.ArrayList(playback.TextTrack) = .empty,
     active: std.ArrayList(u32) = .empty,
     segmenter: ?*hls.Segmenter = null,
@@ -143,6 +152,15 @@ pub const Routes = struct {
         if (s.embedded) |e| e.deinit();
     }
 
+    /// What a route says it is. A renderer needs the DLNA flags; a Cast
+    /// receiver ignores them, so they are left off entirely.
+    fn media(s: *const Routes, content_type: []const u8, seekable: bool) http.Media {
+        return .{
+            .content_type = content_type,
+            .features = if (s.dlna) didl.contentFeatures(seekable) else null,
+        };
+    }
+
     fn addRoute(s: *Routes, path: []const u8, context: *const anyopaque, handle: @FieldType(http.Route.Dynamic, "handle")) !void {
         try s.list.append(s.env.arena, .{ .path = path, .body = .{ .dynamic = .{ .context = context, .handle = handle } } });
     }
@@ -152,7 +170,7 @@ pub const Routes = struct {
         const path = try s.env.arena.print("/media{s}", .{Io.Dir.path.extension(s.source)});
         try s.list.append(s.env.arena, .{
             .path = path,
-            .body = .{ .file = .{ .content_type = content_type, .data = s.source } },
+            .body = .{ .file = .{ .media = s.media(content_type, true), .data = s.source } },
         });
         return .{ .path = path, .content_type = content_type };
     }
@@ -161,7 +179,7 @@ pub const Routes = struct {
     /// stream` and as the `--remux mp4` fallback.
     pub fn addStream(s: *Routes) !Target {
         const c = try s.env.arena.create(StreamCtx);
-        c.* = .{ .gpa = s.env.gpa, .path = s.source };
+        c.* = .{ .gpa = s.env.gpa, .path = s.source, .media = s.media(mp4_type, false) };
         try s.addRoute(mp4_path, c, streamHandle);
         return .{ .path = mp4_path, .content_type = mp4_type, .seekable = false };
     }
@@ -177,7 +195,9 @@ pub const Routes = struct {
             else => return err,
         };
         errdefer vm.deinit();
-        try s.addRoute(mp4_path, vm, vmp4Handle);
+        const route = try s.env.arena.create(Mp4Route);
+        route.* = .{ .vm = vm, .media = s.media(mp4_type, true) };
+        try s.addRoute(mp4_path, route, vmp4Handle);
         s.mp4 = vm;
         return .{ .path = mp4_path, .content_type = mp4_type };
     }
@@ -205,7 +225,14 @@ pub const Routes = struct {
             };
             try s.list.append(arena, .{
                 .path = "/sub.vtt",
-                .body = .{ .bytes = .{ .content_type = "text/vtt", .data = try webvtt.srtToVtt(arena, srt) } },
+                .body = .{ .bytes = .{
+                    .media = .{
+                        .content_type = "text/vtt",
+                        .features = if (s.dlna) didl.contentFeatures(true) else null,
+                        .transfer_mode = .interactive,
+                    },
+                    .data = try webvtt.srtToVtt(arena, srt),
+                } },
             });
             break :blk "/sub.vtt";
         };

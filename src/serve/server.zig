@@ -34,12 +34,38 @@ pub const Route = struct {
         dynamic: Dynamic,
     };
 
-    pub const Static = struct { content_type: []const u8, data: []const u8 };
+    pub const Static = struct { media: Media, data: []const u8 };
 
     pub const Dynamic = struct {
         context: *const anyopaque,
         /// `path` is the request target without its query string.
         handle: *const fn (context: *const anyopaque, request: *Request, path: []const u8) anyerror!void,
+    };
+};
+
+/// What a response says it is, and what a DLNA renderer needs told about
+/// it before it will do anything clever with it.
+pub const Media = struct {
+    content_type: []const u8,
+    /// `contentFeatures.dlna.org`. Null on a Cast session, where the header
+    /// means nothing and is not worth sending.
+    features: ?[]const u8 = null,
+    transfer_mode: TransferMode = .streaming,
+
+    pub const TransferMode = enum {
+        /// Audio and video, played as they arrive.
+        streaming,
+        /// Subtitles and playlists, fetched whole and kept.
+        interactive,
+        background,
+
+        pub fn text(m: TransferMode) []const u8 {
+            return switch (m) {
+                .streaming => "Streaming",
+                .interactive => "Interactive",
+                .background => "Background",
+            };
+        }
     };
 };
 
@@ -148,13 +174,13 @@ pub const Server = struct {
 
         switch (route.body) {
             .dynamic => |d| try d.handle(d.context, request, path),
-            .bytes => |b| try respondBuffer(request, b.content_type, b.data),
+            .bytes => |b| try respondBuffer(request, b.media, b.data),
             .file => |f| {
                 const file = try Io.Dir.cwd().openFile(s.io, f.data, .{});
                 defer file.close(s.io);
                 var buf: [64 * 1024]u8 = undefined;
                 var reader = file.reader(s.io, &buf);
-                try respondRanged(request, f.content_type, try reader.getSize(), .{ .file = &reader });
+                try respondRanged(request, f.media, try reader.getSize(), .{ .file = &reader });
             },
         }
     }
@@ -187,26 +213,43 @@ pub fn respondNotFound(request: *Request) !void {
     try request.respond("not found\n", .{ .status = .not_found, .extra_headers = cors });
 }
 
-fn streamHeaders(content_type: []const u8) [cors_array.len + 2]http.Header {
-    return cors_array ++ [_]http.Header{
-        .{ .name = "content-type", .value = content_type },
-        .{ .name = "cache-control", .value = "no-store" },
-    };
+/// Room for the CORS block plus content-type, cache-control, the two DLNA
+/// headers, accept-ranges and content-range.
+const HeaderBuf = [cors_array.len + 6]http.Header;
+
+/// The headers every response carries, plus the ones a renderer looks for.
+fn baseHeaders(buf: *HeaderBuf, request: *Request, media: Media) std.ArrayList(http.Header) {
+    var headers: std.ArrayList(http.Header) = .initBuffer(buf);
+    headers.appendSliceAssumeCapacity(&cors_array);
+    headers.appendAssumeCapacity(.{ .name = "content-type", .value = media.content_type });
+    headers.appendAssumeCapacity(.{ .name = "cache-control", .value = "no-store" });
+    if (media.features) |features| {
+        headers.appendAssumeCapacity(.{ .name = "contentFeatures.dlna.org", .value = features });
+        // A renderer that states a mode gets it back; otherwise it is told
+        // what the route is for.
+        headers.appendAssumeCapacity(.{
+            .name = "transferMode.dlna.org",
+            .value = header(request, "transferMode.dlna.org") orelse media.transfer_mode.text(),
+        });
+    }
+    return headers;
 }
 
 /// For a dynamic handler's HEAD: headers only, no body.
-pub fn respondHead(request: *Request, content_type: []const u8) !void {
-    const headers = streamHeaders(content_type);
-    return request.respond("", .{ .status = .ok, .extra_headers = &headers });
+pub fn respondHead(request: *Request, media: Media) !void {
+    var buf: HeaderBuf = undefined;
+    const headers = baseHeaders(&buf, request, media);
+    return request.respond("", .{ .status = .ok, .extra_headers = headers.items });
 }
 
 /// For a dynamic handler's GET: begins a chunked response of unknown length.
 /// `buffer` must outlive the returned writer; the caller writes the body and
 /// calls `end()`.
-pub fn beginStream(request: *Request, buffer: []u8, content_type: []const u8) !http.BodyWriter {
-    const headers = streamHeaders(content_type);
+pub fn beginStream(request: *Request, buffer: []u8, media: Media) !http.BodyWriter {
+    var buf: HeaderBuf = undefined;
+    const headers = baseHeaders(&buf, request, media);
     return request.respondStreaming(buffer, .{
-        .respond_options = .{ .status = .ok, .extra_headers = &headers },
+        .respond_options = .{ .status = .ok, .extra_headers = headers.items },
     });
 }
 
@@ -224,13 +267,22 @@ pub const Source = union(enum) {
 /// Serves an in-memory body with a Content-Length and single-range support
 /// (206), handling HEAD. Used by dynamic handlers that produce the whole body
 /// first (the Cast receiver's HLS loader needs a Content-Length on segments).
-pub fn respondBuffer(request: *Request, content_type: []const u8, bytes: []const u8) !void {
-    return respondRanged(request, content_type, bytes.len, .{ .bytes = bytes });
+pub fn respondBuffer(request: *Request, media: Media, bytes: []const u8) !void {
+    return respondRanged(request, media, bytes.len, .{ .bytes = bytes });
 }
 
 /// Serves `total` bytes from `source` with Content-Length, single-range (206)
 /// and HEAD support.
-pub fn respondRanged(request: *Request, content_type: []const u8, total: u64, source: Source) !void {
+pub fn respondRanged(request: *Request, media: Media, total: u64, source: Source) !void {
+    // We serve byte ranges and never advertise DLNA.ORG_OP=10, so a device
+    // asking to seek by time is refused rather than quietly given the whole
+    // thing: that is what sends it back to byte ranges instead of leaving it
+    // with a seek bar that does nothing.
+    if (header(request, "timeseekrange.dlna.org") != null) {
+        log.debug("refusing a time-seek request: byte ranges only", .{});
+        return request.respond("", .{ .status = .not_acceptable, .extra_headers = cors });
+    }
+
     const range = parseRange(header(request, "range"), total) catch {
         var buf: [64]u8 = undefined;
         const content_range = try std.mem.print(&buf, "bytes */{d}", .{total});
@@ -241,12 +293,9 @@ pub fn respondRanged(request: *Request, content_type: []const u8, total: u64, so
     };
 
     var content_range_buf: [96]u8 = undefined;
-    var headers_buf: [cors_array.len + 4]http.Header = undefined;
-    var headers: std.ArrayList(http.Header) = .initBuffer(&headers_buf);
-    headers.appendSliceAssumeCapacity(&cors_array);
-    headers.appendAssumeCapacity(.{ .name = "content-type", .value = content_type });
+    var headers_buf: HeaderBuf = undefined;
+    var headers = baseHeaders(&headers_buf, request, media);
     headers.appendAssumeCapacity(.{ .name = "accept-ranges", .value = "bytes" });
-    headers.appendAssumeCapacity(.{ .name = "cache-control", .value = "no-store" });
     if (range) |r| headers.appendAssumeCapacity(.{
         .name = "content-range",
         .value = try std.mem.print(&content_range_buf, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }),

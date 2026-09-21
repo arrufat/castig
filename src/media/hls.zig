@@ -212,13 +212,13 @@ pub fn handleRoute(context: *const anyopaque, request: *server.Request, path: []
         const digits = tail["seg".len .. tail.len - ".ts".len];
         const index = std.fmt.parseInt(usize, digits, 10) catch return server.respondNotFound(request);
         if (index >= seg.starts.len) return server.respondNotFound(request);
-        if (request.head.method == .HEAD) return server.respondHead(request, segment_content_type);
+        if (request.head.method == .HEAD) return server.respondHead(request, .{ .content_type = segment_content_type });
         // Stream the segment as it is muxed; buffering it first made the
         // receiver time the load out.
         const start = seg.starts[index];
         const end: ?f64 = if (index + 1 < seg.starts.len) seg.starts[index + 1] else null;
         var buffer: [64 * 1024]u8 = undefined;
-        var body = try server.beginStream(request, &buffer, segment_content_type);
+        var body = try server.beginStream(request, &buffer, .{ .content_type = segment_content_type });
         const in = try seg.acquireInput();
         defer seg.releaseInput(in);
         pipeline.remuxWindow(in, start, end, .mpegts, &body.writer) catch |err| {
@@ -236,7 +236,7 @@ fn respondPlaylist(seg: *const Segmenter, request: *server.Request, write: fn (*
     var aw: Io.Writer.Allocating = .init(seg.gpa);
     defer aw.deinit();
     try write(seg, &aw.writer);
-    return server.respondBuffer(request, playlist_content_type, aw.written());
+    return server.respondBuffer(request, .{ .content_type = playlist_content_type }, aw.written());
 }
 
 test "boundaries group keyframes by target" {

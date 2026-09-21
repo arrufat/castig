@@ -164,6 +164,7 @@ pub const Session = struct {
         resolved = true;
         s.endpoint = try resolving.await(io);
         const protocol = s.endpoint.protocol();
+        s.routes.dlna = protocol == .dlna;
 
         if (probe_result) |p| {
             if (p.video_unsupported) {
