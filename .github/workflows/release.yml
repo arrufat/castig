@@ -12,14 +12,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
+      # A debug build of ffmpeg leaves about 2.9 GiB behind, and the action
+      # clears a cache that outgrows its limit rather than saving it.
       - name: Grab Zig
         uses: mlugg/setup-zig@v2
         with:
           version: master
+          cache-size-limit: 4096
 
       - name: Unit tests
         run: zig build test
@@ -69,14 +72,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
+      # `slug` is what separates the two rows that share a runner: the key
+      # carries the OS, so linux and windows would otherwise overwrite each
+      # other's cache and restore the wrong one next time.
       - name: Grab Zig
         uses: mlugg/setup-zig@v2
         with:
           version: master
+          cache-key: ${{ matrix.slug }}
+          cache-size-limit: 4096
 
       # The CLI is static, the window is not: SDL3 dlopens X11 and Wayland,
       # and dlopen in a static musl binary always fails.
