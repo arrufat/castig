@@ -79,10 +79,12 @@ pub const Device = struct {
             std.mem.startsWith(u8, d.id, spec);
     }
 
-    /// How to name this device back to castig. A Cast receiver is named by
-    /// its address, which resolves without a discovery round; a renderer is
-    /// named by its description URL, which is the only thing that locates
-    /// it. An address would name the wrong protocol entirely.
+    /// One spec for this device, for a caller that needs to pick just one.
+    /// A Cast receiver gets its address, which resolves without a discovery
+    /// round where its id would need one; a renderer gets its description
+    /// URL, which is the only thing that locates it, and whose address
+    /// would name the wrong protocol entirely. `ls` prints both, since it
+    /// has a column to spare.
     pub fn writeSpec(d: Device, w: *Io.Writer) Io.Writer.Error!void {
         if (d.protocol == .dlna and d.location.len > 0) return w.writeAll(d.location);
         return w.print("{f}", .{d.address});

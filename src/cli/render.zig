@@ -4,8 +4,11 @@ const std = @import("std");
 const Io = std.Io;
 const castig = @import("castig");
 
-/// The `ls` table, or advice when nothing answered. The last column is the
-/// spec to paste back: an id for a Cast receiver, a URL for a renderer.
+/// The `ls` table, or advice when nothing answered. Both the address and
+/// the last column name a device back to castig. The last column is the id
+/// for a Cast receiver, which survives a new lease where the address does
+/// not, and the description URL for a renderer, which is the only thing
+/// that locates one.
 pub fn devices(out: *Io.Writer, found: []const castig.discovery.Device, timeout_ms: u32) !void {
     if (found.len == 0) {
         try out.print("no devices answered within {d} ms\n", .{timeout_ms});
@@ -43,13 +46,12 @@ pub fn status(out: *Io.Writer, s: castig.control.Status) !void {
     if (s.device.volume) |v| {
         try out.print("  volume: {d:.0}%{s}\n", .{ v.level * 100, if (v.muted) " (muted)" else "" });
     }
-    // A renderer has no apps: what it is playing is all there is to show.
     if (s.device.playing) |p| try media(out, p);
-    if (s.device.apps.len == 0 and s.device.playing == null) try out.writeAll("  nothing running\n");
-    for (s.device.apps) |a| {
-        try out.print("  app: {s} ({s}){s}", .{ a.displayName, a.appId, if (a.isIdleScreen) " idle screen" else "" });
-        if (a.statusText.len > 0) try out.print(" - {s}", .{a.statusText});
-        try out.print("\n       session {s}, transport {s}\n", .{ a.sessionId, a.transportId });
+    if (s.device.running.len == 0 and s.device.playing == null) try out.writeAll("  nothing running\n");
+    for (s.device.running) |a| {
+        try out.print("  running: {s}{s}", .{ a.name, if (a.idle) " (idle screen)" else "" });
+        if (a.detail.len > 0) try out.print(" - {s}", .{a.detail});
+        try out.writeAll("\n");
     }
 }
 

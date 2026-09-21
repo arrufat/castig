@@ -19,6 +19,8 @@ const xml = @import("xml.zig");
 pub const ssdp = @import("dlna/ssdp.zig");
 /// The SOAP envelope, the call, and what a refusal means.
 pub const soap = @import("dlna/soap.zig");
+/// What the renderer says it can do, read on demand.
+pub const claims = @import("dlna/claims.zig");
 /// `SetAVTransportURI` metadata and the UPnP clock format.
 pub const didl = @import("dlna/didl.zig");
 
@@ -26,9 +28,6 @@ const log = std.log.scoped(.dlna);
 
 /// Every AVTransport action takes this first.
 const instance: soap.Arg = .{ .name = "InstanceID", .value = "0" };
-
-/// An AVTransport SCPD runs to a few tens of kilobytes; this is room to spare.
-const max_scpd = 512 * 1024;
 
 pub const Renderer = struct {
     env: Env,
@@ -44,7 +43,7 @@ pub const Renderer = struct {
     /// and the transport verbs need neither.
     scpd_url: []const u8,
     connection_manager: ?ssdp.Service,
-    cached_caps: ?Caps = null,
+    cached_caps: ?claims.Caps = null,
     cached_sinks: ?[]const []const u8 = null,
     /// Reset at the start of each operation, so a poll a second for the
     /// length of a film stays bounded.
@@ -70,15 +69,6 @@ pub const Renderer = struct {
     /// because the item ended, so the live reading cannot say where it got
     /// to and this is what decides finished from cancelled.
     played_to: f64 = 0,
-
-    /// What the device admits to in its SCPD, rather than what we hope.
-    pub const Caps = struct {
-        rel_time_seek: bool = false,
-        abs_time_seek: bool = false,
-        /// Any speed other than 1 in `TransportPlaySpeed`. A renderer that
-        /// declares no list at all plays at 1x only.
-        speeds: bool = false,
-    };
 
     /// Reads the description at `location`, which is the one document every
     /// caller needs. `caps` and `sinks` fetch theirs when first asked.
@@ -116,38 +106,22 @@ pub const Renderer = struct {
         r.env.gpa.destroy(r);
     }
 
-    /// The SCPD lists what each argument accepts. Reading it is one GET, and
-    /// it turns "seek silently does nothing" into a refusal we can explain.
-    pub fn caps(r: *Renderer) Caps {
+    /// What its SCPD admits to, read the first time something asks.
+    pub fn caps(r: *Renderer) claims.Caps {
         if (r.cached_caps) |c| return c;
-        const c = if (r.scpd_url.len == 0) Caps{} else read: {
-            const body = soap.get(r.scratch.allocator(), &r.http, r.scpd_url, max_scpd) catch break :read Caps{};
-            break :read parseCaps(body);
-        };
+        // The SCPD is parsed into bools, so the scratch it lands in may go.
+        const c = claims.transport(r.scratch.allocator(), &r.http, r.scpd_url);
         r.cached_caps = c;
         return c;
     }
 
-    /// The MIME types it says it accepts, from ConnectionManager. One call,
-    /// and it is the difference between remuxing a file and handing it over
-    /// whole. A device that will not answer keeps the conservative defaults.
+    /// The MIME types it says it accepts, read the first time something asks.
     pub fn sinks(r: *Renderer) []const []const u8 {
         if (r.cached_sinks) |s| return s;
-        const s = r.readSinks(r.connection_manager);
+        const s = claims.sinks(r.env.arena, &r.http, r.connection_manager);
         r.cached_sinks = s;
         log.debug("{s} accepts {d} type(s)", .{ r.friendly_name, s.len });
         return s;
-    }
-
-    fn readSinks(r: *Renderer, service: ?ssdp.Service) []const []const u8 {
-        const manager = service orelse return &.{};
-        const reply = soap.call(r.env.arena, &r.http, manager.control_url, .{
-            .service = manager.type,
-            .name = "GetProtocolInfo",
-        }) catch return &.{};
-        const raw = xml.text(reply, "Sink") orelse return &.{};
-        const sink = xml.unescape(r.env.arena, raw) catch return &.{};
-        return parseSinks(r.env.arena, sink) catch &.{};
     }
 
     /// Our own address on the interface that reaches the renderer, for URLs
@@ -431,50 +405,11 @@ fn stateOf(transport_state: []const u8) playback.State {
     return transport_states.get(transport_state) orelse .unknown;
 }
 
-/// A sink list is comma separated `protocol:network:mime:extras`, and the
-/// MIME is the only field worth keeping.
-pub fn parseSinks(arena: std.mem.Allocator, sink: []const u8) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    var entries = std.mem.splitScalar(u8, sink, ',');
-    while (entries.next()) |entry| {
-        var fields = std.mem.splitScalar(u8, std.mem.trim(u8, entry, " \t\r\n"), ':');
-        _ = fields.next() orelse continue;
-        _ = fields.next() orelse continue;
-        const mime = fields.next() orelse continue;
-        if (mime.len > 0) try out.append(arena, mime);
-    }
-    return out.toOwnedSlice(arena);
-}
-
-/// The seek units and play speeds an AVTransport SCPD admits to.
-pub fn parseCaps(scpd: []const u8) Renderer.Caps {
-    var caps: Renderer.Caps = .{};
-    const table = xml.text(scpd, "serviceStateTable") orelse return caps;
-
-    var variables: xml.Scanner = .init(table);
-    while (variables.next()) |variable| {
-        if (!variable.is("stateVariable")) continue;
-        const name = xml.text(variable.body, "name") orelse continue;
-        const allowed = xml.text(variable.body, "allowedValueList") orelse continue;
-
-        var values: xml.Scanner = .init(allowed);
-        while (values.next()) |value| {
-            if (!value.is("allowedValue")) continue;
-            if (std.mem.eql(u8, name, "A_ARG_TYPE_SeekMode")) {
-                if (std.mem.eql(u8, value.body, "REL_TIME")) caps.rel_time_seek = true;
-                if (std.mem.eql(u8, value.body, "ABS_TIME")) caps.abs_time_seek = true;
-            } else if (std.mem.eql(u8, name, "TransportPlaySpeed")) {
-                if (!std.mem.eql(u8, std.mem.trim(u8, value.body, " "), "1")) caps.speeds = true;
-            }
-        }
-    }
-    return caps;
-}
-
 test {
     _ = ssdp;
     _ = soap;
     _ = didl;
+    _ = claims;
 }
 
 const testing = std.testing;
@@ -486,31 +421,4 @@ test "transport states" {
     try testing.expectEqual(playback.State.idle, stateOf("STOPPED"));
     try testing.expectEqual(playback.State.idle, stateOf("NO_MEDIA_PRESENT"));
     try testing.expectEqual(playback.State.unknown, stateOf("RECORDING"));
-}
-
-test "capabilities come from the scpd, not from hope" {
-    const scpd =
-        \\<scpd><serviceStateTable>
-        \\<stateVariable><name>A_ARG_TYPE_SeekMode</name>
-        \\<allowedValueList><allowedValue>TRACK_NR</allowedValue>
-        \\<allowedValue>REL_TIME</allowedValue><allowedValue>ABS_TIME</allowedValue>
-        \\<allowedValue>X_DLNA_REL_BYTE</allowedValue></allowedValueList></stateVariable>
-        \\<stateVariable><name>TransportPlaySpeed</name>
-        \\<allowedValueList><allowedValue>1</allowedValue></allowedValueList></stateVariable>
-        \\</serviceStateTable></scpd>
-    ;
-    const caps = parseCaps(scpd);
-    try testing.expect(caps.rel_time_seek);
-    try testing.expect(caps.abs_time_seek);
-    // A list holding only "1" is not support for another speed.
-    try testing.expect(!caps.speeds);
-
-    // Rygel declares TransportPlaySpeed with no list at all, which means 1x.
-    const bare = "<scpd><serviceStateTable><stateVariable><name>TransportPlaySpeed</name>" ++
-        "<dataType>string</dataType></stateVariable></serviceStateTable></scpd>";
-    try testing.expect(!parseCaps(bare).speeds);
-
-    // Nothing to read is nothing claimed.
-    try testing.expectEqual(Renderer.Caps{}, parseCaps(""));
-    try testing.expectEqual(Renderer.Caps{}, parseCaps("<scpd></scpd>"));
 }

@@ -43,11 +43,22 @@ pub const DeviceStatus = struct {
     /// What it is playing, when the protocol tells us without being asked
     /// to join a session.
     playing: ?playback.Playback = null,
-    /// The apps the receiver lists. Only Cast has any; a protocol without an
-    /// app model leaves this empty and a caller prints nothing for it.
-    apps: []const cast.Channel.App = &.{},
+    /// What is running on it. Cast lists its apps; a protocol with no app
+    /// model reports none, and then `playing` is all there is to show.
+    running: []const Activity = &.{},
 
     pub const Volume = struct { level: f64, muted: bool };
+
+    /// One thing a device says is running, in words any protocol can fill.
+    pub const Activity = struct {
+        /// What the device calls it.
+        name: []const u8,
+        /// The device's own further words about it, often empty.
+        detail: []const u8 = "",
+        /// The screen a device shows when nobody has asked for anything,
+        /// which is running without anyone having started it.
+        idle: bool = false,
+    };
 };
 
 pub const Player = union(enum) {
@@ -279,8 +290,8 @@ pub fn profileOf(env: Env, device: []const u8) !support.Profile {
 pub fn deviceStatus(env: Env, endpoint: discovery.Endpoint) !DeviceStatus {
     const address = switch (endpoint) {
         .cast => |a| a,
-        // A renderer has no apps and no volume we read yet, only what it is
-        // doing right now.
+        // A renderer has nothing running in this sense and no volume we
+        // read yet, only what it is doing right now.
         .dlna => |d| {
             const r = try dlna.Renderer.connect(env, d.address, d.location);
             defer r.deinit();
@@ -290,9 +301,15 @@ pub fn deviceStatus(env: Env, endpoint: discovery.Endpoint) !DeviceStatus {
     const ch = try castChannel(env, address);
     defer ch.deinit();
     const st = try ch.getStatus(env.arena);
+    const running = try env.arena.alloc(DeviceStatus.Activity, st.applications.len);
+    for (st.applications, running) |app, *slot| slot.* = .{
+        .name = app.displayName,
+        .detail = app.statusText,
+        .idle = app.isIdleScreen,
+    };
     return .{
         .volume = .{ .level = st.volume.level, .muted = st.volume.muted },
-        .apps = st.applications,
+        .running = running,
     };
 }
 
