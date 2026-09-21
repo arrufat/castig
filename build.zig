@@ -42,15 +42,8 @@ pub fn build(b: *std.Build) void {
     // The shell. Rooted in src/cli/, so a relative import of a library file is
     // outside its module path and the compiler rejects it: the CLI can only
     // reach the library through `@import("castig")`.
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/cli/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .strip = optimize != .debug,
-        .imports = &.{
-            .{ .name = "castig", .module = castig },
-        },
+    const exe_mod = frontEnd(b, target, optimize, "src/cli/main.zig", &.{
+        .{ .name = "castig", .module = castig },
     });
 
     const exe = b.addExecutable(.{
@@ -110,16 +103,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .backend = .sdl3,
     })) |dvui_dep| {
-        const gui_mod = b.createModule(.{
-            .root_source_file = b.path("src/gui/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .strip = optimize != .debug,
-            .imports = &.{
-                .{ .name = "castig", .module = castig },
-                .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
-            },
+        const gui_mod = frontEnd(b, target, optimize, "src/gui/main.zig", &.{
+            .{ .name = "castig", .module = castig },
+            .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
         });
         const gui = b.addExecutable(.{
             .name = "castigui",
@@ -135,4 +121,22 @@ pub fn build(b: *std.Build) void {
 
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mod })).step);
     }
+}
+
+/// A front end over the library: its own root, and one policy for both.
+fn frontEnd(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    root: []const u8,
+    imports: []const std.Build.Module.Import,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(root),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = optimize != .debug,
+        .imports = imports,
+    });
 }

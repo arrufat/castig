@@ -1,6 +1,15 @@
 //! castig as a library: what the tool does, minus the command line. A module
 //! unreachable from here is neither documented (`zig build docs`) nor tested.
 
+/// The scopes the library logs under. A front end that shows the library's
+/// own explanations asks here, so a new module reaches it without an edit.
+pub const log_scopes = [_]@EnumLiteral(){ .cast, .subs, .http, .hls };
+
+pub fn ownScope(comptime scope: @EnumLiteral()) bool {
+    for (log_scopes) |s| if (s == scope) return true;
+    return false;
+}
+
 /// What every operation runs with: the Io, the allocators, the environment.
 pub const Env = @import("env.zig").Env;
 /// Where the library reports the progress of a long operation.

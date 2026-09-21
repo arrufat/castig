@@ -11,14 +11,16 @@ const castig = @import("castig");
 
 const Channel = castig.channel.Channel;
 
-/// One call in flight, returning an error union. Its result comes from
-/// `arena` and stays valid until the task is started again.
+/// One call in flight, returning `Result`. Its result comes from `arena` and
+/// stays valid until the task is started again.
 pub fn Task(comptime Result: type) type {
     return struct {
         arena: std.heap.ArenaAllocator,
         future: ?Io.Future(Result) = null,
         /// `await` blocks, so the loop waits for this before calling it.
         arrived: std.atomic.Value(bool) = .init(false),
+        /// The window the worker wakes when it has something to show.
+        win: *dvui.Window = undefined,
 
         const Self = @This();
 
@@ -27,7 +29,11 @@ pub fn Task(comptime Result: type) type {
         }
 
         pub fn deinit(self: *Self, io: Io) void {
-            if (self.future) |*f| _ = f.cancel(io) catch {};
+            if (self.future) |*f| {
+                // Stored rather than discarded: `Result` may be an error union.
+                var result = f.cancel(io);
+                _ = &result;
+            }
             self.arena.deinit();
         }
 
@@ -50,9 +56,17 @@ pub fn Task(comptime Result: type) type {
             return self.arena.allocator();
         }
 
-        /// `args` must outlive the call, which runs on another thread, and
-        /// must not point into `arena`, which starting resets.
-        pub fn start(
+        /// Clears the arena and hands it over, for a caller that has to copy
+        /// the arguments in before the call can start.
+        pub fn begin(self: *Self) std.mem.Allocator {
+            std.debug.assert(self.future == null);
+            _ = self.arena.reset(.retain_capacity);
+            return self.arena.allocator();
+        }
+
+        /// Hands the work to another thread. `args` must outlive the call and
+        /// may point into `arena` only if it was filled after `begin`.
+        pub fn launch(
             self: *Self,
             io: Io,
             win: *dvui.Window,
@@ -62,17 +76,30 @@ pub fn Task(comptime Result: type) type {
             std.debug.assert(self.future == null);
             const Args = @TypeOf(args);
             const wrapped = struct {
-                fn call(task: *Self, window: *dvui.Window, inner: Args) Result {
+                fn call(task: *Self, inner: Args) Result {
                     defer {
                         task.arrived.store(true, .release);
-                        dvui.refresh(window, @src(), null);
+                        dvui.refresh(task.win, @src(), null);
                     }
                     return @call(.auto, func, inner);
                 }
             }.call;
-            _ = self.arena.reset(.retain_capacity);
+            self.win = win;
             self.arrived.store(false, .monotonic);
-            self.future = try io.concurrent(wrapped, .{ self, win, args });
+            self.future = try io.concurrent(wrapped, .{ self, args });
+        }
+
+        /// `args` must outlive the call, which runs on another thread, and
+        /// must not point into `arena`, which starting resets.
+        pub fn start(
+            self: *Self,
+            io: Io,
+            win: *dvui.Window,
+            comptime func: anytype,
+            args: std.meta.ArgsTuple(@TypeOf(func)),
+        ) Io.ConcurrentError!void {
+            _ = self.begin();
+            return self.launch(io, win, func, args);
         }
 
         /// What the call returned, once; null while it is still running.
@@ -81,17 +108,20 @@ pub fn Task(comptime Result: type) type {
             defer self.future = null;
             return self.future.?.await(io);
         }
+
+        /// Gives the arena's pages back, for a task whose result nothing
+        /// reads any more: a cast leaves a whole converted subtitle in it.
+        pub fn release(self: *Self) void {
+            _ = self.arena.reset(.free_all);
+        }
     };
 }
 
 /// A cast in flight. The session thread leaves here what the receiver last
 /// said, and the frame loop reads it under the mutex.
 pub const Cast = struct {
-    arena: std.heap.ArenaAllocator,
-    future: ?Io.Future(void) = null,
-    arrived: std.atomic.Value(bool) = .init(false),
-    /// The window the session thread wakes on every receiver message.
-    win: *dvui.Window = undefined,
+    /// One long call, whose window it also wakes on every receiver message.
+    task: Task(void),
     mutex: Io.Mutex = .init,
     state: State = .{},
     progress: Progress = .{},
@@ -157,16 +187,15 @@ pub const Cast = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator) Cast {
-        return .{ .arena = .init(gpa) };
+        return .{ .task = .init(gpa) };
     }
 
     pub fn deinit(c: *Cast, io: Io) void {
-        if (c.future) |*f| f.cancel(io);
-        c.arena.deinit();
+        c.task.deinit(io);
     }
 
     pub fn busy(c: *const Cast) bool {
-        return c.future != null;
+        return c.task.busy();
     }
 
     pub fn snapshot(c: *Cast) State {
@@ -186,24 +215,20 @@ pub const Cast = struct {
         device: []const u8,
         opts: castig.session.Options,
     ) !void {
-        std.debug.assert(c.future == null);
-        _ = c.arena.reset(.retain_capacity);
-        const arena = c.arena.allocator();
+        const arena = c.task.begin();
 
         var copy = opts;
         copy.source = try arena.dupe(u8, opts.source);
         if (opts.title) |t| copy.title = try arena.dupe(u8, t);
         if (opts.subtitles == .source) copy.subtitles = .{ .source = try arena.dupe(u8, opts.subtitles.source) };
 
-        c.win = win;
         {
             Io.Threaded.mutexLock(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             c.state = .{ .phase = .preparing };
             c.say("connecting to {s}", .{device});
         }
-        c.arrived.store(false, .monotonic);
-        c.future = try io.concurrent(run, .{ c, castig.Env{
+        try c.task.launch(io, win, run, .{ c, castig.Env{
             .io = io,
             .arena = arena,
             .gpa = gpa,
@@ -213,17 +238,13 @@ pub const Cast = struct {
     }
 
     /// Reaps the session thread once it has left, so a new cast can start.
+    /// Nothing drawn afterwards points into the arena, so it goes back.
     pub fn poll(c: *Cast, io: Io) void {
-        if (c.future == null or !c.arrived.load(.acquire)) return;
-        c.future.?.await(io);
-        c.future = null;
+        if (c.task.collect(io) == null) return;
+        c.task.release();
     }
 
     fn run(c: *Cast, env: castig.Env, device: []const u8, opts: castig.session.Options) void {
-        defer {
-            c.arrived.store(true, .release);
-            dvui.refresh(c.win, @src(), null);
-        }
         c.pump(env, device, opts) catch |err| {
             Io.Threaded.mutexLock(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
@@ -268,7 +289,7 @@ pub const Cast = struct {
                 },
             }
         }
-        dvui.refresh(c.win, @src(), null);
+        dvui.refresh(c.task.win, @src(), null);
     }
 
     /// The caller holds the mutex. A note longer than the buffer is cut.

@@ -35,10 +35,7 @@ pub const std_options: std.Options = .{
 /// themselves: only their warnings reach the terminal.
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
     if (level == .debug) return;
-    const library = switch (scope) {
-        .cast, .subs, .http, .hls => true,
-        else => false,
-    };
+    const library = comptime castig.ownScope(scope);
     if (library) messages.add(level, format, args);
     if (library or level != .info) dvui.App.logFn(level, scope, format, args);
 }
@@ -51,9 +48,17 @@ const Messages = struct {
     const capacity = 8;
     const width = 200;
 
+    const Line = struct {
+        buf: [width]u8 = @splat(0),
+        len: usize = 0,
+
+        fn text(l: *const Line) []const u8 {
+            return l.buf[0..l.len];
+        }
+    };
+
     mutex: Io.Mutex = .init,
-    lines: [capacity][width]u8 = @splat(@splat(0)),
-    lens: [capacity]usize = @splat(0),
+    lines: [capacity]Line = @splat(.{}),
     next: usize = 0,
     count: usize = 0,
 
@@ -66,42 +71,52 @@ const Messages = struct {
             else => "",
         };
         const line = &m.lines[m.next];
-        const written = std.fmt.bufPrint(line, prefix ++ format, args) catch line[0..];
-        m.lens[m.next] = written.len;
+        const written = std.fmt.bufPrint(&line.buf, prefix ++ format, args) catch line.buf[0..];
+        line.len = written.len;
         m.next = (m.next + 1) % capacity;
         m.count = @min(m.count + 1, capacity);
     }
 
     /// Copies out, so a line cannot change while it is being drawn.
-    fn read(m: *Messages, out: *[capacity][width]u8, lens: *[capacity]usize) usize {
+    fn read(m: *Messages, out: *[capacity]Line) usize {
         Io.Threaded.mutexLock(&m.mutex);
         defer Io.Threaded.mutexUnlock(&m.mutex);
         const first = (m.next + capacity - m.count) % capacity;
-        for (0..m.count) |i| {
-            const slot = (first + i) % capacity;
-            out[i] = m.lines[slot];
-            lens[i] = m.lens[slot];
-        }
+        for (0..m.count) |i| out[i] = m.lines[(first + i) % capacity];
         return m.count;
     }
 };
 
-const Subtitles = enum {
-    sidecar,
-    download,
-    file,
+/// The library's own choices, so a variant added there is a compile error
+/// here instead of a row that maps to the wrong thing.
+const Subtitles = std.meta.Tag(castig.session.Subtitles);
 
-    /// In the order of the enum, which is what the dropdown returns.
-    const labels: []const []const u8 = &.{
-        "sidecar next to the video",
-        "sidecar, else download",
-        "choose a file ...",
-    };
+const subtitle_labels: std.EnumArray(Subtitles, []const u8) = .init(.{
+    .sidecar = "sidecar next to the video",
+    .download = "sidecar, else download",
+    .source = "choose a file ...",
+});
 
-    comptime {
-        std.debug.assert(labels.len == @typeInfo(@This()).@"enum".field_names.len);
+const remux_labels: std.EnumArray(castig.delivery.Remux, []const u8) = .init(.{
+    .auto = "auto (hls, then mp4)",
+    .hls = "hls (seekable, instant)",
+    .mp4 = "mp4 (seekable, prepares)",
+    .stream = "stream (instant, no seek)",
+});
+
+/// "English (en)" per code, laid out at compile time.
+const language_names: [castig.language.codes.len][]const u8 = blk: {
+    @setEvalBranchQuota(20000);
+    var out: [castig.language.codes.len][]const u8 = undefined;
+    for (castig.language.codes, &out) |code, *slot| {
+        slot.* = castig.language.name(code) ++ " (" ++ code ++ ")";
     }
+    break :blk out;
 };
+
+/// Filled once in `init`: a dropdown redraws every frame.
+var language_entries: [castig.language.codes.len + 1][]const u8 = undefined;
+var configured_label: [128]u8 = undefined;
 
 const App = struct {
     io: Io,
@@ -111,10 +126,16 @@ const App = struct {
 
     scan: work.Task(anyerror![]castig.discovery.Device),
     devices: []const castig.discovery.Device = &.{},
+    /// The dropdown's rows, named when the scan lands rather than per frame.
+    device_labels: []const []const u8 = &.{},
     device: ?usize = null,
 
     examine: work.Task(anyerror!castig.probe.Report),
-    report: ?castig.probe.Report = null,
+    /// The probe as the panel shows it, empty when the file cannot be read.
+    report: []const u8 = "",
+    /// The video's frame rate, which ranks the subtitle candidates.
+    fps: ?f64 = null,
+    readable: bool = false,
     /// Owned here: the dialog's string outlives the task that probes it.
     path: ?[:0]const u8 = null,
 
@@ -122,18 +143,15 @@ const App = struct {
     subtitle_path: ?[:0]const u8 = null,
     remux: castig.delivery.Remux = .auto,
 
-    /// The config's language order, read once, for the chooser's default.
-    settings: std.heap.ArenaAllocator,
-    languages: []const []const u8 = &.{"en"},
-    /// Which language to search in: null takes the config's order. The task
-    /// reads the override from here, so it outlives the frame.
+    /// Which language to search in: null takes the config's order.
     language: ?usize = null,
-    override: [1][]const u8 = .{""},
 
     /// An OpenSubtitles search, open until the picker closes: the ranked
     /// candidates and the HTTP client live as long as the `Lookup` does.
     search: work.Task(anyerror!castig.subs.Lookup),
     lookup: ?castig.subs.Lookup = null,
+    /// One row per candidate, written when the search lands.
+    rows: []const []const u8 = &.{},
     picking: bool = false,
     /// One download at a time: each spends one of the day's allowance.
     fetch: work.Task(anyerror!castig.subs.Saved),
@@ -174,14 +192,33 @@ fn init(win: *dvui.Window) !void {
         .control = .init(process.gpa),
         .search = .init(process.gpa),
         .fetch = .init(process.gpa),
-        .settings = .init(process.gpa),
     };
     castig.av_extra.quietLibav();
-    // Only for what the chooser shows: a search loads the config itself.
-    if (castig.subs.config.load(app.settings.allocator(), app.io, app.environ)) |cfg| {
-        app.languages = cfg.languages;
-    } else |err| std.log.warn("cannot read the config: {s}", .{@errorName(err)});
+    try nameLanguages();
     try startScan();
+}
+
+/// The chooser's first row names the configured order, which only a search
+/// otherwise reads; the config is not kept past that one label.
+fn nameLanguages() !void {
+    var scratch: std.heap.ArenaAllocator = .init(app.gpa);
+    defer scratch.deinit();
+
+    var w: Io.Writer = .fixed(&configured_label);
+    w.writeAll("as configured (") catch {};
+    if (castig.subs.config.load(scratch.allocator(), app.io, app.environ)) |cfg| {
+        for (cfg.languages, 0..) |l, i| {
+            if (i > 0) w.writeAll(", ") catch {};
+            w.writeAll(l) catch {};
+        }
+    } else |err| {
+        std.log.warn("cannot read the config: {s}", .{@errorName(err)});
+        w.writeAll("en") catch {};
+    }
+    w.writeAll(")") catch {};
+
+    language_entries[0] = w.buffered();
+    @memcpy(language_entries[1..], &language_names);
 }
 
 fn deinit(_: *dvui.Window) void {
@@ -192,13 +229,13 @@ fn deinit(_: *dvui.Window) void {
     app.fetch.deinit(app.io);
     closeSearch();
     app.search.deinit(app.io);
-    app.settings.deinit();
     if (app.path) |p| app.gpa.free(p);
     if (app.subtitle_path) |p| app.gpa.free(p);
 }
 
 fn startScan() !void {
     app.devices = &.{};
+    app.device_labels = &.{};
     app.device = null;
     app.device_spec_len = 0;
     try app.scan.start(app.io, app.win, castig.discovery.discover, .{
@@ -232,19 +269,25 @@ fn frame() !dvui.App.Result {
     return .ok;
 }
 
-/// Picks up whatever the background calls finished since the last frame.
+/// Picks up whatever the background calls finished since the last frame, and
+/// writes out what a panel would otherwise format again every frame.
 fn collect() void {
     if (app.scan.collect(app.io)) |result| {
         if (result) |found| {
             app.devices = found;
+            app.device_labels = nameDevices(app.scan.allocator(), found) catch &.{};
             if (found.len > 0) selectDevice(0);
         } else |err| std.log.err("discovery failed: {s}", .{@errorName(err)});
     }
     if (app.examine.collect(app.io)) |result| {
-        app.report = result catch |err| blk: {
-            std.log.err("cannot read the file: {s}", .{@errorName(err)});
-            break :blk null;
-        };
+        app.report = "";
+        app.fps = null;
+        app.readable = false;
+        if (result) |r| {
+            app.readable = true;
+            app.fps = videoFps(r);
+            app.report = describeReport(app.examine.allocator(), r) catch "";
+        } else |err| std.log.err("cannot read the file: {s}", .{@errorName(err)});
     }
     if (app.control.collect(app.io)) |result| {
         result catch |err| std.log.err("{s}", .{@errorName(err)});
@@ -252,14 +295,51 @@ fn collect() void {
     if (app.search.collect(app.io)) |result| {
         // The library says on its way out why it found nothing.
         app.lookup = result catch null;
+        if (app.lookup) |l| app.rows = describeCandidates(app.search.allocator(), l) catch &.{};
         // Closed while it searched: there is nothing to show it in.
         if (app.lookup == null or !app.picking) closePicker();
     }
     if (app.fetch.collect(app.io)) |result| {
-        if (result) |saved| takeSaved(saved) catch |err| std.log.err("{s}", .{@errorName(err)})
-        else |err| std.log.err("{s}", .{@errorName(err)});
+        const outcome: anyerror!void = if (result) |saved| takeSaved(saved) else |err| err;
+        outcome catch |err| std.log.err("{s}", .{@errorName(err)});
     }
     app.cast.poll(app.io);
+}
+
+fn nameDevices(arena: std.mem.Allocator, found: []const castig.discovery.Device) ![]const []const u8 {
+    const entries = try arena.alloc([]const u8, found.len);
+    for (found, entries) |d, *entry| {
+        entry.* = try std.fmt.allocPrint(arena, "{s} ({s})", .{ d.friendly_name, d.model });
+    }
+    return entries;
+}
+
+fn describeReport(arena: std.mem.Allocator, r: castig.probe.Report) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.writeAll(r.container);
+    if (r.duration) |secs| {
+        var buf: [16]u8 = undefined;
+        try w.print(", {s}", .{clock(&buf, secs)});
+    }
+    try w.writeAll("\n");
+    for (r.streams) |st| {
+        if (st.kind == .other) continue;
+        try w.print("  {f}\n", .{st});
+    }
+    try r.writeVerdict(w);
+    return out.written();
+}
+
+fn describeCandidates(arena: std.mem.Allocator, l: castig.subs.Lookup) ![]const []const u8 {
+    const many = l.manyFeatures();
+    const rows = try arena.alloc([]const u8, l.candidates.len);
+    for (l.candidates, rows) |c, *row| {
+        var out: Io.Writer.Allocating = .init(arena);
+        try c.write(&out.writer, many);
+        row.* = out.written();
+    }
+    return rows;
 }
 
 fn selectDevice(index: usize) void {
@@ -281,13 +361,8 @@ fn devicePanel() !void {
     } else if (app.devices.len == 0) {
         dvui.label(@src(), "none found", .{}, .{ .gravity_y = 0.5 });
     } else {
-        const arena = dvui.currentWindow().arena();
-        const entries = try arena.alloc([]const u8, app.devices.len);
-        for (app.devices, entries) |d, *entry| {
-            entry.* = try std.fmt.allocPrint(arena, "{s} ({s})", .{ d.friendly_name, d.model });
-        }
         var choice = app.device orelse 0;
-        if (dvui.dropdown(@src(), entries, .{ .choice = &choice }, .{}, .{ .min_size_content = .{ .w = 240 }, .gravity_y = 0.5 })) {
+        if (dvui.dropdown(@src(), app.device_labels, .{ .choice = &choice }, .{}, .{ .min_size_content = .{ .w = 240 }, .gravity_y = 0.5 })) {
             selectDevice(choice);
         }
     }
@@ -315,11 +390,14 @@ fn sourcePanel() !void {
     }
     if (app.path == null) return;
 
-    if (app.report) |r| {
-        reportPanel(r);
-    } else {
+    if (!app.readable) {
         dvui.label(@src(), "this file cannot be read", .{}, .{ .style = .err });
         return;
+    }
+    {
+        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .margin = dvui.Rect{ .y = 6, .h = 6 } });
+        defer tl.deinit();
+        tl.addText(app.report, .{});
     }
 
     {
@@ -328,29 +406,22 @@ fn sourcePanel() !void {
 
         dvui.label(@src(), "Subtitles", .{}, .{ .gravity_y = 0.5 });
         var subs: usize = @intFromEnum(app.subtitles);
-        if (dvui.dropdown(@src(), Subtitles.labels, .{ .choice = &subs }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
+        if (dvui.dropdown(@src(), &subtitle_labels.values, .{ .choice = &subs }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
             app.subtitles = @enumFromInt(subs);
-            if (app.subtitles == .file) try openSubtitle();
+            if (app.subtitles == .source) try openSubtitle();
         }
-        if (app.subtitles == .file) {
+        if (app.subtitles == .source) {
             const name = if (app.subtitle_path) |p| Io.Dir.path.basename(p) else "none chosen";
             dvui.label(@src(), "{s}", .{name}, .{ .gravity_y = 0.5 });
         }
-
     }
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer row.deinit();
 
         dvui.label(@src(), "Language", .{}, .{ .gravity_y = 0.5 });
-        const arena = dvui.currentWindow().arena();
-        const entries = try arena.alloc([]const u8, castig.language.codes.len + 1);
-        entries[0] = try std.fmt.allocPrint(arena, "as configured ({s})", .{try std.mem.join(arena, ", ", app.languages)});
-        for (castig.language.codes, entries[1..]) |code, *entry| {
-            entry.* = try std.fmt.allocPrint(arena, "{s} ({s})", .{ castig.language.name(code), code });
-        }
         var choice: usize = if (app.language) |i| i + 1 else 0;
-        if (dvui.dropdown(@src(), entries, .{ .choice = &choice }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
+        if (dvui.dropdown(@src(), &language_entries, .{ .choice = &choice }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
             app.language = if (choice == 0) null else choice - 1;
         }
 
@@ -365,52 +436,15 @@ fn sourcePanel() !void {
 
         dvui.label(@src(), "Remux", .{}, .{ .gravity_y = 0.5 });
         var mode: usize = @intFromEnum(app.remux);
-        if (dvui.dropdown(@src(), remux_labels, .{ .choice = &mode }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
+        if (dvui.dropdown(@src(), &remux_labels.values, .{ .choice = &mode }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
             app.remux = @enumFromInt(mode);
         }
 
-        const ready = app.report != null and app.device != null and !app.cast.busy();
+        const ready = app.readable and app.device != null and !app.cast.busy();
         if (dvui.button(@src(), "Cast", .{ .grayed = !ready }, .{ .gravity_x = 1, .gravity_y = 0.5 }) and ready) {
             try startCast();
         }
     }
-}
-
-/// In the order of `castig.delivery.Remux`, which the dropdown returns.
-const remux_labels: []const []const u8 = &.{
-    "auto (hls, then mp4)",
-    "hls (seekable, instant)",
-    "mp4 (seekable, prepares)",
-    "stream (instant, no seek)",
-};
-
-comptime {
-    std.debug.assert(remux_labels.len == @typeInfo(castig.delivery.Remux).@"enum".field_names.len);
-}
-
-fn reportPanel(r: castig.probe.Report) void {
-    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .margin = dvui.Rect{ .y = 6, .h = 6 } });
-    defer tl.deinit();
-
-    tl.format("{s}", .{r.container}, .{});
-    if (r.duration) |secs| {
-        var buf: [16]u8 = undefined;
-        tl.format(", {s}", .{clock(&buf, secs)}, .{});
-    }
-    tl.addText("\n", .{});
-
-    for (r.streams) |s| {
-        if (s.kind == .other) continue;
-        tl.format("  {s} {s}", .{ s.type_name, s.codec }, .{});
-        if (s.language) |l| tl.format(" [{s}]", .{l}, .{});
-        if (s.video) |v| tl.format(" {d}x{d} {d:.3} fps", .{ v.width, v.height, v.fps }, .{});
-        if (s.audio) |a| tl.format(" {d} ch {d} Hz", .{ a.channels, a.sample_rate }, .{});
-        if (s.support) |sup| tl.format(" -> {s}", .{sup.label()}, .{});
-        if (s.kind == .subtitle) tl.addText(if (s.text) " -> webvtt" else " -> bitmap, burn-in only", .{});
-        tl.addText("\n", .{});
-    }
-
-    if (!r.castable()) tl.addText("nothing to cast", .{});
 }
 
 fn playbackPanel() !void {
@@ -420,14 +454,16 @@ fn playbackPanel() !void {
         return;
     }
 
-    dvui.label(@src(), "{s}", .{state.note()}, .{ .expand = .horizontal });
+    dvui.label(@src(), "{s}", .{state.note()}, .{
+        .expand = .horizontal,
+        .style = if (state.phase == .failed) .err else .content,
+    });
 
     if (app.cast.progress.fraction()) |done| {
         {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
             defer row.deinit();
 
-            // The label names what is counted, so the count belongs beside it.
             dvui.label(@src(), "{s}", .{app.cast.progress.label}, .{ .gravity_y = 0.5 });
             const counted = app.cast.progress.done.load(.monotonic);
             const total = app.cast.progress.total.load(.monotonic);
@@ -473,12 +509,12 @@ fn playbackPanel() !void {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = dvui.Rect{ .y = 6 } });
         defer row.deinit();
 
-        if (dvui.button(@src(), "-10", .{}, .{})) try seek("-10");
+        if (dvui.button(@src(), "-10", .{}, .{})) try dispatch(runSeek, .{"-10"});
         const paused = state.player == .PAUSED;
         if (dvui.button(@src(), if (paused) "Play" else "Pause", .{}, .{ .min_size_content = .{ .w = 60 } })) {
-            try command(if (paused) "PLAY" else "PAUSE");
+            try dispatch(runCommand, .{if (paused) "PLAY" else "PAUSE"});
         }
-        if (dvui.button(@src(), "+10", .{}, .{})) try seek("+10");
+        if (dvui.button(@src(), "+10", .{}, .{})) try dispatch(runSeek, .{"+10"});
 
         // The receiver's rate only when nobody is dragging: it would undo
         // the drag on the frame that sends it.
@@ -492,25 +528,22 @@ fn playbackPanel() !void {
             app.rate_pending = true;
         } else if (app.rate_pending) {
             app.rate_pending = false;
-            try setRate(app.rate);
+            try dispatch(runRate, .{@as(f64, app.rate)});
         }
 
-        if (dvui.button(@src(), "Stop", .{}, .{ .gravity_x = 1 })) try stop();
+        if (dvui.button(@src(), "Stop", .{}, .{ .gravity_x = 1 })) try dispatch(runStop, .{});
     }
 }
 
 fn messagePanel() void {
-    var lines: [Messages.capacity][Messages.width]u8 = undefined;
-    var lens: [Messages.capacity]usize = undefined;
-    const count = messages.read(&lines, &lens);
+    var lines: [Messages.capacity]Messages.Line = undefined;
+    const count = messages.read(&lines);
     if (count == 0) return;
 
     _ = dvui.separator(@src(), .{ .expand = .horizontal, .margin = dvui.Rect{ .y = 10, .h = 6 } });
     var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .font = .theme(.mono) });
     defer tl.deinit();
-    for (0..count) |i| {
-        tl.format("{s}\n", .{lines[i][0..lens[i]]}, .{});
-    }
+    for (lines[0..count]) |line| tl.format("{s}\n", .{line.text()}, .{});
 }
 
 /// A ranked OpenSubtitles search, shown as a list to pick from. The video's
@@ -529,22 +562,19 @@ fn startSearch() !void {
             .environ = app.environ,
         },
         @as([]const u8, path),
-        castig.subs.Options{ .fps = videoFps(), .languages = languageOverride() },
+        castig.subs.Options{ .fps = app.fps, .languages = languageOverride() },
     });
 }
 
 /// The one language to search in, or null to leave the config's order. The
-/// slice is the app's, because the call outlives this frame.
+/// codes are comptime, so the slice outlives the call by itself.
 fn languageOverride() ?[]const []const u8 {
     const chosen = app.language orelse return null;
-    app.override[0] = castig.language.codes[chosen];
-    return app.override[0..1];
+    return castig.language.codes[chosen..][0..1];
 }
 
-/// The frame rate of the probed video, when it has one.
-fn videoFps() ?f64 {
-    const report = app.report orelse return null;
-    for (report.streams) |st| if (st.video) |v| return v.fps;
+fn videoFps(r: castig.probe.Report) ?f64 {
+    for (r.streams) |st| if (st.video) |v| return v.fps;
     return null;
 }
 
@@ -561,11 +591,15 @@ fn closeSearch() void {
 }
 
 /// Ends the search: the client is the `Lookup`'s to close, and the arena
-/// behind the candidates is reset by the next search.
+/// under the reply goes back now rather than at the next search, which may
+/// never come. A download saves its path there, so callers wait for it.
 fn closePicker() void {
+    std.debug.assert(!app.fetch.busy());
     if (app.lookup) |*l| l.deinit();
     app.lookup = null;
+    app.rows = &.{};
     app.picking = false;
+    app.search.release();
 }
 
 /// What the download left behind: the file to side-load on the next cast.
@@ -573,7 +607,7 @@ fn takeSaved(saved: castig.subs.Saved) !void {
     const path = try app.gpa.dupeSentinel(u8, saved.path, 0);
     if (app.subtitle_path) |p| app.gpa.free(p);
     app.subtitle_path = path;
-    app.subtitles = .file;
+    app.subtitles = .source;
     if (saved.remaining) |n| {
         std.log.info("saved {s} ({d} downloads left today)", .{ Io.Dir.path.basename(path), n });
     } else {
@@ -601,40 +635,32 @@ fn subtitlePanel() !void {
         return;
     }
 
-    if (app.search.busy()) {
+    if (pickerWait()) |note| {
         dvui.spinner(@src(), .{ .gravity_x = 0.5, .gravity_y = 0.5 });
-        dvui.label(@src(), "searching OpenSubtitles ...", .{}, .{ .gravity_x = 0.5 });
+        dvui.label(@src(), "{s}", .{note}, .{ .gravity_x = 0.5 });
         return;
     }
-    // Before the candidates are read: the download mutates the `Lookup` it
-    // runs on, so this thread leaves it alone until it is over.
-    if (app.fetch.busy()) {
-        dvui.spinner(@src(), .{ .gravity_x = 0.5, .gravity_y = 0.5 });
-        dvui.label(@src(), "downloading ...", .{}, .{ .gravity_x = 0.5 });
-        return;
-    }
-    const candidates = if (app.lookup) |l| l.candidates else return;
+    if (app.lookup == null) return;
 
     dvui.label(@src(), "each download spends one of the day's allowance", .{}, .{ .expand = .horizontal });
 
     var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
     defer scroll.deinit();
 
-    // Only worth naming the film or episode when the results disagree about
-    // which one it is.
-    var feature: ?u64 = null;
-    var many = false;
-    for (candidates) |c| {
-        const id = c.feature_id orelse continue;
-        if (feature) |first| many = many or first != id else feature = id;
-    }
-
-    const arena = dvui.currentWindow().arena();
-    for (candidates, 0..) |c, i| {
-        if (try candidateButton(try describe(arena, c, many), i)) {
+    for (app.rows, 0..) |row, i| {
+        if (try candidateButton(row, i)) {
             try app.fetch.start(app.io, app.win, take, .{ &app.lookup.?, i });
         }
     }
+}
+
+/// What the picker is waiting for, or null when it can show the list. A
+/// download mutates the `Lookup` it runs on, so this thread leaves the
+/// candidates alone until it is over.
+fn pickerWait() ?[]const u8 {
+    if (app.search.busy()) return "searching OpenSubtitles ...";
+    if (app.fetch.busy()) return "downloading ...";
+    return null;
 }
 
 /// A full-width button with its label on the left, which `dvui.button`
@@ -652,26 +678,6 @@ fn candidateButton(label: []const u8, index: usize) !bool {
     return clicked;
 }
 
-/// One candidate on one line: what vouches for it, then what it is.
-fn describe(arena: std.mem.Allocator, c: castig.subs.Candidate, many: bool) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    const w = &out.writer;
-    switch (c.hash) {
-        .voted => try w.writeAll("[HASH] "),
-        .match => try w.writeAll("[HASH?] "),
-        .none => {},
-    }
-    try w.print("[{s}]", .{c.lang});
-    if (c.hi) try w.writeAll(" [HI]");
-    if (c.ai) try w.writeAll(" [AI]");
-    try w.print(" {d} dl", .{c.downloads});
-    if (c.fps_mismatch) if (c.fps) |f| try w.print(", {d} fps", .{f});
-    try w.writeAll(" \u{b7} ");
-    if (many) if (c.feature) |f| try w.print("{s} \u{b7} ", .{f});
-    try w.writeAll(c.release);
-    return out.written();
-}
-
 fn take(lookup: *castig.subs.Lookup, index: usize) anyerror!castig.subs.Saved {
     return lookup.take(index);
 }
@@ -685,7 +691,9 @@ fn openFile() !void {
 
     if (app.path) |p| app.gpa.free(p);
     app.path = chosen;
-    app.report = null;
+    app.report = "";
+    app.readable = false;
+    app.fps = null;
     try app.examine.start(app.io, app.win, castig.probe.inspect, .{ app.examine.allocator(), @as([]const u8, chosen) });
 }
 
@@ -710,37 +718,24 @@ fn startCast() !void {
         .subtitles = switch (app.subtitles) {
             .sidecar => .sidecar,
             .download => .download,
-            .file => if (app.subtitle_path) |p| .{ .source = p } else .sidecar,
+            .source => if (app.subtitle_path) |p| .{ .source = p } else .sidecar,
         },
     });
 }
 
-/// One command at a time: a click while one is in flight is dropped.
-fn command(verb: []const u8) !void {
+/// One command at a time: a click while one is in flight is dropped. Every
+/// command opens its own connection to whatever is playing.
+fn dispatch(comptime func: anytype, extra: anytype) !void {
     if (app.control.busy()) return;
-    try app.control.start(app.io, app.win, runCommand, .{ controlEnv(), app.spec(), verb });
-}
-
-fn seek(spec: []const u8) !void {
-    if (app.control.busy()) return;
-    try app.control.start(app.io, app.win, runSeek, .{ controlEnv(), app.spec(), spec });
+    try app.control.start(app.io, app.win, func, .{ controlEnv(), app.spec() } ++ extra);
 }
 
 /// An absolute seek. The busy check also keeps the buffer from changing
 /// under a command in flight.
 fn seekTo(seconds: f64) !void {
     if (app.control.busy() or !std.math.isFinite(seconds)) return;
-    try seek(std.fmt.bufPrint(&app.seek_spec, "{d:.0}", .{seconds}) catch return);
-}
-
-fn setRate(value: f32) !void {
-    if (app.control.busy()) return;
-    try app.control.start(app.io, app.win, runRate, .{ controlEnv(), app.spec(), @as(f64, value) });
-}
-
-fn stop() !void {
-    if (app.control.busy()) return;
-    try app.control.start(app.io, app.win, runStop, .{ controlEnv(), app.spec() });
+    const spec = std.fmt.bufPrint(&app.seek_spec, "{d:.0}", .{seconds}) catch return;
+    try dispatch(runSeek, .{spec});
 }
 
 fn controlEnv() castig.Env {
