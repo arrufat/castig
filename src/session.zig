@@ -13,8 +13,8 @@ const av = @import("av");
 
 const Env = @import("env.zig").Env;
 const Player = @import("device/player.zig").Player;
-const playback = @import("device/playback.zig");
 const discovery = @import("device/discovery.zig");
+const playback = @import("device/playback.zig");
 const extra = @import("media/av_extra.zig");
 const pipeline = @import("media/pipeline.zig");
 const http = @import("serve/server.zig");
@@ -40,6 +40,9 @@ pub const Options = struct {
     content_type: ?[]const u8 = null,
     subtitles: Subtitles = .sidecar,
     remux: delivery.Remux = .auto,
+    /// Which kind of device the name means, when the name alone is
+    /// ambiguous. A `cast:` or `dlna:` prefix on the spec says the same.
+    protocol: ?discovery.Protocol = null,
 };
 
 pub const Event = union(enum) {
@@ -61,7 +64,7 @@ pub const Session = struct {
     env: Env,
     opts: Options,
     local: bool,
-    address: net.Ip4Address,
+    endpoint: discovery.Endpoint,
     player: Player,
     routes: delivery.Routes,
     server: ?*http.Server = null,
@@ -87,7 +90,7 @@ pub const Session = struct {
         const local = !delivery.isUrl(opts.source);
 
         // Discovery waits on the network while the file is probed and prepared.
-        var resolving = io.async(discovery.resolve, .{ io, env.gpa, device });
+        var resolving = io.async(discovery.resolve, .{ env, device, opts.protocol });
         var resolved = false;
         defer if (!resolved) {
             _ = resolving.cancel(io) catch {};
@@ -101,7 +104,7 @@ pub const Session = struct {
             .env = env,
             .opts = opts,
             .local = local,
-            .address = undefined,
+            .endpoint = undefined,
             .player = undefined,
             .routes = .{ .env = env, .source = opts.source },
             .target = .{ .path = opts.source, .content_type = content_type },
@@ -160,11 +163,11 @@ pub const Session = struct {
         if (sub_source) |sub| try s.routes.addSideloaded(sub.path, sub.lang);
 
         resolved = true;
-        s.address = try resolving.await(io);
+        s.endpoint = try resolving.await(io);
 
         // Connect after the heavy work: the receiver drops a channel whose
         // heartbeat PINGs go unanswered during a long mp4 build.
-        s.player = try Player.connect(env, s.address);
+        s.player = try Player.connect(env, s.endpoint);
         errdefer s.player.deinit();
 
         if (s.routes.list.items.len > 0) {
@@ -228,7 +231,7 @@ pub const Session = struct {
             .duration = s.duration,
             .hls = s.target.isHls(),
         });
-        s.push(.{ .loaded = .{ .address = s.address, .content_type = s.target.content_type } });
+        s.push(.{ .loaded = .{ .address = s.endpoint.address(), .content_type = s.target.content_type } });
         s.push(.{ .state = s.media });
     }
 
@@ -245,7 +248,7 @@ pub const Session = struct {
         s.target = try s.routes.addMp4(try extra.openInput(s.env.gpa, s.opts.source));
         try s.routes.absolutise(s.base, &s.target, s.local);
         if (s.server) |server| server.setRoutes(s.routes.list.items);
-        s.player = try Player.connect(s.env, s.address);
+        s.player = try Player.connect(s.env, s.endpoint);
         try s.load();
         return true;
     }

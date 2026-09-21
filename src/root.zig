@@ -3,7 +3,7 @@
 
 /// The scopes the library logs under. A front end that shows the library's
 /// own explanations asks here, so a new module reaches it without an edit.
-pub const log_scopes = [_]@EnumLiteral(){ .cast, .subs, .http, .hls };
+pub const log_scopes = [_]@EnumLiteral(){ .cast, .dlna, .subs, .http, .hls };
 
 /// Whether a log scope is one of the library's own.
 pub fn ownScope(comptime scope: @EnumLiteral()) bool {
@@ -34,6 +34,10 @@ pub const discovery = @import("device/discovery.zig");
 pub const dns = @import("device/dns.zig");
 /// XML: element scanner, text and attribute lookup, escaping.
 pub const xml = @import("device/xml.zig");
+/// One round of multicast discovery, shared by mDNS and SSDP.
+pub const sweep = @import("device/sweep.zig");
+/// UPnP AV: SSDP discovery today, SOAP control next.
+pub const dlna = @import("device/dlna.zig");
 
 /// What a receiver can play, by codec name.
 pub const support = @import("media/support.zig");
@@ -74,6 +78,8 @@ test {
     _ = discovery;
     _ = dns;
     _ = xml;
+    _ = sweep;
+    _ = dlna;
     _ = support;
     _ = probe;
     _ = pipeline;

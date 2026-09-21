@@ -1,14 +1,18 @@
-//! `castig ls`: find Cast receivers with an mDNS query for `_googlecast._tcp`.
+//! `castig ls`: find the devices castig can drive, of either kind.
 //!
-//! The query sets the unicast-response bit, so receivers answer straight to
-//! our socket and we never need to join the 224.0.0.251 multicast group.
-//! Should a device ignore that bit, the fallback is IP_ADD_MEMBERSHIP on
-//! `Socket.handle` plus binding port 5353 with SO_REUSEADDR.
+//! Cast receivers answer an mDNS query for `_googlecast._tcp`; UPnP AV
+//! renderers answer an SSDP M-SEARCH. Both rounds are `sweep.run` with a
+//! different packet, and neither joins its multicast group. See `sweep.zig`
+//! for why that works and what the fallback would be.
 
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+
+const Env = @import("../env.zig").Env;
 const dns = @import("dns.zig");
+const ssdp = @import("dlna/ssdp.zig");
+const sweep = @import("sweep.zig");
 
 const log = std.log.scoped(.cast);
 
@@ -17,23 +21,62 @@ pub const default_port: u16 = 8009;
 pub const default_timeout_ms: u32 = 2000;
 
 const mdns_group: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 224, 0, 0, 251 }, .port = 5353 } };
-/// RFC 6762 §17: mDNS messages fit in 9000 bytes.
-const max_packet = 9000;
+
+/// What a device speaks. The spec a user types may name it, `cast:living
+/// room`, when a name alone would be ambiguous.
+pub const Protocol = enum {
+    cast,
+    dlna,
+
+    /// The prefix that forces this protocol, and what `ls` prints.
+    pub fn label(p: Protocol) []const u8 {
+        return @tagName(p);
+    }
+};
+
+/// A device to connect to, once its address is known.
+pub const Endpoint = union(enum) {
+    cast: net.Ip4Address,
+    dlna: struct {
+        address: net.Ip4Address,
+        /// The description URL; the renderer reads it for its control URLs.
+        location: []const u8,
+    },
+
+    pub fn protocol(e: Endpoint) Protocol {
+        return switch (e) {
+            .cast => .cast,
+            .dlna => .dlna,
+        };
+    }
+
+    /// Where the device is, for a message or for the base URL we serve on.
+    pub fn address(e: Endpoint) net.Ip4Address {
+        return switch (e) {
+            .cast => |a| a,
+            .dlna => |d| d.address,
+        };
+    }
+};
 
 pub const Device = struct {
-    /// Receiver id from the TXT record ("id"). Stable across reboots.
+    protocol: Protocol,
+    /// Cast: the TXT "id", stable across reboots. DLNA: the UDN.
     id: []const u8,
-    /// User-visible name ("fn"), e.g. "Living Room speaker".
+    /// User-visible name: Cast's "fn", or DLNA's `<friendlyName>`.
     friendly_name: []const u8,
-    /// Model ("md"), e.g. "Pixel Tablet".
+    /// Cast's "md", or DLNA's manufacturer and model.
     model: []const u8,
     address: net.Ip4Address,
+    /// DLNA only: the description URL, which also names it as a `<device>`.
+    location: []const u8 = "",
 
     /// Frees the strings the device owns.
     pub fn deinit(d: Device, gpa: std.mem.Allocator) void {
         gpa.free(d.id);
         gpa.free(d.friendly_name);
         gpa.free(d.model);
+        gpa.free(d.location);
     }
 
     /// Case-insensitive fragment of the friendly name or model, or a prefix
@@ -43,45 +86,112 @@ pub const Device = struct {
             std.ascii.findIgnoreCase(d.model, spec) != null or
             std.mem.startsWith(u8, d.id, spec);
     }
+
+    /// How to name this device back to castig, unambiguously.
+    pub fn endpoint(d: Device) Endpoint {
+        return switch (d.protocol) {
+            .cast => .{ .cast = d.address },
+            .dlna => .{ .dlna = .{ .address = d.address, .location = d.location } },
+        };
+    }
 };
 
-/// Sends one query and collects answers until `timeout_ms` elapses, or, when
-/// `wanted` is given, until a device matches it.
-pub fn discover(io: Io, gpa: std.mem.Allocator, timeout_ms: u32, wanted: ?[]const u8) ![]Device {
-    const bind_addr: net.IpAddress = .{ .ip4 = .unspecified(0) };
-    const sock = try bind_addr.bind(io, .{ .mode = .dgram });
-    defer sock.close(io);
+pub const Query = struct {
+    timeout_ms: u32 = default_timeout_ms,
+    /// Stop as soon as a device matches this spec.
+    match: ?[]const u8 = null,
+    /// Only this kind of device, or both when null.
+    protocol: ?Protocol = null,
+};
 
+/// Every device that answers within `q.timeout_ms`, of either kind.
+pub fn discover(io: Io, gpa: std.mem.Allocator, q: Query) ![]Device {
+    const want_cast = if (q.protocol) |p| p == .cast else true;
+    const want_dlna = if (q.protocol) |p| p == .dlna else true;
+
+    var found: std.ArrayList(Device) = .empty;
+    // Reverse order: the strings go first, while the list still holds them.
+    errdefer found.deinit(gpa);
+    errdefer freeDevices(gpa, found.items);
+
+    if (!want_dlna) {
+        try castScan(io, gpa, q, &found);
+        return found.toOwnedSlice(gpa);
+    }
+    if (!want_cast) {
+        try dlnaScan(io, gpa, q, &found);
+        return found.toOwnedSlice(gpa);
+    }
+
+    // Both rounds are mostly waiting on the network, so they overlap: `ls`
+    // costs one timeout rather than two.
+    var renderers: std.ArrayList(Device) = .empty;
+    errdefer renderers.deinit(gpa);
+    errdefer freeDevices(gpa, renderers.items);
+
+    var scanning = io.async(dlnaScan, .{ io, gpa, q, &renderers });
+    castScan(io, gpa, q, &found) catch |err| {
+        _ = scanning.cancel(io) catch {};
+        return err;
+    };
+    // A LAN with no renderer on it is the normal case, not a failure.
+    scanning.await(io) catch |err| log.debug("ssdp round failed: {s}", .{@errorName(err)});
+
+    try found.appendSlice(gpa, renderers.items);
+    // The strings belong to `found` now, so drop the second view of them
+    // before anything else can fail.
+    renderers.deinit(gpa);
+    renderers = .empty;
+
+    return found.toOwnedSlice(gpa);
+}
+
+/// The mDNS round.
+fn castScan(io: Io, gpa: std.mem.Allocator, q: Query, into: *std.ArrayList(Device)) !void {
     var query_buf: [64]u8 = undefined;
     const query = try dns.buildQuery(&query_buf, service, dns.Type.PTR, true);
-    try sock.send(io, &mdns_group, query);
+    var ctx: CastScan = .{ .gpa = gpa, .into = into, .match = q.match };
+    try sweep.run(io, .{
+        .group = mdns_group,
+        .queries = &.{query},
+        .timeout_ms = q.timeout_ms,
+    }, &ctx, CastScan.take);
+}
 
-    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake } };
-    const deadline = timeout.toDeadline(io);
+const CastScan = struct {
+    gpa: std.mem.Allocator,
+    into: *std.ArrayList(Device),
+    match: ?[]const u8,
 
-    var devices: std.ArrayList(Device) = .empty;
-    // Reverse order: the strings go first, while the list still holds them.
-    errdefer devices.deinit(gpa);
-    errdefer freeDevices(gpa, devices.items);
-    var packet: [max_packet]u8 = undefined;
-
-    while (true) {
-        const msg = sock.receiveTimeout(io, &packet, deadline) catch |err| switch (err) {
-            error.Timeout => break,
-            else => return err,
-        };
-        const from: ?net.Ip4Address = switch (msg.from) {
-            .ip4 => |a| a,
-            .ip6 => null,
-        };
-        const added = parseResponse(gpa, msg.data, from, &devices) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            // A malformed packet from one device must not abort discovery.
-            else => continue,
-        };
-        if (added) if (wanted) |spec| if (devices.items[devices.items.len - 1].matches(spec)) break;
+    fn take(c: *CastScan, packet: []const u8, from: ?net.Ip4Address) anyerror!bool {
+        if (!try parseResponse(c.gpa, packet, from, c.into)) return false;
+        const spec = c.match orelse return false;
+        return c.into.items[c.into.items.len - 1].matches(spec);
     }
-    return devices.toOwnedSlice(gpa);
+};
+
+/// The SSDP round. Descriptions are read into a scratch arena and only what
+/// a `Device` keeps is copied out.
+fn dlnaScan(io: Io, gpa: std.mem.Allocator, q: Query, into: *std.ArrayList(Device)) !void {
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+
+    for (try ssdp.discover(io, gpa, scratch.allocator(), q.timeout_ms)) |r| {
+        const model = if (r.description.manufacturer.len > 0 and r.description.model.len > 0)
+            try std.mem.concat(scratch.allocator(), u8, &.{ r.description.manufacturer, " ", r.description.model })
+        else if (r.description.model.len > 0) r.description.model else r.description.manufacturer;
+
+        const device: Device = .{
+            .protocol = .dlna,
+            .id = try gpa.dupe(u8, r.description.udn),
+            .friendly_name = try gpa.dupe(u8, r.description.friendly_name),
+            .model = try gpa.dupe(u8, model),
+            .address = r.address,
+            .location = try gpa.dupe(u8, r.location),
+        };
+        errdefer device.deinit(gpa);
+        try into.append(gpa, device);
+    }
 }
 
 /// Frees each device in a slice; the slice itself is the caller's.
@@ -141,6 +251,8 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
     const bytes = ip orelse (from orelse return false).bytes;
 
     const dev: Device = .{
+        .protocol = .cast,
+        .location = try gpa.dupe(u8, ""),
         .id = id orelse try gpa.dupe(u8, ""),
         .friendly_name = friendly orelse try gpa.dupe(u8, instance orelse "?"),
         .model = model orelse try gpa.dupe(u8, ""),
@@ -161,27 +273,84 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
     return true;
 }
 
-/// Turns a device argument into an address: "192.168.1.39", "192.168.1.39:8009",
-/// or a case-insensitive fragment of the friendly name, model or id, which
-/// triggers a discovery round that ends at the first match.
-pub fn resolve(io: Io, gpa: std.mem.Allocator, spec: []const u8) !net.Ip4Address {
+/// Turns a device argument into an endpoint:
+///
+///   192.168.1.39             a Cast receiver, port 8009 unless given
+///   http://host:port/x.xml   a renderer, named by its description URL
+///   cast:living room         a name, with the protocol settled
+///   dlna:living room
+///   living room              a name; on a tie Cast wins, as it did before
+///                            renderers were a thing castig knew about
+pub fn resolve(env: Env, spec_in: []const u8, want_in: ?Protocol) !Endpoint {
+    var spec = spec_in;
+    var want = want_in;
+    inline for (@typeInfo(Protocol).@"enum".field_names) |name| {
+        if (std.mem.startsWith(u8, spec, name ++ ":")) {
+            want = @field(Protocol, name);
+            spec = std.mem.trim(u8, spec[name.len + 1 ..], " ");
+        }
+    }
+
+    if (std.mem.startsWith(u8, spec, "http://") or std.mem.startsWith(u8, spec, "https://")) {
+        const location = try env.arena.dupe(u8, spec);
+        const address = ssdp.addressOf(location, null) orelse {
+            log.warn("cannot tell an address from {s}", .{location});
+            return error.InvalidAddress;
+        };
+        return .{ .dlna = .{ .address = address, .location = location } };
+    }
+
     if (spec.len > 0 and std.ascii.isDigit(spec[0])) {
         const literal = net.IpAddress.parseLiteral(spec) catch return error.InvalidAddress;
         var address = switch (literal) {
             .ip4 => |a| a,
             .ip6 => return error.InvalidAddress,
         };
-        if (address.port == 0) address.port = default_port;
-        return address;
+        if ((want orelse .cast) == .cast) {
+            if (address.port == 0) address.port = default_port;
+            return .{ .cast = address };
+        }
+        // A renderer is named by its description URL, so go and find the
+        // one living at that address rather than guess a path.
+        if (try firstMatching(env, .{ .protocol = .dlna }, address)) |d| return d.endpoint();
+        log.warn("no renderer answered at {f}; try `castig ls`", .{address});
+        return error.DeviceNotFound;
     }
 
-    const devices = try discover(io, gpa, default_timeout_ms, spec);
-    defer gpa.free(devices);
-    defer freeDevices(gpa, devices);
-    for (devices) |d| if (d.matches(spec)) return d.address;
-    log.warn("no cast device matches \"{s}\"; try `castig ls`", .{spec});
+    // A name. Cast goes first: it is the quicker round, and it is what this
+    // spec already meant.
+    if (want != .dlna) {
+        if (try firstMatching(env, .{ .match = spec, .protocol = .cast }, null)) |d| return d.endpoint();
+    }
+    if (want != .cast) {
+        if (try firstMatching(env, .{ .match = spec, .protocol = .dlna }, null)) |d| return d.endpoint();
+    }
+    log.warn("no device matches \"{s}\"; try `castig ls`", .{spec});
     return error.DeviceNotFound;
 }
+
+/// One round, returning the first device that matches, copied into the
+/// arena because the round's own strings are freed on the way out.
+fn firstMatching(env: Env, q: Query, address: ?net.Ip4Address) !?Device {
+    const devices = try discover(env.io, env.gpa, q);
+    defer env.gpa.free(devices);
+    defer freeDevices(env.gpa, devices);
+
+    for (devices) |d| {
+        const hit = if (address) |a| std.mem.eql(u8, &d.address.bytes, &a.bytes) else d.matches(q.match.?);
+        if (!hit) continue;
+        return .{
+            .protocol = d.protocol,
+            .id = try env.arena.dupe(u8, d.id),
+            .friendly_name = try env.arena.dupe(u8, d.friendly_name),
+            .model = try env.arena.dupe(u8, d.model),
+            .address = d.address,
+            .location = try env.arena.dupe(u8, d.location),
+        };
+    }
+    return null;
+}
+
 
 test {
     std.testing.refAllDecls(@This());

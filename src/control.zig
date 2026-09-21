@@ -20,25 +20,28 @@ pub const Verb = player.Verb;
 
 pub const Status = struct {
     address: net.Ip4Address,
+    protocol: discovery.Protocol,
     device: player.DeviceStatus,
 };
 
 /// What `device` is doing: its volume, and on Cast the apps it runs.
 pub fn status(env: Env, device: []const u8) !Status {
-    const address = try discovery.resolve(env.io, env.gpa, device);
-    return .{ .address = address, .device = try player.deviceStatus(env, address) };
+    const endpoint = try discovery.resolve(env, device, null);
+    return .{
+        .address = endpoint.address(),
+        .protocol = endpoint.protocol(),
+        .device = try player.deviceStatus(env, endpoint),
+    };
 }
 
 /// Stops everything that is playing, and names what it stopped.
 pub fn stop(env: Env, device: []const u8) ![]const []const u8 {
-    const address = try discovery.resolve(env.io, env.gpa, device);
-    return player.stopAll(env, address);
+    return player.stopAll(env, try discovery.resolve(env, device, null));
 }
 
 /// Connects to whatever is playing on the device.
 fn open(env: Env, device: []const u8) !Player {
-    const address = try discovery.resolve(env.io, env.gpa, device);
-    return Player.attach(env, address);
+    return Player.attach(env, try discovery.resolve(env, device, null));
 }
 
 /// One transport command for whatever is playing.

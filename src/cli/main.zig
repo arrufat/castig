@@ -10,7 +10,7 @@ const usage =
     \\usage: castig <command> [args]
     \\
     \\commands:
-    \\  ls        discover cast devices on the local network
+    \\  ls        discover cast receivers and DLNA renderers on the network
     \\  probe     print a file's streams and whether it can be cast directly
     \\  status    show what the receiver is doing
     \\  cast      play a local file or a URL and follow playback
@@ -24,7 +24,7 @@ const usage =
     \\  version   print the version
     \\  help      show this message
     \\
-    \\<device> is an IP, IP:port, or part of a name shown by `ls`.
+    \\<device> is an IP, IP:port, a renderer URL, or part of a name shown\n    \\by `ls`. Prefix it with `cast:` or `dlna:` to settle an ambiguous name.
     \\
     \\Run `castig help <command>` for what a command takes.
     \\
@@ -67,6 +67,7 @@ pub fn main(init: std.process.Init) u8 {
         error.BadReply,
         error.ApiFailed,
         error.DeviceNotFound,
+        error.ProtocolNotSupported,
         error.SourceUnreadable,
         error.SaveFailed,
         error.NoCredentials,
@@ -121,15 +122,20 @@ fn run(init: std.process.Init) !void {
 
     switch (cmd) {
         .ls => {
-            var timeout_ms: u32 = castig.discovery.default_timeout_ms;
+            var query: castig.discovery.Query = .{};
             var i: usize = 2;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
                     i += 1;
-                    timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch fail("--timeout expects a number of milliseconds\n");
+                    query.timeout_ms = std.fmt.parseInt(u32, args[i], 10) catch fail("--timeout expects a number of milliseconds\n");
+                } else if (std.mem.eql(u8, args[i], "--protocol") and i + 1 < args.len) {
+                    i += 1;
+                    query.protocol = std.meta.stringToEnum(castig.discovery.Protocol, args[i]) orelse
+                        fail("--protocol expects cast or dlna\n");
                 } else fail(help(cmd));
             }
-            const found = try castig.discovery.discover(io, init.gpa, timeout_ms, null);
+            const timeout_ms = query.timeout_ms;
+            const found = try castig.discovery.discover(io, init.gpa, query);
             defer init.gpa.free(found);
             defer castig.discovery.freeDevices(init.gpa, found);
             try render.devices(out, found, timeout_ms);
@@ -247,11 +253,17 @@ fn helpTopic(cmd: Command, args: []const []const u8) ?Command {
 fn help(cmd: Command) []const u8 {
     return switch (cmd) {
         .ls =>
-        \\usage: castig ls [--timeout <ms>]
+        \\usage: castig ls [--timeout <ms>] [--protocol cast|dlna]
         \\
-        \\Discover cast devices on the local network over mDNS.
+        \\Find the devices castig can drive: Cast receivers over mDNS and
+        \\UPnP AV renderers over SSDP. Both rounds run at once.
         \\
-        \\  --timeout <ms>  how long to listen for replies (default 2000)
+        \\The last column is what to pass as <device>: an id for a Cast
+        \\receiver, a description URL for a renderer. Part of a name works
+        \\too, and `cast:name` or `dlna:name` settles one that matches both.
+        \\
+        \\  --timeout <ms>       how long to listen for replies (default 2000)
+        \\  --protocol cast|dlna only look for one kind
         \\
         ,
         .probe =>

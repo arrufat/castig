@@ -4,15 +4,18 @@ const std = @import("std");
 const Io = std.Io;
 const castig = @import("castig");
 
-/// The `ls` table, or advice when nothing answered.
+/// The `ls` table, or advice when nothing answered. The last column is the
+/// spec to paste back: an id for a Cast receiver, a URL for a renderer.
 pub fn devices(out: *Io.Writer, found: []const castig.discovery.Device, timeout_ms: u32) !void {
     if (found.len == 0) {
-        try out.print("no cast devices answered within {d} ms\n", .{timeout_ms});
-        try out.writeAll("(check with `avahi-browse -rt _googlecast._tcp`; if devices show there, they ignore unicast-response queries)\n");
+        try out.print("no devices answered within {d} ms\n", .{timeout_ms});
+        try out.writeAll("(cross-check with `avahi-browse -rt _googlecast._tcp` and `gssdp-discover`;\n");
+        try out.writeAll(" devices that show there but not here ignore unicast replies)\n");
         return;
     }
     for (found) |d| {
-        try out.print("{s}\t{s}\t{f}\t{s}\n", .{ d.friendly_name, d.model, d.address, d.id });
+        const spec = if (d.location.len > 0) d.location else d.id;
+        try out.print("{t}\t{s}\t{s}\t{f}\t{s}\n", .{ d.protocol, d.friendly_name, d.model, d.address, spec });
     }
 }
 
@@ -32,7 +35,7 @@ pub fn report(out: *Io.Writer, r: castig.probe.Report) !void {
 
 /// The `status` view: volume, the running app, and what it plays.
 pub fn status(out: *Io.Writer, s: castig.control.Status) !void {
-    try out.print("{f}\n", .{s.address});
+    try out.print("{f} ({t})\n", .{ s.address, s.protocol });
     if (s.device.volume) |v| {
         try out.print("  volume: {d:.0}%{s}\n", .{ v.level * 100, if (v.muted) " (muted)" else "" });
     }

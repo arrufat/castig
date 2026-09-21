@@ -173,8 +173,9 @@ const App = struct {
     /// it cannot be a frame's stack buffer.
     seek_spec: [32]u8 = @splat(0),
 
-    /// The spec the calls take; an address needs no allocation to name.
-    device_spec: [32]u8 = @splat(0),
+    /// The spec the calls take. A Cast receiver is an address, but a
+    /// renderer is named by its description URL, which is much longer.
+    device_spec: [192]u8 = @splat(0),
     device_spec_len: usize = 0,
 
     fn spec(a: *const App) []const u8 {
@@ -244,8 +245,7 @@ fn startScan() !void {
     try app.scan.start(app.io, app.win, castig.discovery.discover, .{
         app.io,
         app.scan.allocator(),
-        castig.discovery.default_timeout_ms,
-        null,
+        castig.discovery.Query{},
     });
 }
 

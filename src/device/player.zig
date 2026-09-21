@@ -16,6 +16,7 @@ const net = Io.net;
 
 const Env = @import("../env.zig").Env;
 const cast = @import("cast.zig");
+const discovery = @import("discovery.zig");
 const playback = @import("playback.zig");
 
 const log = std.log.scoped(.cast);
@@ -66,7 +67,11 @@ pub const Player = union(enum) {
     /// Connects and gets the device ready to be loaded. On Cast that means
     /// joining the Default Media Receiver, or launching it, which is what
     /// raises the "allow this cast?" prompt some devices show.
-    pub fn connect(env: Env, address: net.Ip4Address) !Player {
+    pub fn connect(env: Env, endpoint: discovery.Endpoint) !Player {
+        const address = switch (endpoint) {
+            .cast => |a| a,
+            .dlna => return notYet(),
+        };
         const ch = try cast.Channel.connect(env.io, env.gpa, address);
         errdefer ch.deinit();
         const st = try ch.getStatus(env.arena);
@@ -83,7 +88,11 @@ pub const Player = union(enum) {
     /// Joins whatever is already playing, whoever started it.
     /// `error.NothingPlaying` when the device is idle, `error.NoMedia` when
     /// something is running with nothing loaded.
-    pub fn attach(env: Env, address: net.Ip4Address) !Player {
+    pub fn attach(env: Env, endpoint: discovery.Endpoint) !Player {
+        const address = switch (endpoint) {
+            .cast => |a| a,
+            .dlna => return notYet(),
+        };
         const ch = try cast.Channel.connect(env.io, env.gpa, address);
         errdefer ch.deinit();
 
@@ -108,6 +117,12 @@ pub const Player = union(enum) {
         };
         _ = c.track(media);
         return .{ .cast = c };
+    }
+
+    pub fn protocol(p: Player) discovery.Protocol {
+        return switch (p) {
+            .cast => .cast,
+        };
     }
 
     /// The last thing the device said, without asking it again.
@@ -205,8 +220,18 @@ pub const Player = union(enum) {
     }
 };
 
+/// Until the DLNA arm lands, every verb refuses the same way.
+fn notYet() error{ProtocolNotSupported} {
+    log.warn("driving a DLNA renderer is not implemented yet", .{});
+    return error.ProtocolNotSupported;
+}
+
 /// What `device` is doing, without joining whatever plays on it.
-pub fn deviceStatus(env: Env, address: net.Ip4Address) !DeviceStatus {
+pub fn deviceStatus(env: Env, endpoint: discovery.Endpoint) !DeviceStatus {
+    const address = switch (endpoint) {
+        .cast => |a| a,
+        .dlna => return notYet(),
+    };
     const ch = try cast.Channel.connect(env.io, env.gpa, address);
     defer ch.deinit();
     const st = try ch.getStatus(env.arena);
@@ -217,7 +242,11 @@ pub fn deviceStatus(env: Env, address: net.Ip4Address) !DeviceStatus {
 }
 
 /// Stops everything playing on `device`, and names what it stopped.
-pub fn stopAll(env: Env, address: net.Ip4Address) ![]const []const u8 {
+pub fn stopAll(env: Env, endpoint: discovery.Endpoint) ![]const []const u8 {
+    const address = switch (endpoint) {
+        .cast => |a| a,
+        .dlna => return notYet(),
+    };
     const ch = try cast.Channel.connect(env.io, env.gpa, address);
     defer ch.deinit();
 
