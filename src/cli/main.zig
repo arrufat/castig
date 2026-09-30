@@ -70,7 +70,7 @@ fn run(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    var stdout_writer: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
     var bar: progress.Bar = .{ .io = io };
     const env: castig.Env = .{
