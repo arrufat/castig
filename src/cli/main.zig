@@ -199,9 +199,6 @@ fn run(init: std.process.Init) !void {
                     opts.content_type = args[i];
                 } else if (std.mem.eql(u8, flag, "--subs")) {
                     opts.subtitles = if (std.mem.eql(u8, args[i], "auto")) .download else .{ .source = args[i] };
-                } else if (std.mem.eql(u8, flag, "--protocol")) {
-                    opts.protocol = std.meta.stringToEnum(castig.discovery.Protocol, args[i]) orelse
-                        fail("--protocol expects cast or dlna\n");
                 } else if (std.mem.eql(u8, flag, "--remux")) {
                     opts.remux = std.meta.stringToEnum(castig.delivery.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
                 } else fail(help_text.help(cmd));

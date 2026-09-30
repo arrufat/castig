@@ -20,6 +20,17 @@ pub fn devices(out: *Io.Writer, found: []const castig.discovery.Device, timeout_
         const spec = if (d.location.len > 0) d.location else d.id;
         try out.print("{t}\t{s}\t{s}\t{f}\t{s}\n", .{ d.protocol, d.friendly_name, d.model, d.address, spec });
     }
+
+    // `resolve` picks the receiver silently. Stderr keeps the table parseable.
+    for (found) |receiver| {
+        if (receiver.protocol != .cast) continue;
+        for (found) |renderer| {
+            if (renderer.protocol != .dlna) continue;
+            const name = castig.discovery.sharedName(receiver, renderer) orelse continue;
+            try out.flush();
+            std.debug.print("note: \"{s}\" matches a Cast receiver and a DLNA renderer; alone it picks the receiver, \"dlna:{s}\" the renderer\n", .{ name, name });
+        }
+    }
 }
 
 /// The `probe` report: container, streams, and what casting them needs.

@@ -26,7 +26,7 @@ pub const Status = struct {
 
 /// What `device` is doing: its volume, and on Cast the apps it runs.
 pub fn status(env: Env, device: []const u8) !Status {
-    const endpoint = try discovery.resolve(env, device, null);
+    const endpoint = try discovery.resolve(env, device);
     return .{
         .address = endpoint.address(),
         .protocol = endpoint.protocol(),
@@ -36,13 +36,13 @@ pub fn status(env: Env, device: []const u8) !Status {
 
 /// Stops everything that is playing, and names what it stopped.
 pub fn stop(env: Env, device: []const u8) ![]const []const u8 {
-    return player.stopAll(env, try discovery.resolve(env, device, null));
+    return player.stopAll(env, try discovery.resolve(env, device));
 }
 
 /// Connects to whatever is playing on the device, for a verb that needs
 /// something to act on. Finding nothing is a failure here, so it is said.
 fn open(env: Env, device: []const u8) !Player {
-    return Player.attach(env, try discovery.resolve(env, device, null)) catch |err| switch (err) {
+    return Player.attach(env, try discovery.resolve(env, device)) catch |err| switch (err) {
         error.NothingPlaying => {
             log.warn("nothing is playing on {s}", .{device});
             return err;
@@ -96,7 +96,7 @@ pub const Follow = struct {
     /// idle, `error.NoMedia` when something is up with nothing loaded.
     /// Neither is logged: see `Player.attach`.
     pub fn start(env: Env, device: []const u8) !Follow {
-        const p = try Player.attach(env, try discovery.resolve(env, device, null));
+        const p = try Player.attach(env, try discovery.resolve(env, device));
         return .{ .player = p, .scratch = .init(env.gpa), .now = p.current() };
     }
 

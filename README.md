@@ -29,7 +29,7 @@ back. A name matching one device of each kind goes to the Cast receiver; put
 on whatever is playing, whoever started it.
 
 Local files are served from a built-in HTTP server, so seeking works. `cast`
-takes `--title`, `--type`, `--subs`, `--remux` and `--protocol`; run
+takes `--title`, `--type`, `--subs` and `--remux`; run
 `castig help cast` for what each one does.
 
 Set `CASTIG_DEBUG=1` to see every message exchanged with the device, SOAP

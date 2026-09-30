@@ -268,7 +268,7 @@ pub const Player = union(enum) {
 
 /// What `device` can play, asking it when asking is what settles it.
 pub fn profileOf(env: Env, device: []const u8) !support.Profile {
-    const endpoint = try discovery.resolve(env, device, null);
+    const endpoint = try discovery.resolve(env, device);
     switch (endpoint) {
         .cast => return support.cast,
         .dlna => |d| {

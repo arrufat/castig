@@ -42,9 +42,6 @@ pub const Options = struct {
     content_type: ?[]const u8 = null,
     subtitles: Subtitles = .sidecar,
     remux: delivery.Remux = .auto,
-    /// Which kind of device the name means, when the name alone is
-    /// ambiguous. A `cast:` or `dlna:` prefix on the spec says the same.
-    protocol: ?discovery.Protocol = null,
 };
 
 pub const Event = union(enum) {
@@ -110,7 +107,7 @@ pub const Session = struct {
         const local = !delivery.isUrl(opts.source);
 
         // Discovery waits on the network while the file is probed and prepared.
-        var resolving = io.async(discovery.resolve, .{ env, device, opts.protocol });
+        var resolving = io.async(discovery.resolve, .{ env, device });
         var resolved = false;
         defer if (!resolved) {
             _ = resolving.cancel(io) catch {};

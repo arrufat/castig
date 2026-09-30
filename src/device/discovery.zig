@@ -193,6 +193,13 @@ fn dlnaScan(io: Io, gpa: std.mem.Allocator, q: Query, into: *std.ArrayList(Devic
     }
 }
 
+/// A name that matches both devices when typed bare, or null.
+pub fn sharedName(receiver: Device, renderer: Device) ?[]const u8 {
+    if (renderer.matches(receiver.friendly_name)) return receiver.friendly_name;
+    if (receiver.matches(renderer.friendly_name)) return renderer.friendly_name;
+    return null;
+}
+
 /// Frees each device in a slice; the slice itself is the caller's.
 pub fn freeDevices(gpa: std.mem.Allocator, devices: []const Device) void {
     for (devices) |d| d.deinit(gpa);
@@ -279,9 +286,9 @@ fn parseResponse(gpa: std.mem.Allocator, packet: []const u8, from: ?net.Ip4Addre
 ///   cast:living room         a name, with the protocol settled
 ///   dlna:living room
 ///   living room              a name; on a tie a receiver wins
-pub fn resolve(env: Env, spec_in: []const u8, want_in: ?Protocol) !Endpoint {
+pub fn resolve(env: Env, spec_in: []const u8) !Endpoint {
     var spec = spec_in;
-    var want = want_in;
+    var want: ?Protocol = null;
     if (std.mem.cutScalar(u8, spec, ':')) |cut| {
         const head, const tail = cut;
         if (std.meta.stringToEnum(Protocol, head)) |p| {
@@ -377,6 +384,31 @@ test "a device names itself in a way resolve understands" {
     };
     try renderer.writeSpec(&dlna_w);
     try std.testing.expectEqualStrings("http://192.168.1.37:1254/", dlna_w.buffered());
+}
+
+test "a name reaching one device of each kind is found either way round" {
+    const receiver: Device = .{
+        .protocol = .cast,
+        .id = "abc",
+        .friendly_name = "Living Room TV",
+        .model = "BRAVIA",
+        .address = .{ .bytes = .{ 192, 168, 1, 43 }, .port = 8009 },
+    };
+    var renderer: Device = .{
+        .protocol = .dlna,
+        .id = "uuid:1",
+        .friendly_name = "Living Room TV",
+        .model = "Sony",
+        .address = .{ .bytes = .{ 192, 168, 1, 43 }, .port = 52323 },
+    };
+    try std.testing.expectEqualStrings("Living Room TV", sharedName(receiver, renderer).?);
+
+    // The renderer's name is a fragment of the receiver's.
+    renderer.friendly_name = "Living Room";
+    try std.testing.expectEqualStrings("Living Room", sharedName(receiver, renderer).?);
+
+    renderer.friendly_name = "Kitchen";
+    try std.testing.expectEqual(null, sharedName(receiver, renderer));
 }
 
 test {

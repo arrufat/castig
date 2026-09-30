@@ -46,6 +46,7 @@ pub fn help(cmd: Command) []const u8 {
         \\The last column is what to pass as <device>: an id for a Cast
         \\receiver, a description URL for a renderer. Part of a name works
         \\too, and `cast:name` or `dlna:name` settles one that matches both.
+        \\Any such name is pointed out after the table.
         \\
         \\  --timeout <ms>       how long to listen for replies (default 2000)
         \\  --protocol cast|dlna only look for one kind
@@ -81,7 +82,6 @@ pub fn help(cmd: Command) []const u8 {
         .cast =>
         \\usage: castig cast <device> <file|url> [--title <t>] [--type <mime>]
         \\                                       [--subs <file|url|auto>] [--remux <mode>]
-        \\                                       [--protocol cast|dlna]
         \\
         \\Play a local file or a URL and follow playback until it ends. Local
         \\files are served from a built-in HTTP server, so seeking works.
@@ -94,9 +94,6 @@ pub fn help(cmd: Command) []const u8 {
         \\                  from OpenSubtitles when there is none. Embedded
         \\                  text subtitles are offered too, pick one from the
         \\                  receiver's subtitle menu.
-        \\  --protocol <p>  which kind of device the name means, when it
-        \\                  matches one of each. A `cast:` or `dlna:` prefix
-        \\                  on <device> says the same thing.
         \\  --remux <mode>  how transcoded audio is delivered:
         \\                    auto    hls, falling back to mp4 if refused
         \\                    hls     seekable, starts at once
