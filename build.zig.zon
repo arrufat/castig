@@ -2,7 +2,7 @@
     .name = .castig,
     .version = "0.2.0-dev",
     .fingerprint = 0xd66b6941cc96816d,
-    .minimum_zig_version = "0.17.0-dev.2163+89ff10d56",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .ffmpeg = .{
             .url = "git+https://github.com/allyourcodebase/ffmpeg#51d347c18f7cfe61c138cd09a5df4f1b6cc63ea5",

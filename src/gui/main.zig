@@ -490,9 +490,9 @@ fn sourcePanel() !void {
         defer row.deinit();
 
         dvui.label(@src(), "Subtitles", .{}, .{ .gravity_y = 0.5 });
-        var subs: usize = @intFromEnum(app.subtitles);
+        var subs: usize = @backingInt(app.subtitles);
         if (dvui.dropdown(@src(), &subtitle_labels.values, .{ .choice = &subs }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
-            app.subtitles = @enumFromInt(subs);
+            app.subtitles = @fromBackingInt(@intCast(subs));
             if (app.subtitles == .source) try openSubtitle();
         }
         if (app.subtitles == .source) {
@@ -526,11 +526,11 @@ fn sourcePanel() !void {
         defer row.deinit();
 
         dvui.label(@src(), "Remux", .{}, .{ .gravity_y = 0.5 });
-        var mode: usize = @intFromEnum(app.remux);
+        var mode: usize = @backingInt(app.remux);
         const plays_hls = if (selectedTraits()) |t| t.plays_hls else true;
         const labels = if (plays_hls) &remux_labels.values else &no_hls_remux_labels.values;
         if (dvui.dropdown(@src(), labels, .{ .choice = &mode }, .{}, .{ .min_size_content = .{ .w = 180 }, .gravity_y = 0.5 })) {
-            app.remux = @enumFromInt(mode);
+            app.remux = @fromBackingInt(@intCast(mode));
         }
 
         const ready = app.readable and app.device != null and !app.cast.ours();

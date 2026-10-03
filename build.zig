@@ -209,7 +209,7 @@ fn runGit(b: *std.Build, args: []const []const u8) ?[]const u8 {
 fn frontEnd(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     root: []const u8,
     imports: []const std.Build.Module.Import,
 ) *std.Build.Module {

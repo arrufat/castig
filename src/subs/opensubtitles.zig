@@ -434,7 +434,7 @@ fn langPriority(languages: []const []const u8, lang: []const u8) usize {
 }
 
 fn lessThan(opts: RankOptions, a: Candidate, b: Candidate) bool {
-    if (a.hash != b.hash) return @intFromEnum(a.hash) > @intFromEnum(b.hash);
+    if (a.hash != b.hash) return @backingInt(a.hash) > @backingInt(b.hash);
     const pa = langPriority(opts.languages, a.lang);
     const pb = langPriority(opts.languages, b.lang);
     if (pa != pb) return pa < pb;
