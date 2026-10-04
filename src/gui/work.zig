@@ -215,7 +215,7 @@ pub const Cast = struct {
 
     /// A copy of the state, taken under the lock so the frame sees one instant.
     pub fn snapshot(c: *Cast) State {
-        Io.Threaded.mutexLock(&c.mutex);
+        Io.Threaded.mutexLockUncancelable(&c.mutex);
         defer Io.Threaded.mutexUnlock(&c.mutex);
         return c.state;
     }
@@ -240,7 +240,7 @@ pub const Cast = struct {
 
         c.following = false;
         {
-            Io.Threaded.mutexLock(&c.mutex);
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             c.state = .{ .phase = .preparing };
             c.say("connecting to {s}", .{device});
@@ -271,7 +271,7 @@ pub const Cast = struct {
         const arena = c.task.begin();
         c.following = true;
         {
-            Io.Threaded.mutexLock(&c.mutex);
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             c.state = .{ .phase = .preparing };
             c.say("asking {s} what it is doing", .{name});
@@ -292,14 +292,14 @@ pub const Cast = struct {
         _ = &result;
         c.task.release();
         c.following = false;
-        Io.Threaded.mutexLock(&c.mutex);
+        Io.Threaded.mutexLockUncancelable(&c.mutex);
         defer Io.Threaded.mutexUnlock(&c.mutex);
         c.state = .{};
     }
 
     fn watch(c: *Cast, env: castig.Env, device: []const u8, name: []const u8) void {
         var following = castig.control.Follow.start(env, device) catch |err| {
-            Io.Threaded.mutexLock(&c.mutex);
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             c.state = .{};
             switch (err) {
@@ -314,7 +314,7 @@ pub const Cast = struct {
         // An error here is the watch ending, not the cast: whatever plays
         // carries on without us.
         while (following.next(env) catch null) |now| {
-            Io.Threaded.mutexLock(&c.mutex);
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
             c.state.phase = .playing;
             c.state.player = now.state;
             c.state.position = now.position;
@@ -325,7 +325,7 @@ pub const Cast = struct {
             dvui.refresh(c.task.win, @src(), null);
         }
 
-        Io.Threaded.mutexLock(&c.mutex);
+        Io.Threaded.mutexLockUncancelable(&c.mutex);
         defer Io.Threaded.mutexUnlock(&c.mutex);
         c.state.phase = .over;
         c.say("nothing playing on {s} any more", .{name});
@@ -342,7 +342,7 @@ pub const Cast = struct {
 
     fn run(c: *Cast, env: castig.Env, device: []const u8, opts: castig.session.Options) void {
         c.pump(env, device, opts) catch |err| {
-            Io.Threaded.mutexLock(&c.mutex);
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             c.state.phase = .failed;
             c.say("{s}", .{@errorName(err)});
@@ -357,7 +357,7 @@ pub const Cast = struct {
 
     fn record(c: *Cast, e: castig.session.Event) void {
         {
-            Io.Threaded.mutexLock(&c.mutex);
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
             switch (e) {
                 .serving => |base| c.say("serving at {s}", .{base}),

@@ -9,8 +9,8 @@
             .hash = "ffmpeg-8.1.1-6-zT7QA1H0UQSFjV5BNCN_5tWrZqqNNXoEHjRhTaddLLNs",
         },
         .dvui = .{
-            .url = "git+https://github.com/david-vanderson/dvui?ref=0.17.x#1c183d957e797b1fc5ca660b64562544e181bec1",
-            .hash = "dvui-0.6.0-dev-AQFJme9wAwFWoB3WUPXa_W5aEcMOHeNKwhuu7UNTnbFp",
+            .url = "git+https://github.com/david-vanderson/dvui?ref=0.17.x#51a4c8c40e90a01dde68c811475c94dc0f09da9a",
+            .hash = "dvui-0.6.0-dev-AQFJmUYMBAEH-1VIlNmvI6nz6zH6ZSU4WVZCKrZMnry0",
             // Lazy, so the sources (~15 MB with SDL and freetype) arrive on
             // the first build rather than with a clone.
             .lazy = true,

@@ -63,7 +63,7 @@ const Messages = struct {
     count: usize = 0,
 
     fn add(m: *Messages, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
-        Io.Threaded.mutexLock(&m.mutex);
+        Io.Threaded.mutexLockUncancelable(&m.mutex);
         defer Io.Threaded.mutexUnlock(&m.mutex);
         const prefix = switch (level) {
             .err => "error: ",
@@ -79,7 +79,7 @@ const Messages = struct {
 
     /// Copies out, so a line cannot change while it is being drawn.
     fn read(m: *Messages, out: *[capacity]Line) usize {
-        Io.Threaded.mutexLock(&m.mutex);
+        Io.Threaded.mutexLockUncancelable(&m.mutex);
         defer Io.Threaded.mutexUnlock(&m.mutex);
         const first = (m.next + capacity - m.count) % capacity;
         for (0..m.count) |i| out[i] = m.lines[(first + i) % capacity];
