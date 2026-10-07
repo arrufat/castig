@@ -243,11 +243,16 @@ pub const Player = union(enum) {
     /// Blocks until the device reports something new about the item.
     /// `scratch` backs a Cast reply and is the caller's to reset between
     /// calls; a renderer answers out of its own.
-    pub fn next(p: *Player, env: Env, scratch: std.mem.Allocator) !playback.Playback {
+    /// Null once `wake` is set, which takes up to one heartbeat on Cast and
+    /// one poll on a renderer.
+    pub fn next(p: *Player, env: Env, scratch: std.mem.Allocator, wake: ?*const std.atomic.Value(bool)) !?playback.Playback {
         switch (p.*) {
-            .dlna => |r| return r.next(env.io),
+            .dlna => |r| {
+                if (wake) |w| if (w.load(.acquire)) return null;
+                return try r.next(env.io);
+            },
             .cast => |*c| while (true) {
-                const msg = try c.ch.receive();
+                const msg = try c.ch.receiveUnless(wake) orelse return null;
                 if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
                 const reply = cast.Channel.parseReply(scratch, msg) orelse continue;
                 const m = cast.Channel.mediaStatusFrom(scratch, reply) orelse continue;

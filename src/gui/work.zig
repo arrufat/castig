@@ -138,6 +138,8 @@ pub const Cast = struct {
         position: f64 = 0,
         duration: ?f64 = null,
         rate: f64 = 1,
+        /// False while a stream plays, before its mp4 is built.
+        seekable: bool = true,
         /// When `position` was reported. A Cast receiver reports changes only.
         at: ?Io.Clock.Timestamp = null,
         /// One line for the window: what is served, a fallback, the end.
@@ -390,7 +392,8 @@ pub const Cast = struct {
                 .serving => |base| c.say("serving at {s}", .{base}),
                 .loaded => |l| {
                     c.state.phase = .playing;
-                    c.say("loaded on {f} as {s}", .{ l.address, l.content_type });
+                    c.state.seekable = l.seekable;
+                    c.say("loaded on {f} as {s}{s}", .{ l.address, l.content_type, if (l.seekable) "" else " (no seek)" });
                 },
                 .state => |m| {
                     c.state.player = m.state;
@@ -401,7 +404,7 @@ pub const Cast = struct {
                 },
                 .falling_back => {
                     c.state.phase = .preparing;
-                    c.say("the receiver refused HLS; preparing a seekable mp4", .{});
+                    c.say("the receiver refused HLS; falling back to mp4", .{});
                 },
                 .finished => |reason| {
                     c.state.phase = .over;

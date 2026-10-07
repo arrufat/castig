@@ -52,6 +52,11 @@ transcoding can be refused in one delivery mode and play in another. That is
 what `--remux auto` is for. It means HLS on a Chromecast and a seekable mp4 on
 a renderer, which does not play HLS at all.
 
+When a Chromecast refuses the HLS, `auto` plays a stream of the file at once,
+without seeking, and moves to a seekable mp4 where it has got to once that is
+prepared. `--remux mp4` prepares the mp4 first and plays it seekable from the
+start.
+
 Some receivers show an "allow this cast?" prompt on screen. castig waits for
 it and says so.
 

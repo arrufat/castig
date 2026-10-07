@@ -626,7 +626,9 @@ fn playbackPanel() !void {
     }
 
     // One seek at the end of the drag, not one a frame.
-    if (duration > 0) {
+    if (duration > 0 and !state.seekable) {
+        dvui.progress(@src(), .{ .percent = std.math.clamp(now / @as(f32, @floatCast(duration)), 0, 1) }, .{ .expand = .horizontal, .min_size_content = .{ .h = 16 } });
+    } else if (duration > 0) {
         var fraction: f32 = app.scrub orelse std.math.clamp(now / @as(f32, @floatCast(duration)), 0, 1);
         if (dvui.slider(@src(), .{ .fraction = &fraction }, .{ .expand = .horizontal, .min_size_content = .{ .h = 16 } })) {
             app.scrub = fraction;
@@ -640,12 +642,13 @@ fn playbackPanel() !void {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = dvui.Rect{ .y = 6 } });
         defer row.deinit();
 
-        if (dvui.button(@src(), "-10", .{}, .{})) try dispatch(runSeek, .{"-10"});
+        const seeks = state.seekable;
+        if (dvui.button(@src(), "-10", .{ .grayed = !seeks }, .{}) and seeks) try dispatch(runSeek, .{"-10"});
         const paused = state.player == .paused;
         if (dvui.button(@src(), if (paused) "Play" else "Pause", .{}, .{ .min_size_content = .{ .w = 60 } })) {
             try dispatch(runCommand, .{if (paused) castig.control.Verb.play else .pause});
         }
-        if (dvui.button(@src(), "+10", .{}, .{})) try dispatch(runSeek, .{"+10"});
+        if (dvui.button(@src(), "+10", .{ .grayed = !seeks }, .{}) and seeks) try dispatch(runSeek, .{"+10"});
 
         // Nothing worth having implements a speed other than 1 over UPnP
         // AV, so the device says no and the control says so first.

@@ -67,6 +67,8 @@ pub const LoadRequest = struct {
     title: ?[]const u8 = null,
     /// Total length in seconds, for the device's progress bar.
     duration: ?f64 = null,
+    /// Where to start, in seconds.
+    start: f64 = 0,
     /// Sidecar subtitle tracks, each reachable by the device.
     text_tracks: []const TextTrack = &.{},
     /// Which track ids start enabled; empty means subtitles off.

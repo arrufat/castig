@@ -175,6 +175,7 @@ pub const Renderer = struct {
         r.stops = 0;
         r.polls = 0;
         r.last = .{ .state = .buffering, .duration = req.duration };
+        if (req.start > 0) return r.seek(req.start);
         return r.last;
     }
 

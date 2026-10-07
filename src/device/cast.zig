@@ -152,6 +152,12 @@ pub const Channel = struct {
     /// hanging up (a TCP FIN, `error.EndOfStream` from the reader), is the
     /// normal end of a session and surfaces as `error.ConnectionClosed`.
     pub fn receive(ch: *Channel) !proto.Message {
+        return (try ch.receiveUnless(null)).?;
+    }
+
+    /// `receive`, returning null at a heartbeat once `wake` is set. The
+    /// receiver PINGs every 5 s.
+    pub fn receiveUnless(ch: *Channel, wake: ?*const std.atomic.Value(bool)) !?proto.Message {
         while (true) {
             const r = &ch.client.reader;
             const len = r.takeInt(u32, .big) catch |err| switch (err) {
@@ -171,6 +177,7 @@ pub const Channel = struct {
                 if (std.mem.find(u8, text, "\"PING\"") != null) {
                     try ch.sendJson(msg.source_id, ns_heartbeat, Pong{});
                 }
+                if (wake) |w| if (w.load(.acquire)) return null;
                 continue;
             }
             log.debug("<- {s} {s}\n   {s}", .{ msg.source_id, msg.namespace, text });
@@ -380,7 +387,7 @@ pub const Channel = struct {
             .name = t.name,
         };
         var req: Load = .{
-            .currentTime = 0,
+            .currentTime = opts.start,
             .media = .{
                 .contentId = opts.url,
                 .contentType = opts.content_type,

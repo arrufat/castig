@@ -86,11 +86,11 @@ pub fn media(out: *Io.Writer, p: castig.playback.Playback) !void {
 pub fn event(out: *Io.Writer, e: castig.session.Event) !void {
     switch (e) {
         .serving => |base| try out.print("serving at {s}\n", .{base}),
-        .loaded => |l| try out.print("loaded on {f} as {s}\n", .{ l.address, l.content_type }),
+        .loaded => |l| try out.print("loaded on {f} as {s}{s}\n", .{ l.address, l.content_type, if (l.seekable) "" else " (no seek)" }),
         .state => |p| try media(out, p),
         .falling_back => {
             try out.flush();
-            std.debug.print("receiver refused HLS; falling back to seekable mp4 ...\n", .{});
+            std.debug.print("receiver refused HLS; falling back to mp4 ...\n", .{});
         },
         .finished => |reason| try out.print("finished: {s}\n", .{if (reason) |r| @tagName(r) else "?"}),
         .closed => try out.writeAll("receiver closed the session\n"),
