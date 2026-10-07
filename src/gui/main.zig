@@ -6,6 +6,7 @@ const std = @import("std");
 const Io = std.Io;
 const dvui = @import("dvui");
 const castig = @import("castig");
+const flags = @import("flags");
 
 const work = @import("work.zig");
 const Cast = work.Cast;
@@ -218,7 +219,35 @@ fn init(win: *dvui.Window) !void {
     };
     castig.av_extra.quietLibav();
     try nameLanguages();
+    // Before the scan, so a bad flag exits with nothing running.
+    try startFrom(try process.minimal.args.toSlice(process.arena.allocator()));
     try startScan();
+}
+
+/// `castigui [<file>] [cast flags]`: presets the choices, without casting.
+fn startFrom(args: []const []const u8) !void {
+    const file = args.len > 1 and !std.mem.startsWith(u8, args[1], "--");
+    const rest = if (file) args[2..] else args[1..];
+    var opts: castig.session.Options = .{ .source = if (file) args[1] else "" };
+    flags.cast(&opts, rest) catch |err| {
+        std.debug.print("usage: castigui [<file>] [--subs <file|auto>] [--remux <mode>]\n", .{});
+        return err;
+    };
+    // Not applied: the window has no control that would show them.
+    if (opts.title != null or opts.content_type != null) {
+        std.log.warn("the window ignores --title and --type", .{});
+    }
+
+    app.remux = opts.remux;
+    switch (opts.subtitles) {
+        .sidecar => app.subtitles = .sidecar,
+        .download => app.subtitles = .download,
+        .source => |p| {
+            app.subtitle_path = try app.gpa.dupeSentinel(u8, p, 0);
+            app.subtitles = .source;
+        },
+    }
+    if (file) try choose(try app.gpa.dupeSentinel(u8, opts.source, 0));
 }
 
 /// The chooser's first row names the configured order, which only a search
@@ -813,10 +842,14 @@ fn openFile() !void {
         .filters = &.{ "*.mkv", "*.mp4", "*.m4v", "*.webm", "*.avi", "*.mov", "*.mp3", "*.flac", "*.m4a" },
         .filter_description = "media files",
     }) orelse return;
+    try choose(chosen);
+}
 
+/// Takes ownership of `path`.
+fn choose(path: [:0]const u8) !void {
     if (app.path) |p| app.gpa.free(p);
-    app.path = chosen;
-    seedQuery(chosen);
+    app.path = path;
+    seedQuery(path);
     try startProbe();
 }
 

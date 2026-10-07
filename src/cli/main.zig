@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const castig = @import("castig");
+const flags = @import("flags");
 const help_text = @import("help.zig");
 const render = @import("render.zig");
 const prompt = @import("prompt.zig");
@@ -188,21 +189,10 @@ fn run(init: std.process.Init) !void {
         .cast => {
             if (args.len < 4) fail(help_text.help(cmd));
             var opts: castig.session.Options = .{ .source = args[3] };
-            var i: usize = 4;
-            while (i < args.len) : (i += 1) {
-                const flag = args[i];
-                if (i + 1 >= args.len) fail(help_text.help(cmd));
-                i += 1;
-                if (std.mem.eql(u8, flag, "--title")) {
-                    opts.title = args[i];
-                } else if (std.mem.eql(u8, flag, "--type")) {
-                    opts.content_type = args[i];
-                } else if (std.mem.eql(u8, flag, "--subs")) {
-                    opts.subtitles = if (std.mem.eql(u8, args[i], "auto")) .download else .{ .source = args[i] };
-                } else if (std.mem.eql(u8, flag, "--remux")) {
-                    opts.remux = std.meta.stringToEnum(castig.delivery.Remux, args[i]) orelse fail("--remux expects auto, hls, mp4, or stream\n");
-                } else fail(help_text.help(cmd));
-            }
+            flags.cast(&opts, args[4..]) catch |err| switch (err) {
+                error.InvalidRemux => fail("--remux expects auto, hls, mp4, or stream\n"),
+                error.MissingValue, error.UnknownFlag => fail(help_text.help(cmd)),
+            };
             const session = try castig.session.Session.start(env, args[2], opts);
             defer session.deinit();
             while (try session.next()) |e| try render.event(out, e);
@@ -238,9 +228,8 @@ fn run(init: std.process.Init) !void {
             try out.writeAll("\n");
         },
         .ui => {
-            if (args.len != 2) fail(help_text.help(cmd));
             try out.flush();
-            return openWindow(env);
+            return openWindow(env, args[2..]);
         },
         .version => try out.print("{s}\n", .{castig.version}),
         .help => try out.writeAll(help_text.usage),
@@ -265,17 +254,20 @@ const gui_exe = "castigui";
 
 /// `castig ui` runs the window as a separate program, so the CLI links
 /// nothing of it: the copy next to this binary first, else one on PATH.
-fn openWindow(env: castig.Env) !void {
+/// `args` are passed through unread.
+fn openWindow(env: castig.Env, args: []const []const u8) !void {
     const io = env.io;
     const sibling = sibling: {
         const dir = std.process.executableDirPathAlloc(io, env.arena) catch break :sibling null;
         break :sibling try Io.Dir.path.join(env.arena, &.{ dir, gui_exe });
     };
 
+    const argv = try env.arena.alloc([]const u8, args.len + 1);
+    @memcpy(argv[1..], args);
     var spawned: ?std.process.Child = null;
     for ([_]?[]const u8{ sibling, gui_exe }) |candidate| {
-        const path = candidate orelse continue;
-        spawned = std.process.spawn(io, .{ .argv = &.{path} }) catch continue;
+        argv[0] = candidate orelse continue;
+        spawned = std.process.spawn(io, .{ .argv = argv }) catch continue;
         break;
     }
     var child = spawned orelse {

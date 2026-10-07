@@ -48,11 +48,20 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", version);
     castig.addOptions("build_options", build_options);
 
+    // Shared by both front ends, and a file can belong to one module only.
+    const flags = b.createModule(.{
+        .root_source_file = b.path("src/cli/flags.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "castig", .module = castig }},
+    });
+
     // The shell. Rooted in src/cli/, so a relative import of a library file is
     // outside its module path and the compiler rejects it: the CLI can only
     // reach the library through `@import("castig")`.
     const exe_mod = frontEnd(b, target, optimize, "src/cli/main.zig", &.{
         .{ .name = "castig", .module = castig },
+        .{ .name = "flags", .module = flags },
     });
 
     const exe = b.addExecutable(.{
@@ -132,9 +141,9 @@ pub fn build(b: *std.Build) void {
     const docs_serve_step = b.step("docs-serve", "Serve the API documentation and open a browser");
     docs_serve_step.dependOn(&serve_docs.step);
 
-    // Both modules: the CLI files are reachable only from the exe.
+    // The CLI files are reachable only from the exe.
     const test_step = b.step("test", "Run unit tests");
-    for ([_]*std.Build.Module{ castig, exe_mod }) |mod| {
+    for ([_]*std.Build.Module{ castig, flags, exe_mod }) |mod| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     }
 
@@ -148,6 +157,7 @@ pub fn build(b: *std.Build) void {
     })) |dvui_dep| {
         const gui_mod = frontEnd(b, target, optimize, "src/gui/main.zig", &.{
             .{ .name = "castig", .module = castig },
+            .{ .name = "flags", .module = flags },
             .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
         });
         const gui = b.addExecutable(.{

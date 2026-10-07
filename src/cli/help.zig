@@ -143,9 +143,12 @@ pub fn help(cmd: Command) []const u8 {
         \\
         ,
         .ui =>
-        \\usage: castig ui
+        \\usage: castig ui [<file>] [--subs <file|auto>] [--remux <mode>]
         \\
         \\Open the window. Runs castigui, which `zig build gui` builds.
+        \\
+        \\A file and flags are read as `castig cast` reads them, and the
+        \\window opens with them chosen. It still waits for Cast.
         \\
         ,
         .version =>

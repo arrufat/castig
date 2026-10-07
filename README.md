@@ -18,7 +18,7 @@ castig pause|play <device>
 castig seek <device> <pos>       # 90, 1:30, 1:02:03, +30, -10
 castig rate <device> <x>         # 0.5 to 2.0
 castig subs <file>               # download a subtitle next to the video
-castig ui                        # open the window (see below)
+castig ui [<file>]               # open the window (see below)
 castig version                   # print the version
 ```
 
@@ -132,6 +132,11 @@ the same as `probe --device`. The remux choices
 say what they mean for a renderer, and the speed control is replaced by what a
 renderer will actually do, which is 1x. It is a separate binary, `castigui`, built with
 `zig build gui`; `castig ui` runs the copy next to it, or one on PATH.
+
+`castig ui <file>` opens the window with that file chosen, and `--subs` and
+`--remux` set their choices the way `castig cast` reads them. It still waits
+for Cast. `castigui <file>` does the same, so a desktop entry with
+`Exec=castigui %f` gives a file manager an "Open with castig".
 
 `Find ...` next to the subtitle choice is `castig subs` without the prompt:
 the ranked list of OpenSubtitles results, best first, one click to download
