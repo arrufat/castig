@@ -256,7 +256,10 @@ pub const Player = union(enum) {
                 if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
                 const reply = cast.Channel.parseReply(scratch, msg) orelse continue;
                 const m = cast.Channel.mediaStatusFrom(scratch, reply) orelse continue;
-                return c.track(m);
+                var now = c.track(m);
+                // A receiver tells every sender how it answered any of them.
+                now.answers = (reply.requestId orelse 0) != 0;
+                return now;
             },
         }
     }

@@ -82,8 +82,8 @@ fn deliveryFor(want: delivery.Remux, traits: Traits) delivery.Remux {
     };
 }
 
-/// How far back a stream's position may move before it counts as restarted.
-const restart_slack_s = 5;
+/// How far into a stream a report near 0 means it started over.
+const restart_after_s = 3;
 
 pub const Session = struct {
     env: Env,
@@ -318,12 +318,16 @@ pub const Session = struct {
                 },
                 else => return err,
             } orelse continue);
-            if (!s.isNews(now)) continue;
-            // A seek past what is buffered makes the receiver fetch the
-            // stream again, which starts over at 0.
-            if (!s.target.seekable and now.position + restart_slack_s < s.media.position) {
-                log.warn("a seek from another sender restarted the stream; seeking works once the mp4 is built", .{});
+            // A receiver cannot seek in a stream. It starts it over instead,
+            // and answers the seek at 0. Its own reports meanwhile repeat a
+            // stale position, so only the answer tells.
+            if (!s.target.seekable and now.answers and now.position < 1 and s.expectedPosition() > restart_after_s) {
+                log.warn("the receiver started the stream over: a stream cannot seek", .{});
+                s.media = now;
+                s.media_at = .now(s.env.io, .awake);
+                return .{ .state = s.media };
             }
+            if (!s.isNews(now)) continue;
             s.media = now;
             s.media_at = .now(s.env.io, .awake);
             if (s.media.state == .playing) s.played = true;
