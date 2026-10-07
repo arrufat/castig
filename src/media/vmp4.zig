@@ -107,6 +107,11 @@ const AudioCollector = struct {
     progress: ?Reporter,
     time_base: av.Rational,
     done_s: i64 = -1,
+    /// The encoder's padding runs past the audio.
+    end_s: i64 = std.math.maxInt(i64),
+    counted: *u64,
+    /// Its `first_pts` is the zero the chunk bounds use.
+    ctx: *const pipeline.AudioCtx = undefined,
 
     fn cb(ctx: *anyopaque, pkt: *av.Packet) anyerror!void {
         const self: *AudioCollector = @ptrCast(@alignCast(ctx));
@@ -120,9 +125,12 @@ const AudioCollector = struct {
             .buf_off = off,
             .size = size,
         });
-        const sec = extra.av_rescale_q(pkt.pts, self.time_base, extra.seconds);
-        if (sec > self.done_s) {
+        // Down like `done_s`, or a second at a seam counts twice.
+        const sec = extra.av_rescale_q_rnd(pkt.pts - self.ctx.first_pts, self.time_base, extra.seconds, .down);
+        // The encoder's priming sits before 0.
+        if (sec > self.done_s and sec >= 0 and sec < self.end_s) {
             self.done_s = sec;
+            self.counted.* += 1;
             if (self.progress) |p| p.step();
         }
     }
@@ -384,6 +392,8 @@ fn planChunks(gpa: std.mem.Allocator, sample_rate: c_int, frame_size: c_int, dur
 const ChunkResult = struct {
     aac: std.ArrayList(u8) = .empty,
     samples: std.ArrayList(AacSample) = .empty,
+    /// Seconds ticked on the progress bar.
+    seconds: u64 = 0,
     err: ?anyerror = null,
 
     fn deinit(r: *ChunkResult, gpa: std.mem.Allocator) void {
@@ -393,13 +403,13 @@ const ChunkResult = struct {
 };
 
 /// Encodes one chunk on its own demuxer, decoder and encoder.
-fn encodeChunk(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, progress: ?Reporter, result: *ChunkResult) void {
-    encodeChunkInner(gpa, path, chunk, progress, result) catch |err| {
+fn encodeChunk(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, seconds: ?i64, progress: ?Reporter, result: *ChunkResult) void {
+    encodeChunkInner(gpa, path, chunk, seconds, progress, result) catch |err| {
         result.err = err;
     };
 }
 
-fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, progress: ?Reporter, result: *ChunkResult) !void {
+fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, seconds: ?i64, progress: ?Reporter, result: *ChunkResult) !void {
     const in = try pipeline.Input.open(gpa, path);
     defer in.deinit();
     extra.discardOthers(in.ic, &.{in.audio_index});
@@ -407,9 +417,20 @@ fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, prog
     const enc = try pipeline.openStereoAacEncoder(in.dec);
     defer enc.free();
 
-    var collector: AudioCollector = .{ .gpa = gpa, .aac = &result.aac, .samples = &result.samples, .progress = progress, .time_base = enc.time_base };
+    var collector: AudioCollector = .{
+        .gpa = gpa,
+        .aac = &result.aac,
+        .samples = &result.samples,
+        .progress = progress,
+        .time_base = enc.time_base,
+        // The second this chunk starts in is the previous chunk's to count.
+        .done_s = extra.av_rescale_q_rnd(chunk.lo -| 1, enc.time_base, extra.seconds, .down),
+        .end_s = seconds orelse std.math.maxInt(i64),
+        .counted = &result.seconds,
+    };
     var ctx = try pipeline.AudioCtx.init(in.dec, enc, in_tb, 0, AudioCollector.cb, &collector);
     defer ctx.deinit();
+    collector.ctx = &ctx;
     // ~1 s of whole frames on each side of the slice (see above); the open
     // ends saturate.
     const roll: i64 = @divFloor(enc.sample_rate + enc.frame_size - 1, enc.frame_size) * enc.frame_size;
@@ -579,7 +600,9 @@ pub fn build(env: Env, path: []const u8, ic: *av.FormatContext) !*VMp4 {
     // The audio may end before the container does; plan on its own length.
     const audio_s: ?f64 = if (in_audio.duration != av.NOPTS_VALUE) extra.toSeconds(in_audio.duration, in_audio.time_base) else duration;
 
-    if (progress) |p| p.begin("preparing seekable mp4 (seconds)", if (duration) |d| @intFromFloat(d) else 0);
+    // What the chunks count: each second of audio once.
+    const seconds: ?i64 = if (audio_s) |d| @intFromFloat(@ceil(d)) else null;
+    if (progress) |p| p.begin("preparing seekable mp4 (seconds)", if (seconds) |n| @intCast(n) else 0);
     defer if (progress) |p| p.end();
 
     const chunks = try planChunks(gpa, enc.sample_rate, enc.frame_size, audio_s orelse 0, audioJobs(env, audio_s));
@@ -595,11 +618,17 @@ pub fn build(env: Env, path: []const u8, ic: *av.FormatContext) !*VMp4 {
     var sweep: VideoSweep = .{ .ic = ic, .video_index = video_index, .is_bmff = is_bmff, .gpa = gpa, .video = &video };
     var group: Io.Group = .init;
     defer group.cancel(io);
-    for (chunks, results) |c, *r| group.async(io, encodeChunk, .{ gpa, path, c, progress, r });
+    for (chunks, results) |c, *r| group.async(io, encodeChunk, .{ gpa, path, c, seconds, progress, r });
     group.async(io, VideoSweep.run, .{&sweep});
     try group.await(io);
     if (sweep.err) |err| return err;
     for (results) |r| if (r.err) |err| return err;
+    // A last second shorter than a frame starts no packet to tick it.
+    if (progress) |p| if (seconds) |n| {
+        var counted: u64 = 0;
+        for (results) |r| counted += r.seconds;
+        for (counted..@intCast(n)) |_| p.step();
+    };
 
     var max_size = try mergeChunks(gpa, results, enc.frame_size, &aac_buf, &aac_samples);
     for (video.items) |v| max_size = @max(max_size, v.size);

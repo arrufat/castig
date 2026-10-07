@@ -160,6 +160,9 @@ pub extern fn av_packet_rescale_ts(pkt: *av.Packet, tb_src: av.Rational, tb_dst:
 
 /// Exact, overflow-safe rescale of `a` from `bq` to `cq` (rounds to nearest).
 pub extern fn av_rescale_q(a: i64, bq: av.Rational, cq: av.Rational) i64;
+/// `av_rescale_q` with the rounding chosen.
+pub extern fn av_rescale_q_rnd(a: i64, bq: av.Rational, cq: av.Rational, rnd: Rounding) i64;
+pub const Rounding = enum(c_uint) { zero = 0, inf = 1, down = 2, up = 3, near_inf = 5 };
 /// Exact comparison of two timestamps in different time bases: -1, 0 or 1.
 pub extern fn av_compare_ts(ts_a: i64, tb_a: av.Rational, ts_b: i64, tb_b: av.Rational) c_int;
 
