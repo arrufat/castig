@@ -33,7 +33,7 @@ pub const Plan = struct {
     duration: ?f64,
     /// First video stream's average frame rate, when the demuxer knows it.
     fps: ?f64,
-    video_codec: []const u8,
+    video: support.Video,
     audio_codec: []const u8,
     /// Text subtitle streams we can offer as WebVTT tracks (bitmap subs skipped).
     subtitles: []const SubtitleStream,
@@ -48,7 +48,7 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     const ic = try extra.openInput(gpa, path);
     errdefer ic.close_input();
 
-    var video_codec: []const u8 = "";
+    var video: support.Video = .{ .codec = "" };
     var audio_codec: []const u8 = "";
     var have_video = false;
     var have_audio = false;
@@ -61,7 +61,7 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
         switch (par.codec_type) {
             .VIDEO => if (!have_video) {
                 have_video = true;
-                video_codec = name;
+                video = .{ .codec = name, .profile = par.profile, .profile_name = extra.profileName(par) };
             },
             .AUDIO => if (!have_audio) {
                 have_audio = true;
@@ -81,7 +81,7 @@ pub fn plan(gpa: std.mem.Allocator, path: []const u8) !Plan {
     return .{
         .duration = extra.durationSeconds(ic),
         .fps = extra.videoFps(ic),
-        .video_codec = video_codec,
+        .video = video,
         .audio_codec = audio_codec,
         .subtitles = try subs.toOwnedSlice(gpa),
         .ic = ic,
@@ -676,7 +676,7 @@ test "plan reports the codecs, and a Cast receiver decides what they mean" {
         defer gpa.free(p.subtitles);
 
         try std.testing.expectEqualStrings(std.mem.span(c.codec), p.audio_codec);
-        const verdict = support.judge(support.cast, p.video_codec, p.audio_codec, "video/mp4");
+        const verdict = support.judge(support.cast, p.video, p.audio_codec, "video/mp4");
         try std.testing.expectEqual(c.direct, verdict.direct);
         try std.testing.expect(!verdict.video_unsupported);
         try std.testing.expectEqual(@as(usize, 0), p.subtitles.len);

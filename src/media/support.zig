@@ -35,9 +35,36 @@ const Names = std.StaticStringMap(void);
 /// alike: Kodi says `audio/ac3` where Rygel says `audio/x-ac3`.
 const Spellings = std.StaticStringMap([]const []const u8);
 
+/// A video stream's codec, with the profile for where the name alone is not enough.
+pub const Video = struct {
+    codec: []const u8,
+    /// libavcodec's profile number, `AV_PROFILE_UNKNOWN` when not given.
+    profile: c_int = -99,
+    /// libavcodec's name for `profile`, such as "High 10".
+    profile_name: ?[]const u8 = null,
+
+    pub fn format(v: Video, w: *std.Io.Writer) !void {
+        try w.writeAll(v.codec);
+        if (v.profile_name) |name| try w.print(" ({s})", .{name});
+    }
+
+    /// High 10, 4:2:2, 4:4:4 or CAVLC 4:4:4, intra or not.
+    fn isRichH264(v: Video) bool {
+        if (!std.mem.eql(u8, v.codec, "h264")) return false;
+        const intra: c_int = 1 << 11;
+        return switch (v.profile & ~intra) {
+            44, 110, 122, 144, 244 => true,
+            else => false,
+        };
+    }
+};
+
 pub const Profile = struct {
     direct_video: Names,
     dependent_video: Names,
+    /// H.264 past 8-bit 4:2:0. Sink lists name codecs, not profiles, so a
+    /// device's claims never widen this.
+    rich_h264: Support,
     direct_audio: Names,
     dependent_audio: Names,
     /// MIME types the device said it accepts. Empty means it was not asked
@@ -51,8 +78,10 @@ pub const Profile = struct {
         return out;
     }
 
-    /// Whether the device plays this video codec as it is.
-    pub fn videoSupport(p: Profile, codec: []const u8) Support {
+    /// Whether the device plays this video stream as it is.
+    pub fn videoSupport(p: Profile, v: Video) Support {
+        if (v.isRichH264()) return p.rich_h264;
+        const codec = v.codec;
         if (p.direct_video.has(codec)) return .direct;
         // It said it takes this, which is better than our guess.
         if (p.advertises(video_mimes, codec)) return .direct;
@@ -102,6 +131,7 @@ pub const Profile = struct {
 pub const cast: Profile = .{
     .direct_video = .initComptime(.{ .{"h264"}, .{"vp8"}, .{"vp9"}, .{"av1"} }),
     .dependent_video = .initComptime(.{.{"hevc"}}),
+    .rich_h264 = .transcode,
     .direct_audio = .initComptime(.{ .{"aac"}, .{"mp3"}, .{"opus"}, .{"vorbis"}, .{"flac"} }),
     .dependent_audio = .initComptime(.{ .{"ac3"}, .{"eac3"} }),
 };
@@ -111,6 +141,8 @@ pub const cast: Profile = .{
 pub const dlna: Profile = .{
     .direct_video = .initComptime(.{.{"h264"}}),
     .dependent_video = .initComptime(.{ .{"hevc"}, .{"vp8"}, .{"vp9"}, .{"av1"}, .{"mpeg4"}, .{"mpeg2video"} }),
+    // Kodi plays it; a television's own renderer usually does not.
+    .rich_h264 = .device_dependent,
     .direct_audio = .initComptime(.{ .{"aac"}, .{"mp3"} }),
     .dependent_audio = .initComptime(.{ .{"ac3"}, .{"eac3"}, .{"dts"}, .{"flac"}, .{"vorbis"}, .{"opus"} }),
 };
@@ -151,15 +183,15 @@ pub const Verdict = struct {
 };
 
 /// Judges a file's streams and container against one device.
-pub fn judge(p: Profile, video_codec: []const u8, audio_codec: []const u8, container: []const u8) Verdict {
-    const video = if (video_codec.len > 0) p.videoSupport(video_codec) else Support.direct;
+pub fn judge(p: Profile, v: Video, audio_codec: []const u8, container: []const u8) Verdict {
+    const video = if (v.codec.len > 0) p.videoSupport(v) else Support.direct;
     const audio = if (audio_codec.len > 0) p.audioSupport(audio_codec) else Support.direct;
     // A container the device listed without naming ours needs repackaging
     // even when everything inside it is fine.
     const container_ok = p.acceptsContainer(container) orelse true;
     return .{
         .direct = video != .transcode and audio == .direct and container_ok,
-        .video_unsupported = video_codec.len > 0 and video == .transcode,
+        .video_unsupported = v.codec.len > 0 and video == .transcode,
     };
 }
 
@@ -180,7 +212,7 @@ test "a device's own word widens what it is taken to play" {
     // Nothing claimed, so the conservative reading stands and an AC3 MKV
     // would be remuxed.
     try testing.expectEqual(Support.device_dependent, dlna.audioSupport("ac3"));
-    try testing.expect(!judge(dlna, "h264", "ac3", mkv).direct);
+    try testing.expect(!judge(dlna, .{ .codec = "h264" }, "ac3", mkv).direct);
     try testing.expectEqual(@as(?bool, null), dlna.acceptsContainer(mkv));
 
     // Rygel spells it audio/x-ac3, Kodi spells it audio/ac3, and either is
@@ -188,38 +220,58 @@ test "a device's own word widens what it is taken to play" {
     for ([_][]const u8{ "audio/x-ac3", "audio/ac3" }) |spelling| {
         const claimed = dlna.withSinks(&.{ mkv, spelling });
         try testing.expectEqual(Support.direct, claimed.audioSupport("ac3"));
-        try testing.expect(judge(claimed, "h264", "ac3", mkv).direct);
+        try testing.expect(judge(claimed, .{ .codec = "h264" }, "ac3", mkv).direct);
     }
 
     // A container it listed without naming needs repackaging even when the
     // codecs inside it are all fine.
     const no_mkv = dlna.withSinks(&.{ "video/mp4", "audio/ac3" });
     try testing.expectEqual(@as(?bool, false), no_mkv.acceptsContainer(mkv));
-    try testing.expect(!judge(no_mkv, "h264", "ac3", mkv).direct);
-    try testing.expect(judge(no_mkv, "h264", "ac3", "video/mp4").direct);
+    try testing.expect(!judge(no_mkv, .{ .codec = "h264" }, "ac3", mkv).direct);
+    try testing.expect(judge(no_mkv, .{ .codec = "h264" }, "ac3", "video/mp4").direct);
 
     // A bare wildcard means it will try anything.
-    try testing.expect(judge(dlna.withSinks(&.{"*"}), "h264", "dts", mkv).direct);
+    try testing.expect(judge(dlna.withSinks(&.{"*"}), .{ .codec = "h264" }, "dts", mkv).direct);
 
     // Video it cannot decode is not something a remux can fix.
-    const v = judge(dlna, "mpeg1video", "aac", mkv);
+    const v = judge(dlna, .{ .codec = "mpeg1video" }, "aac", mkv);
     try testing.expect(v.video_unsupported);
     try testing.expect(!v.direct);
 
     // A Cast receiver has fixed abilities; nothing it says changes them.
     try testing.expectEqual(Support.device_dependent, cast.audioSupport("ac3"));
-    try testing.expect(!judge(cast, "h264", "ac3", mkv).direct);
-    try testing.expect(judge(cast, "h264", "aac", mkv).direct);
+    try testing.expect(!judge(cast, .{ .codec = "h264" }, "ac3", mkv).direct);
+    try testing.expect(judge(cast, .{ .codec = "h264" }, "aac", mkv).direct);
 }
 
 test "support tables" {
-    try std.testing.expectEqual(Support.direct, cast.videoSupport("h264"));
-    try std.testing.expectEqual(Support.direct, cast.videoSupport("av1"));
-    try std.testing.expectEqual(Support.device_dependent, cast.videoSupport("hevc"));
-    try std.testing.expectEqual(Support.transcode, cast.videoSupport("mpeg4"));
+    try std.testing.expectEqual(Support.direct, cast.videoSupport(.{ .codec = "h264" }));
+    try std.testing.expectEqual(Support.direct, cast.videoSupport(.{ .codec = "av1" }));
+    try std.testing.expectEqual(Support.device_dependent, cast.videoSupport(.{ .codec = "hevc" }));
+    try std.testing.expectEqual(Support.transcode, cast.videoSupport(.{ .codec = "mpeg4" }));
     try std.testing.expectEqual(Support.direct, cast.audioSupport("aac"));
     try std.testing.expectEqual(Support.transcode, cast.audioSupport("dts"));
     try std.testing.expectEqual(Support.transcode, cast.audioSupport("truehd"));
+}
+
+test "h264 past 8-bit 4:2:0 is judged by its profile" {
+    const high: Video = .{ .codec = "h264", .profile = 100 };
+    const high10: Video = .{ .codec = "h264", .profile = 110 };
+    const high10_intra: Video = .{ .codec = "h264", .profile = 110 | (1 << 11) };
+    const high444: Video = .{ .codec = "h264", .profile = 244 };
+    const mkv = "video/x-matroska";
+
+    try testing.expectEqual(Support.direct, cast.videoSupport(high));
+    try testing.expectEqual(Support.transcode, cast.videoSupport(high10));
+    try testing.expectEqual(Support.transcode, cast.videoSupport(high10_intra));
+    try testing.expectEqual(Support.transcode, cast.videoSupport(high444));
+    try testing.expect(judge(cast, high10, "aac", mkv).video_unsupported);
+
+    // A renderer naming H.264 says nothing about its bit depth.
+    const claims = dlna.withSinks(&.{ mkv, "video/x-h264" });
+    try testing.expectEqual(Support.direct, claims.videoSupport(high));
+    try testing.expectEqual(Support.device_dependent, claims.videoSupport(high10));
+    try testing.expect(!judge(claims, high10, "aac", mkv).video_unsupported);
 }
 
 test "text codec detection" {

@@ -191,9 +191,9 @@ pub const Session = struct {
         const profile = if (connected) s.player.profile() else support.cast;
 
         if (probe_result) |p| {
-            const verdict = support.judge(profile, p.video_codec, p.audio_codec, content_type);
+            const verdict = support.judge(profile, p.video, p.audio_codec, content_type);
             if (verdict.video_unsupported) {
-                log.warn("{s} video is not castable and video transcoding is not implemented; trying direct", .{p.video_codec});
+                log.warn("{f} video is not castable and video transcoding is not implemented; trying direct", .{p.video});
             }
             if (verdict.direct or verdict.video_unsupported) {
                 s.target = try s.routes.addFile(content_type);

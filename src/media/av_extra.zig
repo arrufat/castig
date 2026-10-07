@@ -84,6 +84,9 @@ pub const CodecId = c_uint;
 /// Short codec name such as "h264" or "dts". Never null; unknown ids yield "unknown_codec".
 pub extern fn avcodec_get_name(id: CodecId) [*:0]const u8;
 
+/// Profile name such as "High 10". Null for a profile libavcodec has no name for.
+pub extern fn avcodec_profile_name(codec_id: CodecId, profile: c_int) ?[*:0]const u8;
+
 /// Media type name such as "video". Null for `MediaType.UNKNOWN`.
 pub extern fn av_get_media_type_string(media_type: av.MediaType) ?[*:0]const u8;
 
@@ -96,6 +99,11 @@ pub fn codecId(par: *const av.Codec.Parameters) CodecId {
 /// `avcodec_get_name` as a slice.
 pub fn codecName(id: CodecId) []const u8 {
     return std.mem.span(avcodec_get_name(id));
+}
+
+/// The name of a stream's codec profile, when libavcodec has one.
+pub fn profileName(par: *const av.Codec.Parameters) ?[]const u8 {
+    return if (avcodec_profile_name(codecId(par), par.profile)) |s| std.mem.span(s) else null;
 }
 
 /// `av_get_media_type_string` as a slice, "unknown" when libav has no name.

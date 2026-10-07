@@ -22,7 +22,7 @@ pub const Stream = struct {
     /// How the device copes with this codec. Null for a track no device
     /// decodes, and until `Report.judgeAgainst` has said.
     support: ?support.Support = null,
-    video: ?struct { width: u32, height: u32, fps: f64 } = null,
+    video: ?struct { codec: support.Video, width: u32, height: u32, fps: f64 } = null,
     audio: ?struct { channels: u32, sample_rate: u32 } = null,
     /// A subtitle stream castig can turn into WebVTT; bitmap subtitles cannot.
     text: bool = false,
@@ -30,7 +30,8 @@ pub const Stream = struct {
     /// The codec and what the receiver will do with it. `index` is the
     /// caller's to print: a window has no room for it.
     pub fn format(s: Stream, w: *std.Io.Writer) !void {
-        try w.print("{s} {s}", .{ s.type_name, s.codec });
+        try w.print("{s} ", .{s.type_name});
+        if (s.video) |v| try w.print("{f}", .{v.codec}) else try w.writeAll(s.codec);
         if (s.language) |l| try w.print(" [{s}]", .{l});
         if (s.video) |v| try w.print(" {d}x{d} {d:.3} fps", .{ v.width, v.height, v.fps });
         if (s.audio) |a| try w.print(" {d} ch {d} Hz", .{ a.channels, a.sample_rate });
@@ -60,7 +61,7 @@ pub const Report = struct {
         r.audio = null;
         for (r.streams) |*s| switch (s.kind) {
             .video => {
-                s.support = profile.videoSupport(s.codec);
+                s.support = profile.videoSupport(s.video.?.codec);
                 r.video = worse(r.video, s.support.?);
             },
             .audio => {
@@ -125,6 +126,7 @@ pub fn inspect(gpa: std.mem.Allocator, path: []const u8) !Report {
         switch (s.kind) {
             .video => {
                 s.video = .{
+                    .codec = .{ .codec = codec, .profile = par.profile, .profile_name = extra.profileName(par) },
                     .width = @intCast(par.width),
                     .height = @intCast(par.height),
                     .fps = extra.streamFps(st) orelse 0,
