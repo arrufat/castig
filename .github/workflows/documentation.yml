@@ -2,9 +2,10 @@ name: documentation
 
 # The library's own API, for the projects that `@import("castig")`. The
 # binary's documentation is the README and `castig help <command>`.
+# Pages holds one version, so it follows releases rather than master.
 on:
-  push:
-    branches: ["master"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
