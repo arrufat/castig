@@ -82,6 +82,9 @@ fn deliveryFor(want: delivery.Remux, traits: Traits) delivery.Remux {
     };
 }
 
+/// How far back a stream's position may move before it counts as restarted.
+const restart_slack_s = 5;
+
 pub const Session = struct {
     env: Env,
     opts: Options,
@@ -315,6 +318,11 @@ pub const Session = struct {
             } orelse continue);
             // A stream's reports may differ only in the length `ownLength` fixes.
             if (std.meta.eql(now, s.media)) continue;
+            // A seek past what is buffered makes the receiver fetch the
+            // stream again, which starts over at 0.
+            if (!s.target.seekable and now.position + restart_slack_s < s.media.position) {
+                log.warn("a seek from another sender restarted the stream; seeking works once the mp4 is built", .{});
+            }
             s.media = now;
             if (s.media.state == .playing) s.played = true;
             return .{ .state = s.media };
