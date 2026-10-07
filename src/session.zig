@@ -369,6 +369,10 @@ pub const Session = struct {
             s.target = try s.routes.addStream();
             try s.routes.absolutise(s.base, &s.target, s.local);
             if (s.server) |server| server.setRoutes(s.routes.list.items);
+            // A receiver that refused the LOAD at once closes the session
+            // under the next one.
+            s.player.deinit();
+            s.player = try Player.connect(s.env, s.endpoint);
             try s.load(0);
             s.startBuild(try extra.openInput(s.env.gpa, s.opts.source));
             return;
