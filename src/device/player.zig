@@ -270,8 +270,8 @@ pub const Player = union(enum) {
         return (try p.nextUnless(env, scratch, null)).?;
     }
 
-    /// `next`, returning null once `wake` is set, which takes up to one
-    /// heartbeat on Cast and one poll on a renderer.
+    /// `next`, returning null once `wake` is set. That is seen at the next
+    /// message, a heartbeat at most 5 s away.
     pub fn nextUnless(p: *Player, env: Env, scratch: std.mem.Allocator, wake: ?*const std.atomic.Value(bool)) !?playback.Playback {
         switch (p.*) {
             .dlna => |r| {
@@ -279,6 +279,7 @@ pub const Player = union(enum) {
                 return try r.next(env.io);
             },
             .cast => |*c| while (true) {
+                if (wake) |w| if (w.load(.acquire)) return null;
                 const msg = try c.ch.receiveUnless(wake) orelse return null;
                 if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
                 const reply = cast.Channel.parseReply(scratch, msg) orelse continue;
