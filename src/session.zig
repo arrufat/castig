@@ -242,7 +242,11 @@ pub const Session = struct {
 
         s.title = opts.title orelse (if (local) Io.Dir.path.basename(opts.source) else null);
         s.duration = duration;
-        try s.load();
+        s.load() catch |err| {
+            if (err != error.ReceiverRefused or !s.hlsFallsBack()) return err;
+            s.push(.falling_back);
+            s.falling_back = true;
+        };
         return s;
     }
 
@@ -308,7 +312,11 @@ pub const Session = struct {
     /// before it ever played, and the seekable mp4 is the fallback.
     fn canFallBack(s: *const Session) bool {
         const failed = if (s.media.ended) |e| e == .failed else false;
-        if (s.played or !failed) return false;
+        return !s.played and failed and s.hlsFallsBack();
+    }
+
+    /// A refusal at the LOAD itself falls back the same way.
+    fn hlsFallsBack(s: *const Session) bool {
         return s.opts.remux == .auto and s.target.isHls() and s.local;
     }
 
