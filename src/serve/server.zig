@@ -73,7 +73,9 @@ pub const Server = struct {
     io: Io,
     gpa: std.mem.Allocator,
     listener: net.Server,
+    /// Read and replaced from different threads, so behind `routes_mutex`.
     routes: []const Route,
+    routes_mutex: Io.Mutex = .init,
     group: Io.Group = .init,
     port: u16,
 
@@ -98,7 +100,15 @@ pub const Server = struct {
     /// delivery mode after the server is already running). The new slice must
     /// outlive the server.
     pub fn setRoutes(s: *Server, routes: []const Route) void {
+        Io.Threaded.mutexLockUncancelable(&s.routes_mutex);
+        defer Io.Threaded.mutexUnlock(&s.routes_mutex);
         s.routes = routes;
+    }
+
+    fn currentRoutes(s: *Server) []const Route {
+        Io.Threaded.mutexLockUncancelable(&s.routes_mutex);
+        defer Io.Threaded.mutexUnlock(&s.routes_mutex);
+        return s.routes;
     }
 
     /// Stops accepting, cancels the live connections and frees the server.
@@ -157,7 +167,7 @@ pub const Server = struct {
         }
 
         const path = requestPath(request);
-        const route = for (s.routes) |r| {
+        const route = for (s.currentRoutes()) |r| {
             const matched = if (std.mem.endsWith(u8, r.path, "/"))
                 std.mem.startsWith(u8, path, r.path)
             else
