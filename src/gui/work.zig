@@ -138,9 +138,20 @@ pub const Cast = struct {
         position: f64 = 0,
         duration: ?f64 = null,
         rate: f64 = 1,
+        /// When `position` was reported. A Cast receiver reports changes only.
+        at: ?Io.Clock.Timestamp = null,
         /// One line for the window: what is served, a fallback, the end.
         note_buf: [192]u8 = @splat(0),
         note_len: usize = 0,
+
+        /// The reported position, advanced by the time played since.
+        pub fn positionNow(s: *const State, io: Io) f64 {
+            const at = s.at orelse return s.position;
+            if (s.player != .playing) return s.position;
+            const elapsed: f64 = @floatFromInt(at.untilNow(io).raw.toMilliseconds());
+            const moved = s.position + elapsed / 1000 * s.rate;
+            return if (s.duration) |d| @min(moved, d) else moved;
+        }
 
         /// The progress note, as much of it as fits the fixed buffer.
         pub fn note(s: *const State) []const u8 {
@@ -156,6 +167,8 @@ pub const Cast = struct {
         total: std.atomic.Value(u64) = .init(0),
         done: std.atomic.Value(u64) = .init(0),
         running: std.atomic.Value(bool) = .init(false),
+        /// Woken on `begin`: the bar requests later frames itself.
+        win: ?*dvui.Window = null,
 
         /// The library-facing reporter that writes into this progress.
         pub fn reporter(p: *Progress) castig.Reporter {
@@ -170,6 +183,7 @@ pub const Cast = struct {
             p.total.store(total, .monotonic);
             p.done.store(0, .monotonic);
             p.running.store(true, .release);
+            if (p.win) |win| dvui.refresh(win, @src(), null);
         }
 
         fn step(context: *anyopaque) void {
@@ -239,6 +253,7 @@ pub const Cast = struct {
         if (opts.subtitles == .source) copy.subtitles = .{ .source = try arena.dupe(u8, opts.subtitles.source) };
 
         c.following = false;
+        c.progress.win = win;
         {
             Io.Threaded.mutexLockUncancelable(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
@@ -284,6 +299,17 @@ pub const Cast = struct {
         }, try arena.dupe(u8, device), try arena.dupe(u8, name) });
     }
 
+    /// A library log line, shown as the note while our cast prepares.
+    pub fn explain(c: *Cast, win: *dvui.Window, text: []const u8) void {
+        {
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
+            defer Io.Threaded.mutexUnlock(&c.mutex);
+            if (c.state.phase != .preparing or c.following) return;
+            c.say("{s}", .{text});
+        }
+        dvui.refresh(win, @src(), null);
+    }
+
     /// Drops whatever is being watched so the slot can be used again. A
     /// session of our own is left alone: only the caller knows to stop it.
     pub fn stopFollowing(c: *Cast, io: Io) void {
@@ -318,6 +344,7 @@ pub const Cast = struct {
             c.state.phase = .playing;
             c.state.player = now.state;
             c.state.position = now.position;
+            c.state.at = .now(env.io, .awake);
             c.state.rate = now.rate;
             if (now.duration) |d| c.state.duration = d;
             c.say("playing on {s}, started elsewhere", .{name});
@@ -352,10 +379,10 @@ pub const Cast = struct {
     fn pump(c: *Cast, env: castig.Env, device: []const u8, opts: castig.session.Options) !void {
         const s = try castig.session.Session.start(env, device, opts);
         defer s.deinit();
-        while (try s.next()) |e| c.record(e);
+        while (try s.next()) |e| c.record(env.io, e);
     }
 
-    fn record(c: *Cast, e: castig.session.Event) void {
+    fn record(c: *Cast, io: Io, e: castig.session.Event) void {
         {
             Io.Threaded.mutexLockUncancelable(&c.mutex);
             defer Io.Threaded.mutexUnlock(&c.mutex);
@@ -368,6 +395,7 @@ pub const Cast = struct {
                 .state => |m| {
                     c.state.player = m.state;
                     c.state.position = m.position;
+                    c.state.at = .now(io, .awake);
                     c.state.rate = m.rate;
                     if (m.duration) |d| c.state.duration = d;
                 },

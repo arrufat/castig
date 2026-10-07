@@ -37,7 +37,7 @@ pub const std_options: std.Options = .{
 fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
     if (level == .debug) return;
     const library = comptime castig.ownScope(scope);
-    if (library) messages.add(level, format, args);
+    if (library) app.cast.explain(app.win, messages.add(level, format, args).text());
     if (library or level != .info) dvui.App.logFn(level, scope, format, args);
 }
 
@@ -63,7 +63,8 @@ const Messages = struct {
     next: usize = 0,
     count: usize = 0,
 
-    fn add(m: *Messages, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
+    /// Returns a copy of the line.
+    fn add(m: *Messages, comptime level: std.log.Level, comptime format: []const u8, args: anytype) Line {
         Io.Threaded.mutexLockUncancelable(&m.mutex);
         defer Io.Threaded.mutexUnlock(&m.mutex);
         const prefix = switch (level) {
@@ -76,6 +77,7 @@ const Messages = struct {
         line.len = written.len;
         m.next = (m.next + 1) % capacity;
         m.count = @min(m.count + 1, capacity);
+        return line.*;
     }
 
     /// Copies out, so a line cannot change while it is being drawn.
@@ -606,13 +608,18 @@ fn playbackPanel() !void {
     if (state.phase != .playing) return;
 
     const duration = state.duration orelse 0;
+    const now: f32 = @floatCast(state.positionNow(app.io));
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer row.deinit();
+        // A Cast receiver sends nothing while it plays.
+        if (state.player == .playing and dvui.timerDoneOrNone(row.data().id)) {
+            dvui.timer(row.data().id, 250_000);
+        }
 
         var position: [16]u8 = undefined;
         var total: [16]u8 = undefined;
-        const shown = if (app.scrub) |f| f * duration else @as(f32, @floatCast(state.position));
+        const shown = if (app.scrub) |f| f * duration else now;
         dvui.label(@src(), "{t}", .{state.player}, .{ .gravity_y = 0.5 });
         dvui.label(@src(), "{s} / {s}", .{ clock(&position, shown), clock(&total, duration) }, .{ .gravity_y = 0.5 });
         dvui.label(@src(), "x{d:.2}", .{state.rate}, .{ .gravity_x = 1, .gravity_y = 0.5 });
@@ -620,7 +627,7 @@ fn playbackPanel() !void {
 
     // One seek at the end of the drag, not one a frame.
     if (duration > 0) {
-        var fraction: f32 = app.scrub orelse std.math.clamp(@as(f32, @floatCast(state.position)) / @as(f32, @floatCast(duration)), 0, 1);
+        var fraction: f32 = app.scrub orelse std.math.clamp(now / @as(f32, @floatCast(duration)), 0, 1);
         if (dvui.slider(@src(), .{ .fraction = &fraction }, .{ .expand = .horizontal, .min_size_content = .{ .h = 16 } })) {
             app.scrub = fraction;
         } else if (app.scrub) |target| {

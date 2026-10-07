@@ -51,7 +51,8 @@ pub const Event = union(enum) {
     loaded: struct { address: net.Ip4Address, content_type: []const u8 },
     /// A status update from the receiver.
     state: playback.Playback,
-    /// The receiver refused this delivery; retrying as a seekable mp4.
+    /// The receiver refused this delivery; the next call builds and loads
+    /// a seekable mp4.
     falling_back,
     /// The item ended.
     finished: ?playback.EndReason,
@@ -95,6 +96,8 @@ pub const Session = struct {
     scratch: std.heap.ArenaAllocator,
     played: bool = false,
     done: bool = false,
+    /// Set once `.falling_back` is returned, so the build happens after it.
+    falling_back: bool = false,
     queue: [3]Event = undefined,
     queued: usize = 0,
     head: usize = 0,
@@ -259,8 +262,16 @@ pub const Session = struct {
         if (s.pop()) |e| return e;
         if (s.done) return null;
 
+        if (s.falling_back) {
+            s.falling_back = false;
+            try s.fallBack();
+            return s.pop().?;
+        }
         if (s.media.isFinished()) {
-            if (try s.fallBack()) return s.pop().?;
+            if (s.canFallBack()) {
+                s.falling_back = true;
+                return .falling_back;
+            }
             s.done = true;
             s.player.endSession(s.env);
             return .{ .finished = s.media.ended };
@@ -294,21 +305,21 @@ pub const Session = struct {
     }
 
     /// In auto mode a refused HLS load fails asynchronously, ending the item
-    /// before it ever played, and the seekable mp4 is the fallback. The build
-    /// takes a while, so the idle connection is reopened afterwards.
-    fn fallBack(s: *Session) !bool {
+    /// before it ever played, and the seekable mp4 is the fallback.
+    fn canFallBack(s: *const Session) bool {
         const failed = if (s.media.ended) |e| e == .failed else false;
         if (s.played or !failed) return false;
-        if (s.opts.remux != .auto or !s.target.isHls() or !s.local) return false;
+        return s.opts.remux == .auto and s.target.isHls() and s.local;
+    }
 
-        s.push(.falling_back);
+    /// The connection idles through the build, so it is reopened after.
+    fn fallBack(s: *Session) !void {
         s.player.deinit();
         s.target = try s.routes.addMp4(try extra.openInput(s.env.gpa, s.opts.source));
         try s.routes.absolutise(s.base, &s.target, s.local);
         if (s.server) |server| server.setRoutes(s.routes.list.items);
         s.player = try Player.connect(s.env, s.endpoint);
         try s.load();
-        return true;
     }
 
     fn push(s: *Session, e: Event) void {
