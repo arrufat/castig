@@ -99,6 +99,8 @@ pub const Session = struct {
     title: ?[]const u8 = null,
     duration: ?f64 = null,
     media: playback.Playback,
+    /// When `media` was reported. A receiver is quiet while it plays.
+    media_at: Io.Clock.Timestamp = undefined,
     /// Reset per message, so a long session's memory stays bounded.
     scratch: std.heap.ArenaAllocator,
     played: bool = false,
@@ -316,14 +318,14 @@ pub const Session = struct {
                 },
                 else => return err,
             } orelse continue);
-            // A stream's reports may differ only in the length `ownLength` fixes.
-            if (std.meta.eql(now, s.media)) continue;
+            if (!s.isNews(now)) continue;
             // A seek past what is buffered makes the receiver fetch the
             // stream again, which starts over at 0.
             if (!s.target.seekable and now.position + restart_slack_s < s.media.position) {
                 log.warn("a seek from another sender restarted the stream; seeking works once the mp4 is built", .{});
             }
             s.media = now;
+            s.media_at = .now(s.env.io, .awake);
             if (s.media.state == .playing) s.played = true;
             return .{ .state = s.media };
         }
@@ -337,8 +339,28 @@ pub const Session = struct {
         return own;
     }
 
+    /// A receiver resends a stream's status each time its buffered length
+    /// grows, with a position that has barely moved. Taking those as news
+    /// would pin a caller's clock to that position.
+    fn isNews(s: *const Session, now: playback.Playback) bool {
+        if (s.target.seekable) return !std.meta.eql(now, s.media);
+        return now.state != s.media.state or
+            now.rate != s.media.rate or
+            now.ended != s.media.ended or
+            @abs(now.position - s.media.position) >= 1;
+    }
+
+    /// Where playback should be by now. A receiver's own answer can be
+    /// seconds stale while it plays a stream.
+    fn expectedPosition(s: *const Session) f64 {
+        if (s.media.state != .playing) return s.media.position;
+        const elapsed: f64 = @floatFromInt(s.media_at.untilNow(s.env.io).raw.toMilliseconds());
+        return s.media.position + elapsed / 1000 * s.media.rate;
+    }
+
     /// Hands the connected device the target to play.
     fn load(s: *Session, at: f64) !void {
+        s.media_at = .now(s.env.io, .awake);
         s.media = s.ownLength(try s.player.load(s.env, .{
             .url = s.target.path,
             .content_type = s.target.content_type,
@@ -430,9 +452,9 @@ pub const Session = struct {
         s.target = try s.routes.addBuilt(vm);
         try s.routes.absolutise(s.base, &s.target, s.local);
         if (s.server) |server| server.setRoutes(s.routes.list.items);
-        const now = s.player.status(s.env) catch s.media;
-        log.info("the mp4 is built; reloading at {d:.0} s to seek", .{now.position});
-        try s.load(now.position);
+        const at = s.expectedPosition();
+        log.info("the mp4 is built; reloading at {d:.0} s to seek", .{at});
+        try s.load(at);
     }
 
     fn push(s: *Session, e: Event) void {
