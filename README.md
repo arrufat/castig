@@ -178,22 +178,22 @@ The project pins a Zig version in `build.zig.zon`; with
 up automatically.
 
 ```sh
-zig build                 # debug build, compiles ffmpeg from source the first time
-zig build test            # unit tests
-zig build docs            # API documentation into zig-out/docs
+zig build            # debug build, compiles ffmpeg from source the first time
+zig build test       # unit tests
+zig build docs       # API documentation into zig-out/docs
 zig build run -- ls
-zig build gui             # the window, into zig-out/bin/castigui
+zig build gui        # the window, into zig-out/bin/castigui
 zig build run-gui
-zig build version         # the version this checkout resolves to
+zig build version    # the version this checkout resolves to
 ```
 
 `zig build` builds the CLI alone; only `gui` compiles SDL3 and the rest of
 the window. Their sources are fetched with the other dependencies.
 
 ```sh
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl   # static release
-zig build -fsys=ffmpeg                                        # link system ffmpeg
-zig build gui -fsys=sdl3                                      # link system SDL3
+zig build --release=fast -Dtarget=x86_64-linux-musl   # static release
+zig build -fsys=ffmpeg                                # link system ffmpeg
+zig build gui -fsys=sdl3                              # link system SDL3
 ```
 
 `-fsys=ffmpeg` finds the libav* libraries with pkg-config instead of building

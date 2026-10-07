@@ -89,10 +89,10 @@ jobs:
       # The CLI is static, the window is not: SDL3 dlopens X11 and Wayland,
       # and dlopen in a static musl binary always fails.
       - name: Build the CLI
-        run: zig build -Doptimize=ReleaseFast ${{ matrix.cli_flags }}
+        run: zig build --release=fast ${{ matrix.cli_flags }}
 
       - name: Build the window
-        run: zig build gui -Doptimize=ReleaseFast ${{ matrix.gui_flags }}
+        run: zig build gui --release=fast ${{ matrix.gui_flags }}
 
       # Both binaries, at the root of the archive: `castig ui` runs the copy
       # next to it before the one on PATH.
