@@ -82,9 +82,6 @@ fn deliveryFor(want: delivery.Remux, traits: Traits) delivery.Remux {
     };
 }
 
-/// How far into a stream a report near 0 means it started over.
-const restart_after_s = 3;
-
 pub const Session = struct {
     env: Env,
     opts: Options,
@@ -99,8 +96,6 @@ pub const Session = struct {
     title: ?[]const u8 = null,
     duration: ?f64 = null,
     media: playback.Playback,
-    /// When `media` was reported. A receiver is quiet while it plays.
-    media_at: Io.Clock.Timestamp = undefined,
     /// Reset per message, so a long session's memory stays bounded.
     scratch: std.heap.ArenaAllocator,
     played: bool = false,
@@ -111,7 +106,6 @@ pub const Session = struct {
     building: ?Io.Future(anyerror!*vmp4.VMp4) = null,
     /// Set when the build is over or abandoned, which wakes `next`.
     built: std.atomic.Value(bool) = .init(false),
-    abandoned: std.atomic.Value(bool) = .init(false),
     queue: [3]Event = undefined,
     queued: usize = 0,
     head: usize = 0,
@@ -279,7 +273,6 @@ pub const Session = struct {
     /// Stops building the seekable mp4, from any thread. The stream plays on
     /// without seek.
     pub fn abandonBuild(s: *Session) void {
-        s.abandoned.store(true, .release);
         s.built.store(true, .release);
     }
 
@@ -311,61 +304,21 @@ pub const Session = struct {
             }
             _ = s.scratch.reset(.retain_capacity);
             const wake = if (s.building != null) &s.built else null;
-            const now = s.ownLength(s.player.next(s.env, s.scratch.allocator(), wake) catch |err| switch (err) {
+            s.media = (s.player.nextUnless(s.env, s.scratch.allocator(), wake) catch |err| switch (err) {
                 error.ConnectionClosed => {
                     s.done = true;
                     return .closed;
                 },
                 else => return err,
-            } orelse continue);
-            // A receiver cannot seek in a stream. It starts it over instead,
-            // and answers the seek at 0. Its own reports meanwhile repeat a
-            // stale position, so only the answer tells.
-            if (!s.target.seekable and now.answers and now.position < 1 and s.expectedPosition() > restart_after_s) {
-                log.warn("the receiver started the stream over: a stream cannot seek", .{});
-                s.media = now;
-                s.media_at = .now(s.env.io, .awake);
-                return .{ .state = s.media };
-            }
-            if (!s.isNews(now)) continue;
-            s.media = now;
-            s.media_at = .now(s.env.io, .awake);
+            }) orelse continue;
             if (s.media.state == .playing) s.played = true;
             return .{ .state = s.media };
         }
     }
 
-    /// A receiver takes a stream's length to be what it has buffered, and
-    /// reports each time that grows.
-    fn ownLength(s: *const Session, p: playback.Playback) playback.Playback {
-        var own = p;
-        if (!s.target.seekable and s.duration != null) own.duration = s.duration;
-        return own;
-    }
-
-    /// A receiver resends a stream's status each time its buffered length
-    /// grows, with a position that has barely moved. Taking those as news
-    /// would pin a caller's clock to that position.
-    fn isNews(s: *const Session, now: playback.Playback) bool {
-        if (s.target.seekable) return !std.meta.eql(now, s.media);
-        return now.state != s.media.state or
-            now.rate != s.media.rate or
-            now.ended != s.media.ended or
-            @abs(now.position - s.media.position) >= 1;
-    }
-
-    /// Where playback should be by now. A receiver's own answer can be
-    /// seconds stale while it plays a stream.
-    fn expectedPosition(s: *const Session) f64 {
-        if (s.media.state != .playing) return s.media.position;
-        const elapsed: f64 = @floatFromInt(s.media_at.untilNow(s.env.io).raw.toMilliseconds());
-        return s.media.position + elapsed / 1000 * s.media.rate;
-    }
-
     /// Hands the connected device the target to play.
     fn load(s: *Session, at: f64) !void {
-        s.media_at = .now(s.env.io, .awake);
-        s.media = s.ownLength(try s.player.load(s.env, .{
+        s.media = try s.player.load(s.env, .{
             .url = s.target.path,
             .content_type = s.target.content_type,
             .title = s.title,
@@ -375,7 +328,7 @@ pub const Session = struct {
             .start = at,
             .hls = s.target.isHls(),
             .seekable = s.target.seekable,
-        }));
+        });
         s.push(.{ .loaded = .{
             .address = s.endpoint.address(),
             .content_type = s.target.content_type,
@@ -396,34 +349,27 @@ pub const Session = struct {
         return s.opts.remux == .auto and s.target.isHls() and s.local;
     }
 
-    /// Plays a stream while the mp4 is built where the device can, or else
-    /// builds first and reopens the connection that idled meanwhile.
+    /// Plays a stream while the mp4 is built. Only an HLS device gets here,
+    /// and all of those play a stream.
     fn fallBack(s: *Session) !void {
-        if (s.routes.traits.plays_unsized) {
-            s.target = try s.routes.addStream();
-            try s.routes.absolutise(s.base, &s.target, s.local);
-            if (s.server) |server| server.setRoutes(s.routes.list.items);
-            // A receiver that refused the LOAD at once closes the session
-            // under the next one.
-            s.player.deinit();
-            s.player = try Player.connect(s.env, s.endpoint);
-            try s.load(0);
-            s.startBuild(try extra.openInput(s.env.gpa, s.opts.source));
-            return;
-        }
+        try s.serve(try s.routes.addStream());
+        s.startBuild(try extra.openInput(s.env.gpa, s.opts.source));
+        // A receiver that refused the LOAD closes the session under the next.
         s.player.deinit();
-        s.target = try s.routes.addMp4(try extra.openInput(s.env.gpa, s.opts.source));
-        try s.routes.absolutise(s.base, &s.target, s.local);
-        if (s.server) |server| server.setRoutes(s.routes.list.items);
         s.player = try Player.connect(s.env, s.endpoint);
         try s.load(0);
+    }
+
+    /// Makes `target` the one served and loaded.
+    fn serve(s: *Session, target: delivery.Target) !void {
+        s.target = target;
+        try s.routes.absolutise(s.base, &s.target, s.local);
+        if (s.server) |server| server.setRoutes(s.routes.list.items);
     }
 
     /// Builds the seekable mp4 on another thread while the stream plays.
     /// Takes ownership of `ic`.
     fn startBuild(s: *Session, ic: *av.FormatContext) void {
-        s.built.store(false, .monotonic);
-        s.abandoned.store(false, .monotonic);
         s.building = s.env.io.concurrent(build, .{ s, ic }) catch {
             ic.close_input();
             log.warn("no thread to build the seekable mp4 on; playing without seek", .{});
@@ -440,23 +386,17 @@ pub const Session = struct {
     fn useBuilt(s: *Session) !void {
         var future = s.building.?;
         s.building = null;
-        if (s.abandoned.load(.acquire)) {
-            if (future.cancel(s.env.io)) |vm| vm.deinit() else |_| {}
-            log.info("stopped building the seekable mp4; playing without seek", .{});
-            return;
-        }
-        const vm = future.await(s.env.io) catch |err| {
-            if (delivery.unbuildable(err)) {
-                log.warn("this file cannot be made seekable without a copy ({s}); playing without seek", .{@errorName(err)});
+        // A finished build returns its result, an abandoned one stops.
+        const vm = future.cancel(s.env.io) catch |err| {
+            if (err == error.Canceled) {
+                log.info("stopped building the seekable mp4; playing without seek", .{});
             } else {
                 log.warn("cannot build the seekable mp4 ({s}); playing without seek", .{@errorName(err)});
             }
             return;
         };
-        s.target = try s.routes.addBuilt(vm);
-        try s.routes.absolutise(s.base, &s.target, s.local);
-        if (s.server) |server| server.setRoutes(s.routes.list.items);
-        const at = s.expectedPosition();
+        try s.serve(try s.routes.addBuilt(vm));
+        const at = s.player.positionNow(s.env.io);
         log.info("the mp4 is built; reloading at {d:.0} s to seek", .{at});
         try s.load(at);
     }

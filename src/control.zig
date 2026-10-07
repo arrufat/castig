@@ -118,13 +118,13 @@ pub const Follow = struct {
             return null;
         }
         _ = f.scratch.reset(.retain_capacity);
-        f.now = (f.player.next(env, f.scratch.allocator(), null) catch |err| switch (err) {
+        f.now = f.player.next(env, f.scratch.allocator()) catch |err| switch (err) {
             error.ConnectionClosed => {
                 f.done = true;
                 return null;
             },
             else => return err,
-        }).?;
+        };
         return f.now;
     }
 };

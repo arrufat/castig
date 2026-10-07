@@ -106,10 +106,9 @@ const AudioCollector = struct {
     samples: *std.ArrayList(AacSample),
     progress: ?Reporter,
     time_base: av.Rational,
-    done_s: i64 = -1,
+    done_s: i64,
     /// The encoder's padding runs past the audio.
-    end_s: i64 = std.math.maxInt(i64),
-    counted: *u64,
+    end_s: i64,
     /// Its `first_pts` is the zero the chunk bounds use.
     ctx: *const pipeline.AudioCtx = undefined,
 
@@ -126,11 +125,15 @@ const AudioCollector = struct {
             .size = size,
         });
         // Down like `done_s`, or a second at a seam counts twice.
-        const sec = extra.av_rescale_q_rnd(pkt.pts - self.ctx.first_pts, self.time_base, extra.seconds, .down);
-        // The encoder's priming sits before 0.
-        if (sec > self.done_s and sec >= 0 and sec < self.end_s) {
-            self.done_s = sec;
-            self.counted.* += 1;
+        self.tickTo(extra.av_rescale_q_rnd(pkt.pts - self.ctx.first_pts, self.time_base, extra.seconds, .DOWN));
+    }
+
+    /// Ticks the seconds up to `sec`, leaving out the encoder's priming
+    /// before 0 and padding from `end_s`.
+    fn tickTo(self: *AudioCollector, sec: i64) void {
+        while (self.done_s < @min(sec, self.end_s - 1)) {
+            self.done_s += 1;
+            if (self.done_s < 0) continue;
             if (self.progress) |p| p.step();
         }
     }
@@ -392,8 +395,6 @@ fn planChunks(gpa: std.mem.Allocator, sample_rate: c_int, frame_size: c_int, dur
 const ChunkResult = struct {
     aac: std.ArrayList(u8) = .empty,
     samples: std.ArrayList(AacSample) = .empty,
-    /// Seconds ticked on the progress bar.
-    seconds: u64 = 0,
     err: ?anyerror = null,
 
     fn deinit(r: *ChunkResult, gpa: std.mem.Allocator) void {
@@ -426,9 +427,8 @@ fn encodeChunkInner(io: Io, gpa: std.mem.Allocator, path: []const u8, chunk: Chu
         .progress = progress,
         .time_base = enc.time_base,
         // The second this chunk starts in is the previous chunk's to count.
-        .done_s = extra.av_rescale_q_rnd(chunk.lo -| 1, enc.time_base, extra.seconds, .down),
+        .done_s = @max(-1, extra.av_rescale_q_rnd(chunk.lo -| 1, enc.time_base, extra.seconds, .DOWN)),
         .end_s = seconds orelse std.math.maxInt(i64),
-        .counted = &result.seconds,
     };
     var ctx = try pipeline.AudioCtx.init(in.dec, enc, in_tb, 0, AudioCollector.cb, &collector);
     defer ctx.deinit();
@@ -455,6 +455,12 @@ fn encodeChunkInner(io: Io, gpa: std.mem.Allocator, path: []const u8, chunk: Chu
         try ctx.feed(pkt);
     }
     try ctx.finish();
+    // A last second shorter than a frame starts no packet to tick it.
+    if (chunk.hi != std.math.maxInt(i64)) {
+        collector.tickTo(extra.av_rescale_q_rnd(chunk.hi - 1, enc.time_base, extra.seconds, .DOWN));
+    } else if (seconds != null) {
+        collector.tickTo(collector.end_s);
+    }
 }
 
 /// Joins the chunks' AAC in order into `aac`/`samples` (empty on entry),
@@ -630,12 +636,6 @@ pub fn build(env: Env, path: []const u8, ic: *av.FormatContext) !*VMp4 {
     try group.await(io);
     if (sweep.err) |err| return err;
     for (results) |r| if (r.err) |err| return err;
-    // A last second shorter than a frame starts no packet to tick it.
-    if (progress) |p| if (seconds) |n| {
-        var counted: u64 = 0;
-        for (results) |r| counted += r.seconds;
-        for (counted..@intCast(n)) |_| p.step();
-    };
 
     var max_size = try mergeChunks(gpa, results, enc.frame_size, &aac_buf, &aac_samples);
     for (video.items) |v| max_size = @max(max_size, v.size);

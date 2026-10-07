@@ -79,18 +79,39 @@ pub const Player = union(enum) {
         /// The last status seen, so a caller that needs the position back
         /// does not pay for another round trip.
         last: playback.Playback = .{},
+        /// When `next` returned `last`.
+        last_at: ?Io.Clock.Timestamp = null,
+        /// A body that cannot be sought in, which a receiver reports oddly.
+        unsized: bool = false,
 
         fn track(c: *Cast, m: cast.Channel.MediaStatus) playback.Playback {
             var p = m.toPlayback();
-            if (p.duration) |d| {
-                c.duration = d;
+            // A receiver takes a stream's length to be what it has buffered.
+            if (p.duration != null and !c.unsized) {
+                c.duration = p.duration;
             } else {
                 p.duration = c.duration;
             }
             c.last = p;
             return p;
         }
+
+        fn positionNow(c: *const Cast, io: Io) f64 {
+            const at = c.last_at orelse return c.last.position;
+            return c.last.positionAfter(at.untilNow(io).raw);
+        }
     };
+
+    /// How far into a stream a receiver's answer at 0 means it started over.
+    const restart_after_s = 3;
+
+    /// Whether `now` says more than `before` beyond a nudged position.
+    fn moved(before: playback.Playback, now: playback.Playback) bool {
+        return now.state != before.state or
+            now.rate != before.rate or
+            now.ended != before.ended or
+            @abs(now.position - before.position) >= 1;
+    }
 
     /// Connects and gets the device ready to be loaded. On Cast that means
     /// joining the Default Media Receiver, or launching it, which is what
@@ -189,6 +210,8 @@ pub const Player = union(enum) {
                 const m = try c.ch.load(env.arena, c.transport_id, req);
                 c.media_session_id = m.mediaSessionId;
                 if (req.duration) |d| c.duration = d;
+                c.unsized = !req.seekable;
+                c.last_at = .now(env.io, .awake);
                 return c.track(m);
             },
             .dlna => |r| return r.load(req),
@@ -243,9 +266,13 @@ pub const Player = union(enum) {
     /// Blocks until the device reports something new about the item.
     /// `scratch` backs a Cast reply and is the caller's to reset between
     /// calls; a renderer answers out of its own.
-    /// Null once `wake` is set, which takes up to one heartbeat on Cast and
-    /// one poll on a renderer.
-    pub fn next(p: *Player, env: Env, scratch: std.mem.Allocator, wake: ?*const std.atomic.Value(bool)) !?playback.Playback {
+    pub fn next(p: *Player, env: Env, scratch: std.mem.Allocator) !playback.Playback {
+        return (try p.nextUnless(env, scratch, null)).?;
+    }
+
+    /// `next`, returning null once `wake` is set, which takes up to one
+    /// heartbeat on Cast and one poll on a renderer.
+    pub fn nextUnless(p: *Player, env: Env, scratch: std.mem.Allocator, wake: ?*const std.atomic.Value(bool)) !?playback.Playback {
         switch (p.*) {
             .dlna => |r| {
                 if (wake) |w| if (w.load(.acquire)) return null;
@@ -256,12 +283,34 @@ pub const Player = union(enum) {
                 if (!std.mem.eql(u8, msg.namespace, cast.ns_media)) continue;
                 const reply = cast.Channel.parseReply(scratch, msg) orelse continue;
                 const m = cast.Channel.mediaStatusFrom(scratch, reply) orelse continue;
-                var now = c.track(m);
-                // A receiver tells every sender how it answered any of them.
-                now.answers = (reply.requestId orelse 0) != 0;
+                const before = c.last;
+                const expected = c.positionNow(env.io);
+                const now = c.track(m);
+                if (c.unsized) {
+                    // A seek starts a stream over, and its answer, at 0, goes
+                    // to every sender.
+                    const answer = (reply.requestId orelse 0) != 0;
+                    if (answer and now.position < 1 and expected > restart_after_s) {
+                        log.warn("the receiver started the stream over: a stream cannot seek", .{});
+                    } else if (!moved(before, now)) {
+                        // Resent as its buffer grows, at a stale position.
+                        c.last = before;
+                        continue;
+                    }
+                }
+                c.last_at = .now(env.io, .awake);
                 return now;
             },
         }
+    }
+
+    /// Where playback should be by now. A receiver reports a change, not the
+    /// passing of time.
+    pub fn positionNow(p: Player, io: Io) f64 {
+        return switch (p) {
+            .cast => |c| c.positionNow(io),
+            .dlna => |r| r.last.position,
+        };
     }
 
     /// Leaves the device as we found it rather than parked on an idle screen.

@@ -47,6 +47,13 @@ pub fn Task(comptime Result: type) type {
             return null;
         }
 
+        /// Cancels a call whose result owns nothing, and frees the arena.
+        pub fn abort(self: *Self, io: Io) void {
+            var result = self.cancel(io);
+            _ = &result;
+            self.release();
+        }
+
         /// Whether a call is in flight.
         pub fn busy(self: *const Self) bool {
             return self.future != null;
@@ -151,10 +158,13 @@ pub const Cast = struct {
         /// The reported position, advanced by the time played since.
         pub fn positionNow(s: *const State, io: Io) f64 {
             const at = s.at orelse return s.position;
-            if (s.player != .playing) return s.position;
-            const elapsed: f64 = @floatFromInt(at.untilNow(io).raw.toMilliseconds());
-            const moved = s.position + elapsed / 1000 * s.rate;
-            return if (s.duration) |d| @min(moved, d) else moved;
+            const reported: castig.playback.Playback = .{
+                .state = s.player,
+                .position = s.position,
+                .duration = s.duration,
+                .rate = s.rate,
+            };
+            return reported.positionAfter(at.untilNow(io).raw);
         }
 
         /// The progress note, as much of it as fits the fixed buffer.
@@ -318,9 +328,7 @@ pub const Cast = struct {
     /// session of our own is left alone: only the caller knows to stop it.
     pub fn stopFollowing(c: *Cast, io: Io) void {
         if (!c.following) return;
-        var result = c.task.cancel(io);
-        _ = &result;
-        c.task.release();
+        c.task.abort(io);
         c.following = false;
         Io.Threaded.mutexLockUncancelable(&c.mutex);
         defer Io.Threaded.mutexUnlock(&c.mutex);
@@ -403,9 +411,7 @@ pub const Cast = struct {
             if (c.session) |s| return s.abandonBuild();
         }
         if (!c.ours()) return;
-        var result = c.task.cancel(io);
-        _ = &result;
-        c.task.release();
+        c.task.abort(io);
         Io.Threaded.mutexLockUncancelable(&c.mutex);
         defer Io.Threaded.mutexUnlock(&c.mutex);
         c.state.phase = .over;

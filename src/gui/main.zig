@@ -628,16 +628,20 @@ fn playbackPanel() !void {
         dvui.label(@src(), "x{d:.2}", .{state.rate}, .{ .gravity_x = 1, .gravity_y = 0.5 });
     }
 
-    // One seek at the end of the drag, not one a frame.
-    if (duration > 0 and !state.seekable) {
-        dvui.progress(@src(), .{ .percent = std.math.clamp(now / @as(f32, @floatCast(duration)), 0, 1) }, .{ .expand = .horizontal, .min_size_content = .{ .h = 16 } });
-    } else if (duration > 0) {
-        var fraction: f32 = app.scrub orelse std.math.clamp(now / @as(f32, @floatCast(duration)), 0, 1);
-        if (dvui.slider(@src(), .{ .fraction = &fraction }, .{ .expand = .horizontal, .min_size_content = .{ .h = 16 } })) {
-            app.scrub = fraction;
-        } else if (app.scrub) |target| {
-            app.scrub = null;
-            try seekTo(target * duration);
+    if (duration > 0) {
+        const played = std.math.clamp(now / @as(f32, @floatCast(duration)), 0, 1);
+        const size: dvui.Options = .{ .expand = .horizontal, .min_size_content = .{ .h = 16 } };
+        if (!state.seekable) {
+            dvui.progress(@src(), .{ .percent = played }, size);
+        } else {
+            // One seek at the end of the drag, not one a frame.
+            var fraction: f32 = app.scrub orelse played;
+            if (dvui.slider(@src(), .{ .fraction = &fraction }, size)) {
+                app.scrub = fraction;
+            } else if (app.scrub) |target| {
+                app.scrub = null;
+                try seekTo(target * duration);
+            }
         }
     }
 

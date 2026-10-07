@@ -52,15 +52,6 @@ pub const Target = struct {
     }
 };
 
-/// Whether `vmp4.build` failed on the file itself, rather than for want of
-/// memory or a readable file.
-pub fn unbuildable(err: anyerror) bool {
-    return switch (err) {
-        error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved, error.SeamMismatch => true,
-        else => false,
-    };
-}
-
 /// Whether the source is already a URL, so nothing needs serving.
 pub fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://");
@@ -197,10 +188,12 @@ pub const Routes = struct {
     /// The on-the-fly seekable mp4, or the no-seek stream if the file cannot
     /// be made seekable byte-exactly. Takes ownership of `ic`.
     pub fn addMp4(s: *Routes, ic: *av.FormatContext) !Target {
-        const vm = vmp4.build(s.env, s.source, ic) catch |err| {
-            if (!unbuildable(err)) return err;
-            log.warn("this file cannot be made seekable without a copy ({s}); serving without seek", .{@errorName(err)});
-            return s.addStream();
+        const vm = vmp4.build(s.env, s.source, ic) catch |err| switch (err) {
+            error.NoVideoStream, error.NoAudioStream, error.VideoNotAddressable, error.MuxerInterleaved, error.SeamMismatch => {
+                log.warn("this file cannot be made seekable without a copy ({s}); serving without seek", .{@errorName(err)});
+                return s.addStream();
+            },
+            else => return err,
         };
         return s.addBuilt(vm);
     }

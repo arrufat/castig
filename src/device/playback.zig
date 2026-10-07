@@ -23,13 +23,18 @@ pub const Playback = struct {
     /// Set only once the item has stopped and will not resume. A device that
     /// merely paused, buffered or was interrupted by a seek has none.
     ended: ?EndReason = null,
-    /// Whether this answers a command, from any sender, rather than being
-    /// the device's own update.
-    answers: bool = false,
 
     /// True only for terminal states.
     pub fn isFinished(p: Playback) bool {
         return p.ended != null;
+    }
+
+    /// Where playback is `elapsed` after this snapshot.
+    pub fn positionAfter(p: Playback, elapsed: std.Io.Duration) f64 {
+        if (p.state != .playing) return p.position;
+        const seconds: f64 = @floatFromInt(elapsed.toMilliseconds());
+        const moved = p.position + seconds / 1000 * p.rate;
+        return if (p.duration) |d| @min(moved, d) else moved;
     }
 };
 

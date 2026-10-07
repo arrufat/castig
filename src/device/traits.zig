@@ -24,8 +24,6 @@ pub const Traits = struct {
     plays_hls: bool,
     /// Whether it plays at a speed other than 1.
     variable_rate: bool,
-    /// Whether it plays a body of unknown length, such as a stream.
-    plays_unsized: bool,
     /// The format a side-loaded subtitle is served in.
     subtitle_format: playback.TextTrack.Format,
     /// Whether the text tracks inside the file can be offered to it as a
@@ -50,7 +48,6 @@ pub const Traits = struct {
     pub const cast: Traits = .{
         .plays_hls = true,
         .variable_rate = true,
-        .plays_unsized = true,
         .subtitle_format = .vtt,
         .subtitle_menu = true,
         .profile_is_claimed = false,
@@ -62,7 +59,6 @@ pub const Traits = struct {
     pub const dlna: Traits = .{
         .plays_hls = false,
         .variable_rate = false,
-        .plays_unsized = false,
         .subtitle_format = .srt,
         .subtitle_menu = false,
         .profile_is_claimed = true,
