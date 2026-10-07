@@ -104,8 +104,9 @@ pub const Session = struct {
     falling_back: bool = false,
     /// The seekable mp4, built while a stream of the same file plays.
     building: ?Io.Future(anyerror!*vmp4.VMp4) = null,
-    /// Set when the build is over, which wakes `next`.
+    /// Set when the build is over or abandoned, which wakes `next`.
     built: std.atomic.Value(bool) = .init(false),
+    abandoned: std.atomic.Value(bool) = .init(false),
     queue: [3]Event = undefined,
     queued: usize = 0,
     head: usize = 0,
@@ -270,6 +271,13 @@ pub const Session = struct {
         s.env.gpa.destroy(s);
     }
 
+    /// Stops building the seekable mp4, from any thread. The stream plays on
+    /// without seek.
+    pub fn abandonBuild(s: *Session) void {
+        s.abandoned.store(true, .release);
+        s.built.store(true, .release);
+    }
+
     /// The next thing the receiver did, or null once the session is over.
     /// A `.state` borrows from a scratch arena that the following call
     /// resets, so render or copy it before asking for the next event.
@@ -377,6 +385,7 @@ pub const Session = struct {
     /// Takes ownership of `ic`.
     fn startBuild(s: *Session, ic: *av.FormatContext) void {
         s.built.store(false, .monotonic);
+        s.abandoned.store(false, .monotonic);
         s.building = s.env.io.concurrent(build, .{ s, ic }) catch {
             ic.close_input();
             log.warn("no thread to build the seekable mp4 on; playing without seek", .{});
@@ -393,6 +402,11 @@ pub const Session = struct {
     fn useBuilt(s: *Session) !void {
         var future = s.building.?;
         s.building = null;
+        if (s.abandoned.load(.acquire)) {
+            if (future.cancel(s.env.io)) |vm| vm.deinit() else |_| {}
+            log.info("stopped building the seekable mp4; playing without seek", .{});
+            return;
+        }
         const vm = future.await(s.env.io) catch |err| {
             if (delivery.unbuildable(err)) {
                 log.warn("this file cannot be made seekable without a copy ({s}); playing without seek", .{@errorName(err)});

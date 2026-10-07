@@ -129,6 +129,8 @@ pub const Cast = struct {
     /// Whether the panel is showing a cast this window did not start, which
     /// anything of our own may take over.
     following: bool = false,
+    /// Behind `mutex`: the frame thread abandons its mp4 build.
+    session: ?*castig.session.Session = null,
 
     pub const Phase = enum { idle, preparing, playing, over, failed };
 
@@ -381,7 +383,33 @@ pub const Cast = struct {
     fn pump(c: *Cast, env: castig.Env, device: []const u8, opts: castig.session.Options) !void {
         const s = try castig.session.Session.start(env, device, opts);
         defer s.deinit();
+        c.share(s);
+        defer c.share(null);
         while (try s.next()) |e| c.record(env.io, e);
+    }
+
+    fn share(c: *Cast, s: ?*castig.session.Session) void {
+        Io.Threaded.mutexLockUncancelable(&c.mutex);
+        defer Io.Threaded.mutexUnlock(&c.mutex);
+        c.session = s;
+    }
+
+    /// Stops what the progress bar shows: the mp4 build behind a playing
+    /// stream, or else the cast itself, which has nothing playing yet.
+    pub fn cancelPreparing(c: *Cast, io: Io) void {
+        {
+            Io.Threaded.mutexLockUncancelable(&c.mutex);
+            defer Io.Threaded.mutexUnlock(&c.mutex);
+            if (c.session) |s| return s.abandonBuild();
+        }
+        if (!c.ours()) return;
+        var result = c.task.cancel(io);
+        _ = &result;
+        c.task.release();
+        Io.Threaded.mutexLockUncancelable(&c.mutex);
+        defer Io.Threaded.mutexUnlock(&c.mutex);
+        c.state.phase = .over;
+        c.say("cancelled", .{});
     }
 
     fn record(c: *Cast, io: Io, e: castig.session.Event) void {

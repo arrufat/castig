@@ -593,6 +593,9 @@ fn playbackPanel() !void {
             dvui.label(@src(), "{s}", .{app.cast.progress.label}, .{ .gravity_y = 0.5 });
             const counted = app.cast.progress.done.load(.monotonic);
             const total = app.cast.progress.total.load(.monotonic);
+            if (dvui.button(@src(), "Cancel", .{}, .{ .gravity_x = 1, .gravity_y = 0.5 })) {
+                app.cast.cancelPreparing(app.io);
+            }
             if (total > 0) {
                 dvui.label(@src(), "{d} / {d}", .{ counted, total }, .{ .gravity_x = 1, .gravity_y = 0.5 });
             } else {
