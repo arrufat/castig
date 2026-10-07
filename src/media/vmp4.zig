@@ -403,13 +403,15 @@ const ChunkResult = struct {
 };
 
 /// Encodes one chunk on its own demuxer, decoder and encoder.
-fn encodeChunk(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, seconds: ?i64, progress: ?Reporter, result: *ChunkResult) void {
-    encodeChunkInner(gpa, path, chunk, seconds, progress, result) catch |err| {
+fn encodeChunk(io: Io, gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, seconds: ?i64, progress: ?Reporter, result: *ChunkResult) void {
+    encodeChunkInner(io, gpa, path, chunk, seconds, progress, result) catch |err| {
+        // Stored, not returned: re-armed for chunks run inline after this.
+        if (err == error.Canceled) io.recancel();
         result.err = err;
     };
 }
 
-fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, seconds: ?i64, progress: ?Reporter, result: *ChunkResult) !void {
+fn encodeChunkInner(io: Io, gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, seconds: ?i64, progress: ?Reporter, result: *ChunkResult) !void {
     const in = try pipeline.Input.open(gpa, path);
     defer in.deinit();
     extra.discardOthers(in.ic, &.{in.audio_index});
@@ -442,6 +444,8 @@ fn encodeChunkInner(gpa: std.mem.Allocator, path: []const u8, chunk: Chunk, seco
     const pkt = try av.Packet.alloc();
     defer pkt.free();
     while (ctx.consumed() < stop) {
+        // libav does its own reads, so nothing else here is a cancelation point.
+        try io.checkCancel();
         in.ic.read_frame(pkt) catch |err| switch (err) {
             error.EndOfFile => break,
             else => return err,
@@ -494,6 +498,7 @@ fn mergeChunks(gpa: std.mem.Allocator, results: []ChunkResult, frame_size: c_int
 /// Phase A's pass over the video stream: per-sample metadata only, the bytes
 /// are located again at serve time. Runs alongside the audio chunks.
 const VideoSweep = struct {
+    io: Io,
     ic: *av.FormatContext,
     video_index: usize,
     is_bmff: bool,
@@ -503,6 +508,7 @@ const VideoSweep = struct {
 
     fn run(s: *VideoSweep) void {
         s.sweep() catch |err| {
+            if (err == error.Canceled) s.io.recancel();
             s.err = err;
         };
     }
@@ -512,6 +518,7 @@ const VideoSweep = struct {
         const pkt = try av.Packet.alloc();
         defer pkt.free();
         while (true) {
+            try s.io.checkCancel();
             s.ic.read_frame(pkt) catch |err| switch (err) {
                 error.EndOfFile => break,
                 else => return err,
@@ -615,10 +622,10 @@ pub fn build(env: Env, path: []const u8, ic: *av.FormatContext) !*VMp4 {
     // Each chunk opens its own demuxer; `ic` does the video. `Group.async`
     // runs a task inline when no thread is free, so this needs no minimum
     // pool size to be correct.
-    var sweep: VideoSweep = .{ .ic = ic, .video_index = video_index, .is_bmff = is_bmff, .gpa = gpa, .video = &video };
+    var sweep: VideoSweep = .{ .io = io, .ic = ic, .video_index = video_index, .is_bmff = is_bmff, .gpa = gpa, .video = &video };
     var group: Io.Group = .init;
     defer group.cancel(io);
-    for (chunks, results) |c, *r| group.async(io, encodeChunk, .{ gpa, path, c, seconds, progress, r });
+    for (chunks, results) |c, *r| group.async(io, encodeChunk, .{ io, gpa, path, c, seconds, progress, r });
     group.async(io, VideoSweep.run, .{&sweep});
     try group.await(io);
     if (sweep.err) |err| return err;
